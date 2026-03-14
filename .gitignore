@@ -1,0 +1,5 @@
+# Ignore local build artifacts
+build/
+
+# Ignore recorded video samples (too large)
+videos/
