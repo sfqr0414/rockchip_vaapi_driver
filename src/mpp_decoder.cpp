@@ -140,6 +140,10 @@ bool MppDecoder::enqueueJob(DecodeJob job) {
         running_ = true;
         decoder_thread_ = std::jthread([this](std::stop_token st){ decoderThreadMain(st); });
     }
+    {
+        std::lock_guard<std::mutex> lock(pending_mutex_);
+        pending_surfaces_.push_back(job.target_surface);
+    }
     job_queue_.push(std::move(job));
     return true;
 }
@@ -148,20 +152,90 @@ bool MppDecoder::isInitialized() const { return ctx_ != nullptr; }
 
 bool MppDecoder::waitSurfaceReady(VASurfaceID surface, uint32_t timeout_ms) {
     std::shared_ptr<std::atomic<bool>> ready_flag;
+    std::shared_ptr<std::atomic<bool>> failed_flag;
     {
         std::lock_guard<std::mutex> lock(g_surfaces_mutex);
         auto it = surfaces_.find(surface);
         if (it == surfaces_.end()) return false;
         ready_flag = it->second.ready;
+        failed_flag = it->second.decode_failed;
     }
     if (!ready_flag) return false;
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
-    while (!ready_flag->load()) {
-        if (std::chrono::steady_clock::now() >= deadline) return false;
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    while (std::chrono::steady_clock::now() < deadline) {
+        MppFrame frame = nullptr;
+        mpp_frame_init(&frame);
+        int cret = api_->decode_get_frame(ctx_, &frame);
+        if (cret != MPP_OK || !frame) {
+            if (frame) mpp_frame_deinit(&frame);
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            continue;
+        }
+
+        if (mpp_frame_get_info_change(frame)) {
+            uint32_t new_w = mpp_frame_get_width(frame);
+            uint32_t new_h = mpp_frame_get_height(frame);
+            uint32_t new_stride = mpp_frame_get_hor_stride(frame);
+            std::lock_guard<std::mutex> lock(g_surfaces_mutex);
+            for (auto& pair : surfaces_) {
+                pair.second.width = new_w;
+                pair.second.height = new_h;
+                pair.second.stride = new_stride;
+            }
+            api_->control(ctx_, MPP_DEC_SET_INFO_CHANGE_READY, nullptr);
+            mpp_frame_deinit(&frame);
+            continue;
+        }
+
+        MppBuffer buf = mpp_frame_get_buffer(frame);
+        if (buf) {
+            mpp_buffer_inc_ref(buf);
+            int fd = mpp_buffer_get_fd(buf);
+            VASurfaceID target = VA_INVALID_ID;
+            {
+                std::lock_guard<std::mutex> plock(pending_mutex_);
+                if (!pending_surfaces_.empty()) {
+                    target = pending_surfaces_.front();
+                    pending_surfaces_.pop_front();
+                }
+            }
+
+            if (target != VA_INVALID_ID) {
+                std::lock_guard<std::mutex> lock(g_surfaces_mutex);
+                auto it = surfaces_.find(target);
+                if (it != surfaces_.end()) {
+                    if (it->second.buffer) mpp_buffer_put(it->second.buffer);
+                    it->second.buffer = buf;
+                    it->second.dmabuf_fd = fd;
+                    it->second.width = mpp_frame_get_width(frame);
+                    it->second.height = mpp_frame_get_height(frame);
+                    it->second.stride = mpp_frame_get_hor_stride(frame);
+                    if (it->second.ready) it->second.ready->store(true);
+                    if (failed_flag && target == surface) failed_flag->store(false);
+                } else {
+                    mpp_buffer_put(buf);
+                }
+            } else {
+                mpp_buffer_put(buf);
+            }
+        }
+
+        mpp_frame_deinit(&frame);
+
+        {
+            std::lock_guard<std::mutex> lock(g_surfaces_mutex);
+            auto it = surfaces_.find(surface);
+            if (it != surfaces_.end() && it->second.ready && it->second.ready->load()) {
+                return true;
+            }
+            if (it != surfaces_.end() && it->second.decode_failed && it->second.decode_failed->load()) {
+                return false;
+            }
+        }
     }
-    return true;
+
+    return false;
 }
 
 void MppDecoder::shutdown() {

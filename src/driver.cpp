@@ -64,6 +64,13 @@ struct DriverState {
     // Current expected decoding resolution (from vaCreateContext or MPP feedback).
     uint32_t picture_width = 0;
     uint32_t picture_height = 0;
+    // Persistent per-picture buffers collected by vaRenderPicture and submitted
+    // atomically in vaEndPicture.
+    std::vector<uint8_t> frame_buffer;
+    std::vector<uint8_t> frame_extra_data;
+    // For AV1 we may receive picture params separately; keep a copy to
+    // synthesize sequence header at EndPicture if needed.
+    std::vector<uint8_t> pending_av1_pic_blob;
 };
 
 static ptrdiff_t findStartCode(const std::vector<uint8_t>& data, size_t start, size_t& code_len) {
@@ -495,7 +502,42 @@ static VAStatus rockchip_vaBeginPicture(VADriverContextP ctx,
 
 static VAStatus rockchip_vaEndPicture(VADriverContextP ctx,
                                      VAContextID /*context*/) {
-    (void)ctx;
+    auto* d = toDriver(ctx);
+    if (!d) return VA_STATUS_ERROR_INVALID_CONTEXT;
+
+    // Ensure we have collected data for the current picture.
+    if (d->current_surface == VA_INVALID_ID) return VA_STATUS_ERROR_INVALID_SURFACE;
+    if (d->frame_buffer.empty()) return VA_STATUS_ERROR_INVALID_BUFFER;
+
+    // For AV1, try to extract sequence header from the aggregated bitstream or
+    // synthesize it from picture parameters captured during vaRenderPicture.
+    if (d->profile == VAProfileAV1Profile0 && d->frame_extra_data.empty()) {
+        size_t seq_start = 0, seq_end = 0;
+        if (extractAv1SequenceHeader(d->frame_buffer, seq_start, seq_end)) {
+            d->frame_extra_data.assign(d->frame_buffer.begin() + seq_start, d->frame_buffer.begin() + seq_end);
+        } else if (!d->pending_av1_pic_blob.empty() && d->pending_av1_pic_blob.size() >= sizeof(VADecPictureParameterBufferAV1)) {
+            VADecPictureParameterBufferAV1 pic;
+            memcpy(&pic, d->pending_av1_pic_blob.data(), sizeof(pic));
+            d->frame_extra_data = synthesizeAv1SequenceHeader(pic);
+        }
+    }
+
+    DecodeJob job;
+    job.target_surface = d->current_surface;
+    job.bitstream = std::move(d->frame_buffer);
+    job.extra_data = std::move(d->frame_extra_data);
+
+    // Submit the complete frame to the decoder thread (which will feed MPP).
+    if (!d->decoder.enqueueJob(std::move(job))) {
+        return VA_STATUS_ERROR_ALLOCATION_FAILED;
+    }
+
+    // Clear per-picture state so next picture can be collected.
+    d->frame_buffer.clear();
+    d->frame_extra_data.clear();
+    d->pending_av1_pic_blob.clear();
+    d->current_buffers.clear();
+
     return VA_STATUS_SUCCESS;
 }
 
@@ -802,93 +844,30 @@ static VAStatus rockchip_vaRenderPicture(VADriverContextP ctx,
     if (!d) return VA_STATUS_ERROR_INVALID_CONTEXT;
     if (!buffers || num_buffers <= 0) return VA_STATUS_ERROR_INVALID_PARAMETER;
 
-    std::vector<uint8_t> bitstream;
-    std::vector<uint8_t> extra_data;
     const uint8_t start_code[] = {0, 0, 0, 1};
-    const VADecPictureParameterBufferAV1* av1_picture = nullptr;
 
-    // First pass: find slice parameters and picture parameters
-    std::vector<VASliceParameterBufferH264*> h264_slices;
-    std::vector<VASliceParameterBufferHEVC*> hevc_slices;
-    std::vector<VASliceParameterBufferAV1*> av1_slices;
-
-    for (int i = 0; i < num_buffers; i++) {
-        auto it = d->buffers.find(buffers[i]);
-        if (it == d->buffers.end()) continue;
-
-        if (it->second.type == VASliceParameterBufferType) {
-            uint32_t num = it->second.num_elements;
-            if (d->profile == VAProfileH264High) {
-                auto* p = static_cast<VASliceParameterBufferH264*>(it->second.data);
-                for (uint32_t j = 0; j < num; j++) h264_slices.push_back(&p[j]);
-            } else if (d->profile == VAProfileHEVCMain) {
-                auto* p = static_cast<VASliceParameterBufferHEVC*>(it->second.data);
-                for (uint32_t j = 0; j < num; j++) hevc_slices.push_back(&p[j]);
-            } else if (d->profile == VAProfileAV1Profile0) {
-                auto* p = static_cast<VASliceParameterBufferAV1*>(it->second.data);
-                for (uint32_t j = 0; j < num; j++) av1_slices.push_back(&p[j]);
-            }
-        }
-        if (av1_picture == nullptr && d->profile == VAProfileAV1Profile0 && it->second.type == VAPictureParameterBufferType) {
-            if (it->second.size >= sizeof(VADecPictureParameterBufferAV1)) {
-                av1_picture = static_cast<const VADecPictureParameterBufferAV1*>(it->second.data);
-            }
-        }
-    }
-
-    // Second pass: extract bitstream data using slices
+    // Collect slice data and any picture-parameter blobs into the driver's
+    // persistent per-picture buffers. Do NOT submit to the decoder here.
     for (int i = 0; i < num_buffers; i++) {
         auto it = d->buffers.find(buffers[i]);
         if (it == d->buffers.end()) continue;
 
         if (it->second.type == VASliceDataBufferType) {
             uint8_t* data = static_cast<uint8_t*>(it->second.data);
-            
-            if (d->profile == VAProfileH264High && !h264_slices.empty()) {
-                for (auto* s : h264_slices) {
-                    bitstream.insert(bitstream.end(), start_code, start_code + 4);
-                    bitstream.insert(bitstream.end(), data + s->slice_data_offset, data + s->slice_data_offset + s->slice_data_size);
-                }
-            } else if (d->profile == VAProfileHEVCMain && !hevc_slices.empty()) {
-                for (auto* s : hevc_slices) {
-                    bitstream.insert(bitstream.end(), start_code, start_code + 4);
-                    bitstream.insert(bitstream.end(), data + s->slice_data_offset, data + s->slice_data_offset + s->slice_data_size);
-                }
-            } else if (d->profile == VAProfileAV1Profile0 && !av1_slices.empty()) {
-                for (auto* s : av1_slices) {
-                    // AV1 slices are OBUs. They typically don't use 0001 start codes in the same way,
-                    // but MPP might expect them if it's in Annex B mode. 
-                    // Most libva AV1 slices have the OBU header already.
-                    bitstream.insert(bitstream.end(), data + s->slice_data_offset, data + s->slice_data_offset + s->slice_data_size);
-                }
+            // For H264/HEVC append start codes; for AV1 append raw OBUs.
+            if (d->profile == VAProfileH264High || d->profile == VAProfileHEVCMain) {
+                d->frame_buffer.insert(d->frame_buffer.end(), start_code, start_code + 4);
+                d->frame_buffer.insert(d->frame_buffer.end(), data, data + it->second.size);
             } else {
-                // Fallback: raw copy if no slices found
-                bitstream.insert(bitstream.end(), data, data + it->second.size);
+                d->frame_buffer.insert(d->frame_buffer.end(), data, data + it->second.size);
             }
         }
-    }
 
-    if (d->profile == VAProfileAV1Profile0 && extra_data.empty()) {
-        size_t seq_start = 0;
-        size_t seq_end = 0;
-        if (extractAv1SequenceHeader(bitstream, seq_start, seq_end)) {
-            extra_data.assign(bitstream.begin() + seq_start, bitstream.begin() + seq_end);
-        } else if (av1_picture) {
-            extra_data = synthesizeAv1SequenceHeader(*av1_picture);
+        // Capture AV1 picture parameter buffer so EndPicture can synthesize
+        // a sequence header if needed.
+        if (d->profile == VAProfileAV1Profile0 && it->second.type == VAPictureParameterBufferType) {
+            d->pending_av1_pic_blob.assign(static_cast<uint8_t*>(it->second.data), static_cast<uint8_t*>(it->second.data) + it->second.size);
         }
-    }
-
-    if (bitstream.empty()) {
-        return VA_STATUS_ERROR_INVALID_BUFFER;
-    }
-
-    DecodeJob job;
-    job.target_surface = d->current_surface;
-    job.bitstream = std::move(bitstream);
-    job.extra_data = std::move(extra_data);
-
-    if (!d->decoder.enqueueJob(std::move(job))) {
-        return VA_STATUS_ERROR_ALLOCATION_FAILED;
     }
 
     return VA_STATUS_SUCCESS;

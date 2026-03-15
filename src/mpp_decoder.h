@@ -7,6 +7,8 @@
 #include <stop_token>
 #include <unordered_map>
 #include <vector>
+#include <deque>
+#include <mutex>
 
 #include <va/va.h>
 #include <va/va_drmcommon.h>
@@ -101,6 +103,12 @@ private:
 
     // Per-surface readiness indicator.
     std::unordered_map<VASurfaceID, SurfaceInfo> surfaces_;
+    // Queue of pending target surfaces corresponding to jobs that have been
+    // submitted (bitstream fed to MPP). `waitSurfaceReady` will consume this
+    // queue as it pulls frames via `api_->decode_get_frame` and assign the
+    // resulting MppBuffer to the next pending surface.
+    std::deque<VASurfaceID> pending_surfaces_;
+    std::mutex pending_mutex_;
 };
 
 CodecProfile vaProfileToCodec(VAProfile profile);
