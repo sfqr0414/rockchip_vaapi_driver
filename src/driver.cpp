@@ -526,6 +526,7 @@ static VAStatus rockchip_vaEndPicture(VADriverContextP ctx,
     job.target_surface = d->current_surface;
     job.bitstream = std::move(d->frame_buffer);
     job.extra_data = std::move(d->frame_extra_data);
+    job.eos = true; // Treat EndPicture as end-of-frame mark for decoder.
 
     // Submit the complete frame to the decoder thread (which will feed MPP).
     if (!d->decoder.enqueueJob(std::move(job))) {

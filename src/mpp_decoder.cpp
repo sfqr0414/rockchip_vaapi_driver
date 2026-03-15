@@ -56,14 +56,35 @@ bool MppDecoder::initialize(CodecProfile profile, int width, int height) {
         }
     }
 
-    // Try buffer group types in priority order: DMA_HEAP then DRM. This follows
-    // RK3588 kernel preference (DMA_HEAP > DRM > ION). If both fail, initialization fails.
-    if (mpp_buffer_group_get_internal(&group_, MPP_BUFFER_TYPE_DMA_HEAP) != MPP_OK) {
-        if (mpp_buffer_group_get_internal(&group_, MPP_BUFFER_TYPE_DRM) != MPP_OK) {
-            mpp_destroy(ctx_);
-            ctx_ = nullptr;
+    // Try buffer group types in priority order: DMA_HEAP then DRM. If the
+    // chosen group doesn't produce exportable DMABUF fds, fall back.
+    auto try_group = [&](MppBufferType type, const char* name) -> bool {
+        MppBufferGroup g = nullptr;
+        if (mpp_buffer_group_get_internal(&g, type) != MPP_OK) return false;
+        // Quick check: allocate a buffer of a size similar to what we'll need and make sure it has an exportable fd.
+        MppBuffer test_buf = nullptr;
+        bool ok = false;
+        const size_t test_size = 8 * 1024 * 1024;
+        if (mpp_buffer_get(g, &test_buf, test_size) == MPP_OK && test_buf) {
+            int fd = mpp_buffer_get_fd(test_buf);
+            ok = (fd >= 0);
+            mpp_buffer_put(test_buf);
+        }
+        if (!ok) {
+            mpp_buffer_group_put(g);
             return false;
         }
+        group_ = g;
+        util::log(util::stderr_sink, util::LogLevel::Info, "mpp: using {} buffer group", name);
+        return true;
+    };
+
+    if (!try_group(MPP_BUFFER_TYPE_DMA_HEAP, "DMA_HEAP") &&
+        !try_group(MPP_BUFFER_TYPE_DRM, "DRM")) {
+        util::log(util::stderr_sink, util::LogLevel::Error, "mpp: failed to create DMA_HEAP or DRM buffer group");
+        mpp_destroy(ctx_);
+        ctx_ = nullptr;
+        return false;
     }
 
     // Bind the created external buffer group into the decoder context so output
@@ -80,7 +101,8 @@ bool MppDecoder::initialize(CodecProfile profile, int width, int height) {
 bool MppDecoder::allocateSurface(VASurfaceID id, DecodedSurface& out, int width, int height) {
     uint32_t stride = alignUp(static_cast<uint32_t>(width), 64);
     if (profile_ == CodecProfile::AV1) {
-        stride = alignUp((width * 10U + 7U) / 8U, 256U) + 256U;
+        // For 10-bit AV1, MPP expects a stride close to width*10/8 and aligned to 16.
+        stride = alignUp((width * 10U + 7U) / 8U, 16U);
     }
     out.va_id = id;
     out.width = static_cast<uint32_t>(width);
@@ -102,15 +124,21 @@ bool MppDecoder::allocateSurface(VASurfaceID id, DecodedSurface& out, int width,
     if (group_) {
         MppBuffer buf = nullptr;
         // Estimate buffer size: stride * height * bytes-per-pixel (approx).
-        size_t bpp = out.is_10bit ? 2 : 3 / 2; // 10-bit use 2 bytes per sample, 8-bit YUV420 ~1.5
-        size_t buf_size = static_cast<size_t>(out.stride) * static_cast<size_t>(out.height) * bpp;
+        // For 8-bit YUV420 use 1.5 bytes per pixel; for 10-bit YUV420 use 2.5 bytes per pixel.
+        size_t bytes_per_pixel_mul = out.is_10bit ? 5 : 3;
+        size_t bytes_per_pixel_div = out.is_10bit ? 2 : 2;
+        size_t buf_size = (static_cast<size_t>(out.stride) * static_cast<size_t>(out.height) * bytes_per_pixel_mul) / bytes_per_pixel_div;
         if (buf_size == 0) buf_size = 8 * 1024 * 1024; // fallback 8MB
         if (mpp_buffer_get(group_, &buf, buf_size) == MPP_OK && buf) {
             int fd = mpp_buffer_get_fd(buf);
+            util::log(util::stderr_sink, util::LogLevel::Debug,
+                      "mpp: allocated surface {} buf_size={} fd={}", id, buf_size, fd);
             info.buffer = buf;
             info.dmabuf_fd = fd;
         } else {
             // Allocation failed — leave buffer null and fd -1, but continue.
+            util::log(util::stderr_sink, util::LogLevel::Warn,
+                      "mpp: failed to allocate buffer for surface %u (size=%zu)", id, buf_size);
             info.buffer = nullptr;
             info.dmabuf_fd = -1;
         }
@@ -163,79 +191,14 @@ bool MppDecoder::waitSurfaceReady(VASurfaceID surface, uint32_t timeout_ms) {
     if (!ready_flag) return false;
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
-    while (std::chrono::steady_clock::now() < deadline) {
-        MppFrame frame = nullptr;
-        mpp_frame_init(&frame);
-        int cret = api_->decode_get_frame(ctx_, &frame);
-        if (cret != MPP_OK || !frame) {
-            if (frame) mpp_frame_deinit(&frame);
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            continue;
-        }
-
-        if (mpp_frame_get_info_change(frame)) {
-            uint32_t new_w = mpp_frame_get_width(frame);
-            uint32_t new_h = mpp_frame_get_height(frame);
-            uint32_t new_stride = mpp_frame_get_hor_stride(frame);
-            std::lock_guard<std::mutex> lock(g_surfaces_mutex);
-            for (auto& pair : surfaces_) {
-                pair.second.width = new_w;
-                pair.second.height = new_h;
-                pair.second.stride = new_stride;
-            }
-            api_->control(ctx_, MPP_DEC_SET_INFO_CHANGE_READY, nullptr);
-            mpp_frame_deinit(&frame);
-            continue;
-        }
-
-        MppBuffer buf = mpp_frame_get_buffer(frame);
-        if (buf) {
-            mpp_buffer_inc_ref(buf);
-            int fd = mpp_buffer_get_fd(buf);
-            VASurfaceID target = VA_INVALID_ID;
-            {
-                std::lock_guard<std::mutex> plock(pending_mutex_);
-                if (!pending_surfaces_.empty()) {
-                    target = pending_surfaces_.front();
-                    pending_surfaces_.pop_front();
-                }
-            }
-
-            if (target != VA_INVALID_ID) {
-                std::lock_guard<std::mutex> lock(g_surfaces_mutex);
-                auto it = surfaces_.find(target);
-                if (it != surfaces_.end()) {
-                    if (it->second.buffer) mpp_buffer_put(it->second.buffer);
-                    it->second.buffer = buf;
-                    it->second.dmabuf_fd = fd;
-                    it->second.width = mpp_frame_get_width(frame);
-                    it->second.height = mpp_frame_get_height(frame);
-                    it->second.stride = mpp_frame_get_hor_stride(frame);
-                    if (it->second.ready) it->second.ready->store(true);
-                    if (failed_flag && target == surface) failed_flag->store(false);
-                } else {
-                    mpp_buffer_put(buf);
-                }
-            } else {
-                mpp_buffer_put(buf);
-            }
-        }
-
-        mpp_frame_deinit(&frame);
-
-        {
-            std::lock_guard<std::mutex> lock(g_surfaces_mutex);
-            auto it = surfaces_.find(surface);
-            if (it != surfaces_.end() && it->second.ready && it->second.ready->load()) {
-                return true;
-            }
-            if (it != surfaces_.end() && it->second.decode_failed && it->second.decode_failed->load()) {
-                return false;
-            }
-        }
+    std::unique_lock<std::mutex> lock(cv_mutex_);
+    while (!ready_flag->load()) {
+        if (std::chrono::steady_clock::now() >= deadline) break;
+        cv_.wait_until(lock, deadline);
     }
 
-    return false;
+    if (failed_flag && failed_flag->load()) return false;
+    return ready_flag->load();
 }
 
 void MppDecoder::shutdown() {
@@ -303,12 +266,19 @@ bool MppDecoder::processJob(const DecodeJob& job) {
     std::span<const uint8_t> bit(job.bitstream);
     MppPacket pkt;
     mpp_packet_init(&pkt, const_cast<uint8_t*>(bit.data()), bit.size());
+    if (job.eos) {
+        mpp_packet_set_eos(pkt);
+    }
     int ret = api_->decode_put_packet(ctx_, pkt);
     mpp_packet_deinit(&pkt);
 
     if (ret != MPP_OK) {
         if (failed_flag) failed_flag->store(true);
-        if (ready_flag) ready_flag->store(true);
+        if (ready_flag) {
+            ready_flag->store(true);
+            std::lock_guard<std::mutex> lock(cv_mutex_);
+            cv_.notify_all();
+        }
         return false;
     }
 
@@ -371,7 +341,12 @@ bool MppDecoder::processJob(const DecodeJob& job) {
         mpp_frame_deinit(&frame);
     }
 
-    if (ready_flag) ready_flag->store(true);
+    if (ready_flag) {
+        ready_flag->store(true);
+        std::lock_guard<std::mutex> lock(cv_mutex_);
+        cv_.notify_all();
+    }
+
     // Ensure surfaces_ contains the latest dmabuf_fd for the surface even if
     // the fd was obtained during frame handling above.
     {

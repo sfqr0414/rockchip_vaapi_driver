@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <memory>
 #include <thread>
@@ -45,6 +46,7 @@ struct DecodeJob {
     VASurfaceID target_surface = VA_INVALID_ID;
     std::vector<uint8_t> bitstream;
     std::vector<uint8_t> extra_data; // For SPS/PPS or AV1 Sequence Header
+    bool eos = false;
 };
 
 struct SurfaceInfo {
@@ -103,12 +105,17 @@ private:
 
     // Per-surface readiness indicator.
     std::unordered_map<VASurfaceID, SurfaceInfo> surfaces_;
+
     // Queue of pending target surfaces corresponding to jobs that have been
-    // submitted (bitstream fed to MPP). `waitSurfaceReady` will consume this
-    // queue as it pulls frames via `api_->decode_get_frame` and assign the
-    // resulting MppBuffer to the next pending surface.
+    // submitted (bitstream fed to MPP). The decoder thread will use this list
+    // to associate output frames with the correct VA surface.
     std::deque<VASurfaceID> pending_surfaces_;
     std::mutex pending_mutex_;
+
+    // Condition variable used by waitSurfaceReady to block until the decoder
+    // thread reports that a surface is ready (or has failed).
+    std::mutex cv_mutex_;
+    std::condition_variable cv_;
 };
 
 CodecProfile vaProfileToCodec(VAProfile profile);
