@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <memory>
 #include <thread>
+#include <stop_token>
 #include <unordered_map>
 #include <vector>
 
@@ -84,7 +85,7 @@ public:
     void shutdown();
 
 private:
-    void decoderThreadMain();
+    void decoderThreadMain(std::stop_token st);
     bool processJob(const DecodeJob& job);
     bool drainFrames(const DecodeJob& job, SurfaceInfo& info);
     CodecProfile profile_{CodecProfile::Unknown};
@@ -96,7 +97,7 @@ private:
     util::AtomicSyncQueue<DecodeJob, 16> job_queue_;
 
     std::atomic<bool> running_{false};
-    std::thread decoder_thread_;
+    std::jthread decoder_thread_;
 
     // Per-surface readiness indicator.
     std::unordered_map<VASurfaceID, SurfaceInfo> surfaces_;

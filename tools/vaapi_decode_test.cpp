@@ -10,6 +10,7 @@
 
 #include <vector>
 #include <string>
+#include <fstream>
 
 static bool read_file(const char* path, std::vector<uint8_t>& out) {
     std::ifstream f(path, std::ios::binary | std::ios::ate);

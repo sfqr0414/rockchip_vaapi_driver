@@ -45,7 +45,8 @@ bool MppDecoder::initialize(CodecProfile profile, int width, int height) {
     // If the SDK provides mpp_dec_cfg helpers, set the 'base:split_parse' flag.
     // These symbols are normally available in Rockchip MPP builds; if not,
     // the calls are skipped safely by checking their presence at compile-time.
-#if defined(HAVE_MPP_DEC_CFG)
+    // Force-enable split-parse so MPP will split input into smaller packets
+    // required by some hardware decoders. Use the cfg helper unconditionally.
     {
         MppDecCfg cfg = nullptr;
         if (mpp_dec_cfg_init(&cfg) == MPP_OK && cfg) {
@@ -54,13 +55,20 @@ bool MppDecoder::initialize(CodecProfile profile, int width, int height) {
             mpp_dec_cfg_deinit(cfg);
         }
     }
-#endif
 
+    // Try buffer group types in priority order: DMA_HEAP then DRM. This follows
+    // RK3588 kernel preference (DMA_HEAP > DRM > ION). If both fail, initialization fails.
     if (mpp_buffer_group_get_internal(&group_, MPP_BUFFER_TYPE_DMA_HEAP) != MPP_OK) {
-        mpp_destroy(ctx_);
-        ctx_ = nullptr;
-        return false;
+        if (mpp_buffer_group_get_internal(&group_, MPP_BUFFER_TYPE_DRM) != MPP_OK) {
+            mpp_destroy(ctx_);
+            ctx_ = nullptr;
+            return false;
+        }
     }
+
+    // Bind the created external buffer group into the decoder context so output
+    // buffers are allocated from this group and can provide exportable DMABUF fds.
+    api_->control(ctx_, MPP_DEC_SET_EXT_BUF_GROUP, group_);
 
     // Short output timeout to avoid long hangs in tests
     RK_U32 timeout = 100; // ms
@@ -87,6 +95,26 @@ bool MppDecoder::allocateSurface(VASurfaceID id, DecodedSurface& out, int width,
     info.stride = out.stride;
     info.ready = std::make_shared<std::atomic<bool>>(false);
     info.decode_failed = std::make_shared<std::atomic<bool>>(false);
+
+    // Try to allocate an output buffer from the bound group so we have an
+    // exportable DMABUF ready for VA to import/export. This ensures the
+    // surface mapping contains a real MppBuffer and fd before decoding.
+    if (group_) {
+        MppBuffer buf = nullptr;
+        // Estimate buffer size: stride * height * bytes-per-pixel (approx).
+        size_t bpp = out.is_10bit ? 2 : 3 / 2; // 10-bit use 2 bytes per sample, 8-bit YUV420 ~1.5
+        size_t buf_size = static_cast<size_t>(out.stride) * static_cast<size_t>(out.height) * bpp;
+        if (buf_size == 0) buf_size = 8 * 1024 * 1024; // fallback 8MB
+        if (mpp_buffer_get(group_, &buf, buf_size) == MPP_OK && buf) {
+            int fd = mpp_buffer_get_fd(buf);
+            info.buffer = buf;
+            info.dmabuf_fd = fd;
+        } else {
+            // Allocation failed — leave buffer null and fd -1, but continue.
+            info.buffer = nullptr;
+            info.dmabuf_fd = -1;
+        }
+    }
 
     std::lock_guard<std::mutex> lock(g_surfaces_mutex);
     surfaces_[id] = std::move(info);
@@ -151,7 +179,11 @@ void MppDecoder::shutdown() {
     }
     if (group_) {
         for (auto& pair : surfaces_) {
-            if (pair.second.buffer) mpp_buffer_put(pair.second.buffer);
+            if (pair.second.buffer) {
+                mpp_buffer_put(pair.second.buffer);
+                pair.second.buffer = nullptr;
+                pair.second.dmabuf_fd = -1;
+            }
         }
         mpp_buffer_group_put(group_);
         group_ = nullptr;
@@ -235,12 +267,15 @@ bool MppDecoder::processJob(const DecodeJob& job) {
 
         MppBuffer buf = mpp_frame_get_buffer(frame);
         if (buf) {
+            // Increment buffer ref before querying/exporting FD to ensure the
+            // buffer remains valid while we inspect and assign it to our surface
+            // structure. If we don't keep a ref and fail to store it, we must put it.
+            mpp_buffer_inc_ref(buf);
             int fd = mpp_buffer_get_fd(buf);
             if (fd >= 0) {
                 std::lock_guard<std::mutex> lock(g_surfaces_mutex);
                 auto it = surfaces_.find(job.target_surface);
                 if (it != surfaces_.end()) {
-                    mpp_buffer_inc_ref(buf);
                     if (it->second.buffer) mpp_buffer_put(it->second.buffer);
                     it->second.buffer = buf;
                     it->second.dmabuf_fd = fd;
@@ -249,7 +284,13 @@ bool MppDecoder::processJob(const DecodeJob& job) {
                     // Immediately update stride from frame to avoid mismatch
                     it->second.stride = mpp_frame_get_hor_stride(frame);
                     got = true;
+                } else {
+                    // No surface entry to attach to; release our ref.
+                    mpp_buffer_put(buf);
                 }
+            } else {
+                // Buffer has no exportable fd; drop our ref.
+                mpp_buffer_put(buf);
             }
         }
 
@@ -257,6 +298,17 @@ bool MppDecoder::processJob(const DecodeJob& job) {
     }
 
     if (ready_flag) ready_flag->store(true);
+    // Ensure surfaces_ contains the latest dmabuf_fd for the surface even if
+    // the fd was obtained during frame handling above.
+    {
+        std::lock_guard<std::mutex> lock(g_surfaces_mutex);
+        auto it = surfaces_.find(job.target_surface);
+        if (it != surfaces_.end() && it->second.buffer) {
+            int fd = mpp_buffer_get_fd(it->second.buffer);
+            it->second.dmabuf_fd = fd;
+        }
+    }
+
     return got;
 }
 
