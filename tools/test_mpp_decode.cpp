@@ -33,13 +33,26 @@ static bool readFile(const char* path, std::vector<uint8_t>& out) {
 
 int main(int argc, char** argv) {
     const char* inPath = "./videos/test.h264";
+    const char* codecStr = "h264";
     if (argc > 1) inPath = argv[1];
+    if (argc > 2) codecStr = argv[2];
 
     std::vector<uint8_t> bitstream;
     if (!readFile(inPath, bitstream)) {
         fprintf(stderr, "Failed to read input file: %s\n", inPath);
         return 1;
     }
+
+    MppCodingType codec = MPP_VIDEO_CodingAVC;
+    if (strcmp(codecStr, "av1") == 0) {
+        codec = MPP_VIDEO_CodingAV1;
+    } else if (strcmp(codecStr, "hevc") == 0) {
+        codec = MPP_VIDEO_CodingHEVC;
+    } else if (strcmp(codecStr, "vp9") == 0) {
+        codec = MPP_VIDEO_CodingVP9;
+    }
+
+    fprintf(stderr, "Using codec %s\n", codecStr);
 
     MppCtx ctx;
     MppApi* api = nullptr;
@@ -48,8 +61,8 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    if (mpp_init(ctx, MPP_CTX_DEC, MPP_VIDEO_CodingAVC) != MPP_OK) {
-        fprintf(stderr, "mpp_init failed\n");
+    if (mpp_init(ctx, MPP_CTX_DEC, codec) != MPP_OK) {
+        fprintf(stderr, "mpp_init failed (codec=%s)\n", codecStr);
         mpp_destroy(ctx);
         return 1;
     }

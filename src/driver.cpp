@@ -2,10 +2,12 @@
 #include "util/log.h"
 
 #include <cstdarg>
+#include <cstddef>
 #include <va/va.h>
 #include <va/va_backend.h>
 #include <va/va_drm.h>
 #include <va/va_drmcommon.h>
+#include <va/va_dec_av1.h>
 #include <drm/drm_fourcc.h>
 
 #include <atomic>
@@ -13,6 +15,7 @@
 #include <cstring>
 #include <memory>
 #include <unordered_map>
+#include <vector>
 
 using namespace rockchip;
 
@@ -43,6 +46,7 @@ struct BufferInfo {
     void* data = nullptr;
     size_t size = 0;
     VABufferType type = static_cast<VABufferType>(0);
+    uint32_t num_elements = 0;
 };
 
 struct DriverState {
@@ -61,6 +65,71 @@ struct DriverState {
     uint32_t picture_width = 0;
     uint32_t picture_height = 0;
 };
+
+static ptrdiff_t findStartCode(const std::vector<uint8_t>& data, size_t start, size_t& code_len) {
+    if (data.size() < 3 || start >= data.size()) return -1;
+    for (size_t i = start; i + 3 < data.size(); ++i) {
+        if (data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1) {
+            code_len = 3;
+            return static_cast<ptrdiff_t>(i);
+        }
+        if (i + 4 < data.size() && data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 0 && data[i + 3] == 1) {
+            code_len = 4;
+            return static_cast<ptrdiff_t>(i);
+        }
+    }
+    return -1;
+}
+
+static bool extractAv1SequenceHeader(const std::vector<uint8_t>& bitstream,
+                                     size_t& start,
+                                     size_t& end) {
+    size_t cursor = 0;
+    while (cursor < bitstream.size()) {
+        size_t code_len = 0;
+        ptrdiff_t pos = findStartCode(bitstream, cursor, code_len);
+        if (pos < 0) break;
+        size_t header_pos = static_cast<size_t>(pos) + code_len;
+        if (header_pos >= bitstream.size()) break;
+        uint8_t obu_header = bitstream[header_pos];
+        uint8_t obu_type = (obu_header >> 3) & 0x1F;
+        if (obu_type == 1) {
+            size_t next_start = header_pos + 1;
+            size_t next_len = 0;
+            ptrdiff_t next_pos = findStartCode(bitstream, next_start, next_len);
+            start = static_cast<size_t>(pos);
+            end = (next_pos < 0) ? bitstream.size() : static_cast<size_t>(next_pos);
+            return true;
+        }
+        cursor = static_cast<size_t>(pos) + 1;
+    }
+    return false;
+}
+
+static std::vector<uint8_t> synthesizeAv1SequenceHeader(const VADecPictureParameterBufferAV1& pic) {
+    std::vector<uint8_t> header;
+    header.insert(header.end(), {0x00, 0x00, 0x00, 0x01});
+    constexpr uint8_t obu_header = 0x0A; // obu_type=1 (Sequence), has_size_field=1
+    header.push_back(obu_header);
+    std::vector<uint8_t> payload;
+    payload.push_back(static_cast<uint8_t>(pic.profile & 0x07));
+    payload.push_back(static_cast<uint8_t>((pic.frame_width_minus1 + 1) & 0xFF));
+    payload.push_back(static_cast<uint8_t>(((pic.frame_width_minus1 + 1) >> 8) & 0xFF));
+    payload.push_back(static_cast<uint8_t>((pic.frame_height_minus1 + 1) & 0xFF));
+    payload.push_back(static_cast<uint8_t>(((pic.frame_height_minus1 + 1) >> 8) & 0xFF));
+    payload.push_back(static_cast<uint8_t>(pic.bit_depth_idx));
+    payload.push_back(static_cast<uint8_t>(((pic.frame_width_minus1 + 1) >> 16) & 0xFF));
+    payload.push_back(static_cast<uint8_t>(((pic.frame_height_minus1 + 1) >> 16) & 0xFF));
+    uint32_t payload_size = static_cast<uint32_t>(payload.size());
+    do {
+        uint8_t byte = payload_size & 0x7F;
+        payload_size >>= 7;
+        if (payload_size) byte |= 0x80;
+        header.push_back(byte);
+    } while (payload_size);
+    header.insert(header.end(), payload.begin(), payload.end());
+    return header;
+}
 
 static DriverState* toDriver(VADriverContextP ctx) {
     return reinterpret_cast<DriverState*>(ctx->pDriverData);
@@ -113,6 +182,7 @@ static VAStatus rockchip_vaCreateSurfaces(VADriverContextP ctx,
         state->surface.width = static_cast<uint32_t>(width);
         state->surface.height = static_cast<uint32_t>(height);
         state->surface.stride = ((state->surface.width + 63) / 64) * 64;
+        state->surface.is_10bit = (d->profile == VAProfileAV1Profile0);
         state->surface.ready.store(false);
 
         // Allocate a buffer for the surface using MPP.
@@ -162,11 +232,17 @@ static VAStatus rockchip_vaSyncSurface(VADriverContextP ctx, VASurfaceID surface
     // Update the driver-side surface dimensions/stride from the decoder (in case MPP changed resolution).
     uint32_t width, height, stride;
     int fd;
-    if (d->decoder.getSurfaceInfo(surface, width, height, stride, fd)) {
+    bool failed = false;
+    if (d->decoder.getSurfaceInfo(surface, width, height, stride, fd, failed)) {
+        if (failed || fd < 0) {
+            // If the surface reached ready state but has no valid FD, it's a decoding failure or flush.
+            return (failed) ? VA_STATUS_ERROR_DECODING_ERROR : VA_STATUS_ERROR_INVALID_SURFACE;
+        }
         it->second->surface.width = width;
         it->second->surface.height = height;
         it->second->surface.stride = stride;
         it->second->surface.dmabuf_fd = fd;
+        it->second->surface.ready.store(true);
     }
 
     return VA_STATUS_SUCCESS;
@@ -357,7 +433,7 @@ static VAStatus rockchip_vaCreateBuffer(VADriverContextP ctx,
     }
 
     VABufferID id = d->next_buffer_id++;
-    d->buffers[id] = {ptr, total_size, type};
+    d->buffers[id] = {ptr, total_size, type, num_elements};
     *buf_id = id;
     return VA_STATUS_SUCCESS;
 }
@@ -370,8 +446,7 @@ static VAStatus rockchip_vaBufferSetNumElements(VADriverContextP ctx,
     auto it = d->buffers.find(buf_id);
     if (it == d->buffers.end()) return VA_STATUS_ERROR_INVALID_BUFFER;
 
-    // No-op: we don't track element count separately.
-    (void)num_elements;
+    it->second.num_elements = num_elements;
     return VA_STATUS_SUCCESS;
 }
 
@@ -727,30 +802,90 @@ static VAStatus rockchip_vaRenderPicture(VADriverContextP ctx,
     if (!d) return VA_STATUS_ERROR_INVALID_CONTEXT;
     if (!buffers || num_buffers <= 0) return VA_STATUS_ERROR_INVALID_PARAMETER;
 
-    // Collect bitstream from slice data buffers.
     std::vector<uint8_t> bitstream;
+    std::vector<uint8_t> extra_data;
+    const uint8_t start_code[] = {0, 0, 0, 1};
+    const VADecPictureParameterBufferAV1* av1_picture = nullptr;
+
+    // First pass: find slice parameters and picture parameters
+    std::vector<VASliceParameterBufferH264*> h264_slices;
+    std::vector<VASliceParameterBufferHEVC*> hevc_slices;
+    std::vector<VASliceParameterBufferAV1*> av1_slices;
+
     for (int i = 0; i < num_buffers; i++) {
         auto it = d->buffers.find(buffers[i]);
         if (it == d->buffers.end()) continue;
-        if (it->second.type != VASliceDataBufferType) continue;
 
-        auto* data = static_cast<uint8_t*>(it->second.data);
-        if (!data || it->second.size == 0) continue;
+        if (it->second.type == VASliceParameterBufferType) {
+            uint32_t num = it->second.num_elements;
+            if (d->profile == VAProfileH264High) {
+                auto* p = static_cast<VASliceParameterBufferH264*>(it->second.data);
+                for (uint32_t j = 0; j < num; j++) h264_slices.push_back(&p[j]);
+            } else if (d->profile == VAProfileHEVCMain) {
+                auto* p = static_cast<VASliceParameterBufferHEVC*>(it->second.data);
+                for (uint32_t j = 0; j < num; j++) hevc_slices.push_back(&p[j]);
+            } else if (d->profile == VAProfileAV1Profile0) {
+                auto* p = static_cast<VASliceParameterBufferAV1*>(it->second.data);
+                for (uint32_t j = 0; j < num; j++) av1_slices.push_back(&p[j]);
+            }
+        }
+        if (av1_picture == nullptr && d->profile == VAProfileAV1Profile0 && it->second.type == VAPictureParameterBufferType) {
+            if (it->second.size >= sizeof(VADecPictureParameterBufferAV1)) {
+                av1_picture = static_cast<const VADecPictureParameterBufferAV1*>(it->second.data);
+            }
+        }
+    }
 
-        bitstream.insert(bitstream.end(), data, data + it->second.size);
+    // Second pass: extract bitstream data using slices
+    for (int i = 0; i < num_buffers; i++) {
+        auto it = d->buffers.find(buffers[i]);
+        if (it == d->buffers.end()) continue;
+
+        if (it->second.type == VASliceDataBufferType) {
+            uint8_t* data = static_cast<uint8_t*>(it->second.data);
+            
+            if (d->profile == VAProfileH264High && !h264_slices.empty()) {
+                for (auto* s : h264_slices) {
+                    bitstream.insert(bitstream.end(), start_code, start_code + 4);
+                    bitstream.insert(bitstream.end(), data + s->slice_data_offset, data + s->slice_data_offset + s->slice_data_size);
+                }
+            } else if (d->profile == VAProfileHEVCMain && !hevc_slices.empty()) {
+                for (auto* s : hevc_slices) {
+                    bitstream.insert(bitstream.end(), start_code, start_code + 4);
+                    bitstream.insert(bitstream.end(), data + s->slice_data_offset, data + s->slice_data_offset + s->slice_data_size);
+                }
+            } else if (d->profile == VAProfileAV1Profile0 && !av1_slices.empty()) {
+                for (auto* s : av1_slices) {
+                    // AV1 slices are OBUs. They typically don't use 0001 start codes in the same way,
+                    // but MPP might expect them if it's in Annex B mode. 
+                    // Most libva AV1 slices have the OBU header already.
+                    bitstream.insert(bitstream.end(), data + s->slice_data_offset, data + s->slice_data_offset + s->slice_data_size);
+                }
+            } else {
+                // Fallback: raw copy if no slices found
+                bitstream.insert(bitstream.end(), data, data + it->second.size);
+            }
+        }
+    }
+
+    if (d->profile == VAProfileAV1Profile0 && extra_data.empty()) {
+        size_t seq_start = 0;
+        size_t seq_end = 0;
+        if (extractAv1SequenceHeader(bitstream, seq_start, seq_end)) {
+            extra_data.assign(bitstream.begin() + seq_start, bitstream.begin() + seq_end);
+        } else if (av1_picture) {
+            extra_data = synthesizeAv1SequenceHeader(*av1_picture);
+        }
     }
 
     if (bitstream.empty()) {
         return VA_STATUS_ERROR_INVALID_BUFFER;
     }
 
-    // Save the buffer IDs for potential future use.
-    d->current_buffers.assign(buffers, buffers + num_buffers);
-
-    // Enqueue decode job for the current surface.
     DecodeJob job;
     job.target_surface = d->current_surface;
     job.bitstream = std::move(bitstream);
+    job.extra_data = std::move(extra_data);
 
     if (!d->decoder.enqueueJob(std::move(job))) {
         return VA_STATUS_ERROR_ALLOCATION_FAILED;

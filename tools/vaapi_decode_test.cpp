@@ -32,31 +32,18 @@ static bool read_file(const char* path, std::vector<uint8_t>& out) {
 
 static bool extract_elementary_stream(const char* mp4_path,
                                      const char* parser_name,
-                                     const char* caps,
-                                     bool caps_before_parser,
+                                     const char* output_caps,
                                      std::vector<uint8_t>& out) {
-    // Create a temporary file for the extracted elementary stream.
     char tmp_path[] = "/tmp/vaapi_decode_test_XXXXXX";
     int tmp_fd = mkstemp(tmp_path);
     if (tmp_fd < 0) return false;
     close(tmp_fd);
 
-    // Build a GStreamer pipeline for extracting the elementary stream.
     std::string cmd = "gst-launch-1.0 -q filesrc location=\"" + std::string(mp4_path) +
-                      "\" ! qtdemux name=d d.video_0 ! queue";
-
-    if (parser_name && caps) {
-        if (caps_before_parser) {
-            cmd += " ! ";
-            cmd += caps;
-            cmd += " ! ";
-            cmd += parser_name;
-        } else {
-            cmd += " ! ";
-            cmd += parser_name;
-            cmd += " ! ";
-            cmd += caps;
-        }
+                      "\" ! qtdemux name=d d.video_0 ! queue ! " + std::string(parser_name);
+    
+    if (output_caps && strlen(output_caps) > 0) {
+        cmd += " ! \"" + std::string(output_caps) + "\"";
     }
 
     cmd += " ! filesink location=\"" + std::string(tmp_path) + "\"";
@@ -72,176 +59,111 @@ static bool extract_elementary_stream(const char* mp4_path,
     return ok;
 }
 
-static bool extract_av1c_from_mp4(const char* mp4_path, std::vector<uint8_t>& out) {
-    std::vector<uint8_t> data;
-    if (!read_file(mp4_path, data)) return false;
-    size_t offset = 0;
-    while (offset + 8 <= data.size()) {
-        uint32_t size = (uint32_t(data[offset]) << 24) | (uint32_t(data[offset + 1]) << 16) |
-                        (uint32_t(data[offset + 2]) << 8) | uint32_t(data[offset + 3]);
-        char type[5] = {char(data[offset + 4]), char(data[offset + 5]), char(data[offset + 6]), char(data[offset + 7]), 0};
-        if (size < 8) break;
-        if (offset + size > data.size()) break;
-        if (strcmp(type, "av1C") == 0) {
-            // AV1CodecConfigurationRecord: skip the fixed header and return configOBUs.
-            // Per ISO/IEC 14496-12, the first 22 bytes are the header fields.
-            size_t header_size = 22;
-            if (size <= 8 + header_size) return false;
-            out.assign(data.begin() + offset + 8 + header_size, data.begin() + offset + size);
-            return !out.empty();
-        }
-        offset += size;
-    }
-    return false;
-}
-
 int main(int argc, char** argv) {
-    const char* file = "./videos/Test Jellyfin 1080p AVC 20M.mp4";
-    if (argc > 1) file = argv[1];
+    if (argc < 2) {
+        fprintf(stderr, "Usage: %s <file.mp4> [width] [height] [codec: h264|hevc|av1]\n", argv[0]);
+        return 1;
+    }
+    const char* file = argv[1];
+    int width = (argc > 2) ? atoi(argv[2]) : 1920;
+    int height = (argc > 3) ? atoi(argv[3]) : 1080;
+    std::string codec_hint = (argc > 4) ? argv[4] : "";
 
     std::vector<uint8_t> bitstream;
     VAProfile profile = VAProfileH264High;
 
-    // Use the file name to choose which codec to pull from the container.
     std::string file_str(file);
-    const bool is_mp4 = file_str.ends_with(".mp4");
+    const char* parser = nullptr;
+    const char* out_caps = nullptr;
 
-    if (is_mp4) {
-        const char* parser = nullptr;
-        const char* caps = nullptr;
-        bool caps_before_parser = false;
-        if (file_str.find("AVC") != std::string::npos) {
-            parser = "h264parse";
-            caps = "video/x-h264,stream-format=byte-stream";
-            profile = VAProfileH264High;
-        } else if (file_str.find("HEVC") != std::string::npos) {
-            parser = "h265parse";
-            caps = "video/x-h265,stream-format=byte-stream";
-            profile = VAProfileHEVCMain;
-        } else if (file_str.find("AV1") != std::string::npos) {
-            // For AV1, use the stream caps first (as in a working gst-launch pipeline) so
-            // the parser sees the correct input format and can emit a usable byte-stream.
-            parser = "av1parse";
-            caps = "video/x-av1";
-            caps_before_parser = true;
-            profile = VAProfileAV1Profile0;
-        } else {
-            fprintf(stderr, "Unable to infer codec from filename: %s\n", file);
-            return 1;
-        }
+    if (codec_hint == "h264" || (codec_hint == "" && file_str.find("AVC") != std::string::npos)) {
+        parser = "h264parse";
+        out_caps = "video/x-h264,stream-format=byte-stream";
+        profile = VAProfileH264High;
+    } else if (codec_hint == "hevc" || (codec_hint == "" && file_str.find("HEVC") != std::string::npos)) {
+        parser = "h265parse";
+        out_caps = "video/x-h265,stream-format=byte-stream";
+        profile = VAProfileHEVCMain;
+    } else if (codec_hint == "av1" || (codec_hint == "" && file_str.find("AV1") != std::string::npos)) {
+        parser = "av1parse";
+        out_caps = "";
+        profile = VAProfileAV1Profile0;
+    }
 
-        if (!extract_elementary_stream(file, parser, caps, caps_before_parser, bitstream)) {
-            fprintf(stderr, "Failed to extract elementary stream from: %s\n", file);
-            return 1;
-        }
-
-        // For AV1, prepend the av1C box data from the MP4 container so the decoder has
-        // the required sequence header / initial OBU units.
-        if (profile == VAProfileAV1Profile0) {
-            std::vector<uint8_t> av1c;
-            if (extract_av1c_from_mp4(file, av1c) && !av1c.empty()) {
-                std::vector<uint8_t> merged;
-                merged.reserve(av1c.size() + bitstream.size());
-                merged.insert(merged.end(), av1c.begin(), av1c.end());
-                merged.insert(merged.end(), bitstream.begin(), bitstream.end());
-                bitstream.swap(merged);
-            }
-        }
-    } else {
-        if (!read_file(file, bitstream)) {
-            fprintf(stderr, "Failed to read input file: %s\n", file);
-            return 1;
-        }
+    if (!extract_elementary_stream(file, parser, out_caps, bitstream)) {
+        return 1;
     }
 
     const char* drm_path = "/dev/dri/renderD128";
     int drm_fd = open(drm_path, O_RDWR);
-    if (drm_fd < 0) {
-        perror("open drm device");
-        return 1;
-    }
+    if (drm_fd < 0) return 1;
 
     VADisplay display = vaGetDisplayDRM(drm_fd);
-    if (!display) {
-        fprintf(stderr, "vaGetDisplayDRM failed\n");
-        close(drm_fd);
-        return 1;
-    }
+    if (!display) return 1;
 
     int major = 0, minor = 0;
-    VAStatus status = vaInitialize(display, &major, &minor);
-    if (status != VA_STATUS_SUCCESS) {
-        fprintf(stderr, "vaInitialize failed: %d\n", status);
-        close(drm_fd);
-        return 1;
-    }
-    fprintf(stderr, "vaInitialize %d.%d\n", major, minor);
-
-    int num_profiles = 0;
-    status = vaQueryConfigProfiles(display, nullptr, &num_profiles);
-    fprintf(stderr, "vaQueryConfigProfiles: %d profiles\n", num_profiles);
-
-    VAEntrypoint entrypoint = VAEntrypointVLD;
-    VAConfigAttrib attrib;
-    attrib.type = VAConfigAttribRTFormat;
-    status = vaGetConfigAttributes(display, profile, entrypoint, &attrib, 1);
-    fprintf(stderr, "vaGetConfigAttributes(rtformat) = 0x%x status=%d\n", attrib.value, status);
+    if (vaInitialize(display, &major, &minor) != VA_STATUS_SUCCESS) return 1;
 
     VAConfigID config_id;
-    status = vaCreateConfig(display, profile, entrypoint, &attrib, 1, &config_id);
-    if (status != VA_STATUS_SUCCESS) {
-        fprintf(stderr, "vaCreateConfig failed %d\n", status);
-        return 1;
-    }
+    vaCreateConfig(display, profile, VAEntrypointVLD, nullptr, 0, &config_id);
 
-    const int width = 1920;
-    const int height = 1080;
-    VASurfaceID surface;
-    status = vaCreateSurfaces(display, VA_RT_FORMAT_YUV420, width, height, &surface, 1, nullptr, 0);
-    if (status != VA_STATUS_SUCCESS) {
-        fprintf(stderr, "vaCreateSurfaces failed %d\n", status);
-        return 1;
-    }
+    VASurfaceID surfaces[2];
+    vaCreateSurfaces(display, VA_RT_FORMAT_YUV420, width, height, surfaces, 2, nullptr, 0);
 
     VAContextID context;
-    status = vaCreateContext(display, config_id, width, height, 0, &surface, 1, &context);
-    if (status != VA_STATUS_SUCCESS) {
-        fprintf(stderr, "vaCreateContext failed %d\n", status);
-        return 1;
+    vaCreateContext(display, config_id, width, height, VA_PROGRESSIVE, surfaces, 2, &context);
+
+    auto findStartCode = [&](size_t start, size_t& code_len) -> ssize_t {
+        for (size_t i = start; i + 3 < bitstream.size(); ++i) {
+            if (bitstream[i] == 0 && bitstream[i + 1] == 0 && bitstream[i + 2] == 1) {
+                code_len = 3;
+                return static_cast<ssize_t>(i);
+            }
+            if (i + 4 < bitstream.size() && bitstream[i] == 0 && bitstream[i + 1] == 0 && bitstream[i + 2] == 0 && bitstream[i + 3] == 1) {
+                code_len = 4;
+                return static_cast<ssize_t>(i);
+            }
+        }
+        return -1;
+    };
+
+    int surface_idx = 0;
+    size_t cursor = 0;
+    while (cursor < bitstream.size()) {
+        size_t start_len = 0;
+        ssize_t start_pos = findStartCode(cursor, start_len);
+        if (start_pos < 0) break;
+
+        size_t search_start = static_cast<size_t>(start_pos) + start_len;
+        size_t next_len = 0;
+        ssize_t next_pos = findStartCode(search_start, next_len);
+        size_t end_pos = (next_pos < 0) ? bitstream.size() : static_cast<size_t>(next_pos);
+        if (end_pos <= static_cast<size_t>(start_pos)) break;
+
+        std::vector<uint8_t> nal(bitstream.begin() + start_pos, bitstream.begin() + end_pos);
+        VABufferID buf;
+        vaCreateBuffer(display, context, VASliceDataBufferType, nal.size(), 1, nal.data(), &buf);
+
+        vaBeginPicture(display, context, surfaces[surface_idx % 2]);
+        vaRenderPicture(display, context, &buf, 1);
+        vaEndPicture(display, context);
+        VAStatus sync = vaSyncSurface(display, surfaces[surface_idx % 2]);
+        if (sync != VA_STATUS_SUCCESS) {
+            fprintf(stderr, "vaSyncSurface failed: %d\n", sync);
+        }
+
+        VADRMPRIMESurfaceDescriptor desc;
+        if (vaExportSurfaceHandle(display, surfaces[surface_idx % 2], VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2, VA_EXPORT_SURFACE_READ_ONLY, &desc) == VA_STATUS_SUCCESS) {
+            fprintf(stderr, "Decoded unit: surface=%d fd=%d stride=%d\n", surface_idx, desc.objects[0].fd, desc.layers[0].pitch[0]);
+            surface_idx++;
+        }
+        vaDestroyBuffer(display, buf);
+
+        if (next_pos < 0) break;
+        cursor = static_cast<size_t>(next_pos);
     }
 
-    // Create slice data buffer
-    VABufferID slice_buf;
-    status = vaCreateBuffer(display, context, VASliceDataBufferType, bitstream.size(), 1, bitstream.data(), &slice_buf);
-    if (status != VA_STATUS_SUCCESS) {
-        fprintf(stderr, "vaCreateBuffer(VASliceDataBufferType) failed %d\n", status);
-        return 1;
-    }
-
-    status = vaBeginPicture(display, context, surface);
-    if (status != VA_STATUS_SUCCESS) {
-        fprintf(stderr, "vaBeginPicture failed %d\n", status);
-        return 1;
-    }
-
-    status = vaRenderPicture(display, context, &slice_buf, 1);
-    if (status != VA_STATUS_SUCCESS) {
-        fprintf(stderr, "vaRenderPicture failed %d\n", status);
-        return 1;
-    }
-
-    status = vaEndPicture(display, context);
-    if (status != VA_STATUS_SUCCESS) {
-        fprintf(stderr, "vaEndPicture failed %d\n", status);
-        return 1;
-    }
-
-    status = vaSyncSurface(display, surface);
-    fprintf(stderr, "vaSyncSurface returned %d\n", status);
-
-    VADRMPRIMESurfaceDescriptor desc;
-    status = vaExportSurfaceHandle(display, surface, VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2, 0, &desc);
-    fprintf(stderr, "vaExportSurfaceHandle returned %d, fd=%d\n", status, desc.objects[0].fd);
-
+    vaTerminate(display);
+    close(drm_fd);
     return 0;
 }

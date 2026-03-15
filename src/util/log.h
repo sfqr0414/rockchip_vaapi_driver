@@ -1,45 +1,53 @@
 #pragma once
 
-#include <cstdio>
-#include <format>
-#include <mutex>
 #include <string_view>
+#include <format>
+#include <iostream>
 
 namespace util {
 
-struct LogSink {
-    FILE* file;
-};
-
-static inline LogSink stdout_sink{stdout};
-static inline LogSink stderr_sink{stderr};
-
 enum class LogLevel {
+    Debug,
     Info,
     Warn,
-    Error,
+    Error
 };
 
-/// Log a formatted message to the given sink.
-///
-/// @param sink Output sink (stdout/stderr, or a file pointer).
-/// @param fmt  Format string (std::format style).
-/// @param args Format arguments.
-template <typename... Args>
+struct LogSink {
+    std::ostream& os;
+};
+
+static inline LogSink stdout_sink{std::cout};
+static inline LogSink stderr_sink{std::cerr};
+
+template<typename... Args>
 void log(const LogSink& sink, LogLevel level, std::string_view fmt, Args&&... args) {
-    static std::mutex mutex;
     const char* prefix = "";
     switch (level) {
-        case LogLevel::Info: prefix = "[rockchip-vaapi] "; break;
-        case LogLevel::Warn: prefix = "[rockchip-vaapi][WARN] "; break;
-        case LogLevel::Error: prefix = "[rockchip-vaapi][ERROR] "; break;
+        case LogLevel::Debug: prefix = "[DEBUG] "; break;
+        case LogLevel::Info:  prefix = "[INFO ] "; break;
+        case LogLevel::Warn:  prefix = "[WARN ] "; break;
+        case LogLevel::Error: prefix = "[ERROR] "; break;
     }
+    
+    try {
+        auto msg = std::vformat(fmt, std::make_format_args(args...));
+        sink.os << "[rockchip-vaapi] " << prefix << msg << std::endl;
+    } catch (...) {
+        sink.os << "[rockchip-vaapi] [ERR  ] Failed to format log message" << std::endl;
+    }
+}
 
-    auto msg = std::vformat(fmt, std::make_format_args(std::forward<Args>(args)...));
-    std::lock_guard lock(mutex);
-    std::fputs(prefix, sink.file);
-    std::fputs(msg.c_str(), sink.file);
-    std::fputc('\n', sink.file);
+// Specialization for no arguments to avoid make_format_args issues.
+inline void log(const LogSink& sink, LogLevel level, std::string_view msg) {
+    const char* prefix = "";
+    switch (level) {
+        case LogLevel::Debug: prefix = "[DEBUG] "; break;
+        case LogLevel::Info:  prefix = "[INFO ] "; break;
+        case LogLevel::Warn:  prefix = "[WARN ] "; break;
+        case LogLevel::Error: prefix = "[ERROR] "; break;
+    }
+    sink.os << "[rockchip-vaapi] " << prefix << msg << std::endl;
 }
 
 } // namespace util

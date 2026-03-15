@@ -34,12 +34,14 @@ struct DecodedSurface {
     uint32_t width = 0;
     uint32_t height = 0;
     uint32_t stride = 0;
+    bool is_10bit = false;
     std::atomic<bool> ready{false};
 };
 
 struct DecodeJob {
     VASurfaceID target_surface = VA_INVALID_ID;
     std::vector<uint8_t> bitstream;
+    std::vector<uint8_t> extra_data; // For SPS/PPS or AV1 Sequence Header
 };
 
 struct SurfaceInfo {
@@ -52,6 +54,7 @@ struct SurfaceInfo {
     uint32_t height = 0;
     uint32_t stride = 0;
     std::shared_ptr<std::atomic<bool>> ready;
+    std::shared_ptr<std::atomic<bool>> decode_failed;
 };
 
 class MppDecoder {
@@ -72,7 +75,7 @@ public:
     /// Update the output surface size/stride when MPP reports a resolution change.
     bool updateSurfaceResolution(VASurfaceID id, int width, int height);
 
-    bool getSurfaceInfo(VASurfaceID id, uint32_t& width, uint32_t& height, uint32_t& stride, int& dmabuf_fd);
+    bool getSurfaceInfo(VASurfaceID id, uint32_t& width, uint32_t& height, uint32_t& stride, int& dmabuf_fd, bool& failed);
 
     /// Notify the decoder that a surface is ready for display.
     void markSurfaceReady(VASurfaceID surface);
@@ -83,6 +86,7 @@ public:
 private:
     void decoderThreadMain();
     bool processJob(const DecodeJob& job);
+    bool drainFrames(const DecodeJob& job, SurfaceInfo& info);
     CodecProfile profile_{CodecProfile::Unknown};
 
     MppCtx ctx_ = nullptr;
