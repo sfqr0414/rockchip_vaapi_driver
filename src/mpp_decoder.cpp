@@ -201,6 +201,16 @@ bool MppDecoder::waitSurfaceReady(VASurfaceID surface, uint32_t timeout_ms) {
     return ready_flag->load();
 }
 
+void MppDecoder::resetSurface(VASurfaceID surface) {
+    std::lock_guard<std::mutex> lock(g_surfaces_mutex);
+    auto it = surfaces_.find(surface);
+    if (it == surfaces_.end()) return;
+    if (it->second.ready) it->second.ready->store(false);
+    if (it->second.decode_failed) it->second.decode_failed->store(false);
+    std::lock_guard<std::mutex> lock2(cv_mutex_);
+    cv_.notify_all();
+}
+
 void MppDecoder::shutdown() {
     running_ = false;
     job_queue_.shutdown();

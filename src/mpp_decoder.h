@@ -82,6 +82,9 @@ public:
 
     bool getSurfaceInfo(VASurfaceID id, uint32_t& width, uint32_t& height, uint32_t& stride, int& dmabuf_fd, bool& failed);
 
+    /// Reset ready/failed flags for the given surface (called prior to submit).
+    void resetSurface(VASurfaceID surface);
+
     /// Notify the decoder that a surface is ready for display.
     void markSurfaceReady(VASurfaceID surface);
 

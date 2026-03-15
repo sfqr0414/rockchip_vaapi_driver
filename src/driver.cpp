@@ -522,6 +522,10 @@ static VAStatus rockchip_vaEndPicture(VADriverContextP ctx,
         }
     }
 
+    // Before submitting, reset ready/failed flags so vaSyncSurface will block
+    // until MPP reports the frame is decoded and attached.
+    d->decoder.resetSurface(d->current_surface);
+
     DecodeJob job;
     job.target_surface = d->current_surface;
     job.bitstream = std::move(d->frame_buffer);
