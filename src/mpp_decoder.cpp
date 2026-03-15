@@ -132,6 +132,7 @@ bool MppDecoder::allocateSurface(VASurfaceID id, DecodedSurface& out, int width,
     out.dmabuf_fd = fd;
     out.width = static_cast<uint32_t>(width);
     out.height = static_cast<uint32_t>(height);
+    out.stride = stride;
     out.ready.store(false);
 
     SurfaceInfo surfaceInfo;
@@ -146,6 +147,47 @@ bool MppDecoder::allocateSurface(VASurfaceID id, DecodedSurface& out, int width,
 
     // Drop the canonical allocation handle; the imported buffer holds the ref.
     mpp_buffer_put(allocBuf);
+    return true;
+}
+
+bool MppDecoder::updateSurfaceResolution(VASurfaceID id, int width, int height) {
+    auto it = surfaces_.find(id);
+    if (it == surfaces_.end()) return false;
+
+    if (it->second.width == static_cast<uint32_t>(width) &&
+        it->second.height == static_cast<uint32_t>(height)) {
+        return true;
+    }
+
+    // Free existing resources.
+    if (it->second.buffer) {
+        mpp_buffer_put(it->second.buffer);
+        it->second.buffer = nullptr;
+    }
+    if (it->second.dmabuf_fd >= 0) {
+        close(it->second.dmabuf_fd);
+        it->second.dmabuf_fd = -1;
+    }
+
+    DecodedSurface dummy;
+    if (!allocateSurface(id, dummy, width, height)) {
+        return false;
+    }
+
+    // Update stored size/stride.
+    it->second.width = static_cast<uint32_t>(width);
+    it->second.height = static_cast<uint32_t>(height);
+    it->second.stride = alignUp(width, 64);
+    return true;
+}
+
+bool MppDecoder::getSurfaceInfo(VASurfaceID id, uint32_t& width, uint32_t& height, uint32_t& stride, int& dmabuf_fd) {
+    auto it = surfaces_.find(id);
+    if (it == surfaces_.end()) return false;
+    width = it->second.width;
+    height = it->second.height;
+    stride = it->second.stride;
+    dmabuf_fd = it->second.dmabuf_fd;
     return true;
 }
 
@@ -269,7 +311,29 @@ bool MppDecoder::processJob(const DecodeJob& job) {
 
     const size_t maxPacketSize = 64 * 1024;
 
-    auto sendPacketRange = [&](size_t begin, size_t end, bool isLast) {
+    auto sendPacketRange = [&](size_t begin, size_t end, bool isLast, bool allowSplit) {
+        if (!allowSplit) {
+            // Send the full range as one packet (safe for H264/HEVC NAL units).
+            MppPacket packet = nullptr;
+            size_t size = end - begin;
+            if (mpp_packet_init(&packet, (void*)(data + begin), size) != MPP_OK) {
+                return false;
+            }
+            if (isLast) {
+                mpp_packet_set_eos(packet);
+            }
+
+            int ret = api_->decode_put_packet(ctx_, packet);
+            mpp_packet_deinit(&packet);
+            if (ret != MPP_OK) {
+                util::log(util::stderr_sink, util::LogLevel::Warn,
+                          "mpp_decode_put_packet failed: {} (offset={} size={})",
+                          ret, begin, size);
+                return false;
+            }
+            return true;
+        }
+
         size_t offset = begin;
         while (offset < end) {
             size_t chunkSize = std::min(maxPacketSize, end - offset);
@@ -315,14 +379,35 @@ bool MppDecoder::processJob(const DecodeJob& job) {
                 if (!(b & 0x80)) break;
                 if (size_field_len > 8) return false;
             }
-        } else {
-            // No size field implies OBU extends to end of stream.
-            payload_size = dataSize - ptr;
+
+            size_t total = 1 + size_field_len + payload_size;
+            if (off + total > dataSize) return false;
+            obu_size = total;
+            return true;
         }
 
-        size_t total = 1 + size_field_len + payload_size;
-        if (off + total > dataSize) return false;
-        obu_size = total;
+        // If there is no size field, the OBU extends until the next OBU header.
+        // We scan forward for a valid OBU header (forbidden bit == 0, and
+        // OBU type in [0,31]). This is heuristic but works for typical streams.
+        size_t scan = ptr;
+        while (scan + 1 < dataSize) {
+            uint8_t candidate = data[scan];
+            if ((candidate & 0x80) == 0) {
+                uint8_t obu_type = (candidate >> 3) & 0x1F;
+                if (obu_type <= 31) {
+                    // Assume this is a new OBU header.
+                    break;
+                }
+            }
+            scan++;
+        }
+        if (scan <= ptr) {
+            // No next header found; assume rest of stream is current OBU.
+            obu_size = dataSize - off;
+            return true;
+        }
+
+        obu_size = scan - off;
         return true;
     };
 
@@ -360,6 +445,18 @@ bool MppDecoder::processJob(const DecodeJob& job) {
                 }
                 if (frame) mpp_frame_deinit(&frame);
                 break;
+            }
+
+            // Dynamically update width/height/stride if MPP reports a change.
+            uint32_t frame_w = mpp_frame_get_width(frame);
+            uint32_t frame_h = mpp_frame_get_height(frame);
+            uint32_t frame_stride = mpp_frame_get_hor_stride(frame);
+            if (frame_w && frame_h && (frame_w != info.width || frame_h != info.height)) {
+                util::log(util::stderr_sink, util::LogLevel::Info,
+                          "MPP reported resolution change %ux%u -> %ux%u",
+                          info.width, info.height, frame_w, frame_h);
+                // Update buffer/surface sizes.
+                updateSurfaceResolution(job.target_surface, frame_w, frame_h);
             }
 
             if (info.buffer) {
@@ -418,11 +515,11 @@ bool MppDecoder::processJob(const DecodeJob& job) {
             pos += obu_size;
         }
     } else {
-        // H.264/HEVC: split on start codes.
+        // H.264/HEVC: feed each NAL unit as a packet.
         while (nalStart < dataSize) {
             size_t nalEnd = findStart(nalStart + 3);
             bool isLastNal = (nalEnd == dataSize);
-            if (!sendPacketRange(nalStart, nalEnd, isLastNal)) {
+            if (!sendPacketRange(nalStart, nalEnd, isLastNal, false)) {
                 return false;
             }
             if (drainFrames()) return true;

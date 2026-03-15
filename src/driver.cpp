@@ -56,6 +56,10 @@ struct DriverState {
     VADriverVTable* vtable = nullptr;
     SpinLock lock;
     VAProfile profile = VAProfileNone;
+
+    // Current expected decoding resolution (from vaCreateContext or MPP feedback).
+    uint32_t picture_width = 0;
+    uint32_t picture_height = 0;
 };
 
 static DriverState* toDriver(VADriverContextP ctx) {
@@ -108,6 +112,7 @@ static VAStatus rockchip_vaCreateSurfaces(VADriverContextP ctx,
         state->surface.va_id = id;
         state->surface.width = static_cast<uint32_t>(width);
         state->surface.height = static_cast<uint32_t>(height);
+        state->surface.stride = ((state->surface.width + 63) / 64) * 64;
         state->surface.ready.store(false);
 
         // Allocate a buffer for the surface using MPP.
@@ -153,6 +158,17 @@ static VAStatus rockchip_vaSyncSurface(VADriverContextP ctx, VASurfaceID surface
     if (!d->decoder.waitSurfaceReady(surface)) {
         return VA_STATUS_ERROR_TIMEDOUT;
     }
+
+    // Update the driver-side surface dimensions/stride from the decoder (in case MPP changed resolution).
+    uint32_t width, height, stride;
+    int fd;
+    if (d->decoder.getSurfaceInfo(surface, width, height, stride, fd)) {
+        it->second->surface.width = width;
+        it->second->surface.height = height;
+        it->second->surface.stride = stride;
+        it->second->surface.dmabuf_fd = fd;
+    }
+
     return VA_STATUS_SUCCESS;
 }
 
@@ -298,7 +314,11 @@ static VAStatus rockchip_vaCreateContext(VADriverContextP ctx,
     if (!isSupportedProfile(d->profile))
         return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;
 
-    // Ensure the decoder is initialized with the profile.
+    // Remember the dimensions requested by the client.
+    d->picture_width = static_cast<uint32_t>(picture_width);
+    d->picture_height = static_cast<uint32_t>(picture_height);
+
+    // Initialize decoder with the requested size; it may adjust later.
     if (!d->decoder.initialize(vaProfileToCodec(d->profile), picture_width, picture_height)) {
         return VA_STATUS_ERROR_ALLOCATION_FAILED;
     }
@@ -450,7 +470,7 @@ static VAStatus rockchip_vaExportSurfaceHandle(VADriverContextP ctx,
     memset(desc, 0, sizeof(*desc));
 
     const auto& surf = it->second->surface;
-    const uint32_t stride = ((surf.width + 63) / 64) * 64;
+    const uint32_t stride = surf.stride ? surf.stride : ((surf.width + 63) / 64) * 64;
     const uint32_t y_size = stride * surf.height;
     const uint32_t uv_offset = y_size;
 

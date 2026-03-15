@@ -72,48 +72,26 @@ static bool extract_elementary_stream(const char* mp4_path,
     return ok;
 }
 
-static bool get_codec_data(const char* mp4_path, std::vector<uint8_t>& out) {
-    // Use gst-discoverer to extract the codec_data field, which contains required
-    // sequence headers for some codecs (e.g., AV1).
-    std::string cmd = "gst-discoverer-1.0 -v \"" + std::string(mp4_path) + "\"";
-    FILE* fp = popen(cmd.c_str(), "r");
-    if (!fp) return false;
-
-    char line[4096];
-    while (fgets(line, sizeof(line), fp)) {
-        const char* p = strstr(line, "codec_data=(buffer)");
-        if (!p) continue;
-        const char* hex = strchr(p, ')');
-        if (!hex) continue;
-        // Skip past "codec_data=(buffer)" and whitespace.
-        hex = strchr(p, '(');
-        if (!hex) continue;
-        // Find the hex string after the last whitespace.
-        hex = strstr(p, "(buffer)");
-        if (!hex) continue;
-        hex = strchr(hex, ')');
-        if (!hex) continue;
-        hex++;
-        while (*hex == ' ' || *hex == '\t') hex++;
-
-        std::string hexstr(hex);
-        // Trim whitespace/newline
-        while (!hexstr.empty() && isspace((unsigned char)hexstr.back()))
-            hexstr.pop_back();
-
-        // Convert hex to bytes
-        out.clear();
-        for (size_t i = 0; i + 1 < hexstr.size(); i += 2) {
-            char byteStr[3] = {hexstr[i], hexstr[i + 1], '\0'};
-            unsigned int v;
-            if (sscanf(byteStr, "%x", &v) != 1) break;
-            out.push_back(static_cast<uint8_t>(v));
+static bool extract_av1c_from_mp4(const char* mp4_path, std::vector<uint8_t>& out) {
+    std::vector<uint8_t> data;
+    if (!read_file(mp4_path, data)) return false;
+    size_t offset = 0;
+    while (offset + 8 <= data.size()) {
+        uint32_t size = (uint32_t(data[offset]) << 24) | (uint32_t(data[offset + 1]) << 16) |
+                        (uint32_t(data[offset + 2]) << 8) | uint32_t(data[offset + 3]);
+        char type[5] = {char(data[offset + 4]), char(data[offset + 5]), char(data[offset + 6]), char(data[offset + 7]), 0};
+        if (size < 8) break;
+        if (offset + size > data.size()) break;
+        if (strcmp(type, "av1C") == 0) {
+            // AV1CodecConfigurationRecord: skip the fixed header and return configOBUs.
+            // Per ISO/IEC 14496-12, the first 22 bytes are the header fields.
+            size_t header_size = 22;
+            if (size <= 8 + header_size) return false;
+            out.assign(data.begin() + offset + 8 + header_size, data.begin() + offset + size);
+            return !out.empty();
         }
-        pclose(fp);
-        return !out.empty();
+        offset += size;
     }
-
-    pclose(fp);
     return false;
 }
 
@@ -157,14 +135,14 @@ int main(int argc, char** argv) {
             return 1;
         }
 
-        // For AV1, prepend the codec_data from the container so the decoder sees the
-        // sequence header / initial OBU units.
+        // For AV1, prepend the av1C box data from the MP4 container so the decoder has
+        // the required sequence header / initial OBU units.
         if (profile == VAProfileAV1Profile0) {
-            std::vector<uint8_t> codec_data;
-            if (get_codec_data(file, codec_data) && !codec_data.empty()) {
+            std::vector<uint8_t> av1c;
+            if (extract_av1c_from_mp4(file, av1c) && !av1c.empty()) {
                 std::vector<uint8_t> merged;
-                merged.reserve(codec_data.size() + bitstream.size());
-                merged.insert(merged.end(), codec_data.begin(), codec_data.end());
+                merged.reserve(av1c.size() + bitstream.size());
+                merged.insert(merged.end(), av1c.begin(), av1c.end());
                 merged.insert(merged.end(), bitstream.begin(), bitstream.end());
                 bitstream.swap(merged);
             }

@@ -33,6 +33,7 @@ struct DecodedSurface {
     int dmabuf_fd = -1;
     uint32_t width = 0;
     uint32_t height = 0;
+    uint32_t stride = 0;
     std::atomic<bool> ready{false};
 };
 
@@ -67,6 +68,11 @@ public:
 
     /// Allocates a surface (with an exported dmabuf FD) and tracks readiness.
     bool allocateSurface(VASurfaceID id, DecodedSurface& out, int width, int height);
+
+    /// Update the output surface size/stride when MPP reports a resolution change.
+    bool updateSurfaceResolution(VASurfaceID id, int width, int height);
+
+    bool getSurfaceInfo(VASurfaceID id, uint32_t& width, uint32_t& height, uint32_t& stride, int& dmabuf_fd);
 
     /// Notify the decoder that a surface is ready for display.
     void markSurfaceReady(VASurfaceID surface);
