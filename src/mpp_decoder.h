@@ -44,6 +44,9 @@ struct DecodeJob {
 struct SurfaceInfo {
     // DMABUF returned to VA (exported by the driver)
     int dmabuf_fd = -1;
+    // Imported MPP buffer handle used for decode output.
+    MppBuffer buffer = nullptr;
+
     uint32_t width = 0;
     uint32_t height = 0;
     uint32_t stride = 0;
@@ -56,6 +59,7 @@ public:
     ~MppDecoder();
 
     bool initialize(CodecProfile profile, int width, int height);
+    bool isInitialized() const;
     bool enqueueJob(DecodeJob job);
 
     /// Wait until the surface is ready to be used (decoded).

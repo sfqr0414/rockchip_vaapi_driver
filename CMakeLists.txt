@@ -5,6 +5,11 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
+find_package(PkgConfig REQUIRED)
+
+pkg_check_modules(LIBVA REQUIRED libva)
+pkg_check_modules(LIBVA_DRM REQUIRED libva-drm)
+
 # Ensure we build shared library for the VAAPI driver
 add_library(rockchip_drv_video SHARED
     src/driver.cpp
@@ -13,10 +18,23 @@ add_library(rockchip_drv_video SHARED
 )
 
 add_executable(test_mpp_decode tools/test_mpp_decode.cpp)
+add_executable(vaapi_decode_test tools/vaapi_decode_test.cpp)
 
 target_link_libraries(test_mpp_decode PRIVATE
     dl
     pthread
+)
+
+target_link_libraries(vaapi_decode_test PRIVATE
+    ${LIBVA_LIBRARIES}
+    ${LIBVA_DRM_LIBRARIES}
+    dl
+    pthread
+)
+
+target_include_directories(vaapi_decode_test PRIVATE
+    ${LIBVA_INCLUDE_DIRS}
+    ${LIBVA_DRM_INCLUDE_DIRS}
 )
 
 # The VA-API driver naming convention expects <driver>_drv_video.so (no lib prefix).
@@ -31,6 +49,7 @@ target_compile_definitions(rockchip_drv_video PRIVATE "_GNU_SOURCE")
 find_package(PkgConfig REQUIRED)
 
 pkg_check_modules(LIBVA REQUIRED libva)
+pkg_check_modules(LIBVA_DRM REQUIRED libva-drm)
 
 # Prefer installed rockchip-mpp (RK3588) if available.
 find_library(ROCKCHIP_MPP_LIB NAMES rockchip_mpp)

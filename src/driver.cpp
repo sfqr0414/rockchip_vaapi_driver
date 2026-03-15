@@ -5,6 +5,8 @@
 #include <va/va.h>
 #include <va/va_backend.h>
 #include <va/va_drm.h>
+#include <va/va_drmcommon.h>
+#include <drm/drm_fourcc.h>
 
 #include <atomic>
 #include <cassert>
@@ -50,6 +52,7 @@ struct DriverState {
     VASurfaceID next_surface_id = 1;
     VABufferID next_buffer_id = 1;
     VASurfaceID current_surface = VA_INVALID_ID;
+    std::vector<VABufferID> current_buffers;
     VADriverVTable* vtable = nullptr;
     SpinLock lock;
     VAProfile profile = VAProfileNone;
@@ -78,6 +81,27 @@ static VAStatus rockchip_vaCreateSurfaces(VADriverContextP ctx,
     if (!d) return VA_STATUS_ERROR_INVALID_CONTEXT;
 
     ScopedSpinLock lock(d->lock);
+    {
+        int initialized = d->decoder.isInitialized() ? 1 : 0;
+        util::log(util::stderr_sink, util::LogLevel::Info,
+                  "vaCreateSurfaces: decoder isInitialized={}", initialized);
+    }
+
+    // Ensure decoder is initialized before allocating surfaces.
+    if (!d->decoder.isInitialized()) {
+        int profile_int = static_cast<int>(d->profile);
+        int w = width;
+        int h = height;
+        util::log(util::stderr_sink, util::LogLevel::Info,
+                  "Initializing decoder for profile={} width={} height={}",
+                  profile_int, w, h);
+        if (!d->decoder.initialize(vaProfileToCodec(d->profile), width, height)) {
+            util::log(util::stderr_sink, util::LogLevel::Error,
+                      "Failed to initialize decoder for surface allocation");
+            return VA_STATUS_ERROR_ALLOCATION_FAILED;
+        }
+    }
+
     for (int i = 0; i < num_surfaces; i++) {
         VASurfaceID id = d->next_surface_id++;
         auto state = std::make_unique<SurfaceState>();
@@ -143,12 +167,21 @@ static VAStatus rockchip_vaQueryConfigProfiles(VADriverContextP ctx,
         VAProfileAV1Profile0,
     };
     const int supported_count = static_cast<int>(std::size(supported));
-    if (!num_profiles) return VA_STATUS_ERROR_INVALID_PARAMETER;
-    if (*num_profiles < supported_count) {
+
+    if (!num_profiles)
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+
+    // When profiles == nullptr, libva expects the driver to set the count
+    // and return success.
+    if (!profile_list) {
         *num_profiles = supported_count;
-        return VA_STATUS_ERROR_MAX_NUM_EXCEEDED;
+        return VA_STATUS_SUCCESS;
     }
-    for (int i = 0; i < supported_count; i++) {
+
+    // Always return success and report the full supported count.
+    // Firefox expects the count even if the provided buffer is smaller.
+    int fill = std::min(*num_profiles, supported_count);
+    for (int i = 0; i < fill; i++) {
         profile_list[i] = supported[i];
     }
     *num_profiles = supported_count;
@@ -171,15 +204,28 @@ static VAStatus rockchip_vaQueryConfigEntrypoints(VADriverContextP ctx,
     return VA_STATUS_SUCCESS;
 }
 
+static bool isSupportedProfile(VAProfile profile) {
+    switch (profile) {
+        case VAProfileH264High:
+        case VAProfileHEVCMain:
+        case VAProfileVP9Profile0:
+        case VAProfileAV1Profile0:
+            return true;
+        default:
+            return false;
+    }
+}
+
 static VAStatus rockchip_vaGetConfigAttributes(VADriverContextP ctx,
                                                VAProfile profile,
                                                VAEntrypoint entrypoint,
                                                VAConfigAttrib* attrib_list,
                                                int num_attribs) {
     (void)ctx;
-    (void)profile;
     (void)entrypoint;
+
     if (!attrib_list) return VA_STATUS_ERROR_INVALID_PARAMETER;
+    if (!isSupportedProfile(profile)) return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;
 
     for (int i = 0; i < num_attribs; i++) {
         if (attrib_list[i].type == VAConfigAttribRTFormat) {
@@ -244,6 +290,14 @@ static VAStatus rockchip_vaCreateContext(VADriverContextP ctx,
                                         VAContextID* context) {
     auto* d = toDriver(ctx);
     if (!d) return VA_STATUS_ERROR_INVALID_CONTEXT;
+    (void)config_id;
+    (void)flag;
+    (void)render_targets;
+    (void)num_render_targets;
+
+    if (!isSupportedProfile(d->profile))
+        return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;
+
     // Ensure the decoder is initialized with the profile.
     if (!d->decoder.initialize(vaProfileToCodec(d->profile), picture_width, picture_height)) {
         return VA_STATUS_ERROR_ALLOCATION_FAILED;
@@ -338,7 +392,9 @@ static VAStatus rockchip_vaBeginPicture(VADriverContextP ctx,
                                        VASurfaceID render_target) {
     auto* d = toDriver(ctx);
     if (!d) return VA_STATUS_ERROR_INVALID_CONTEXT;
+
     d->current_surface = render_target;
+    d->current_buffers.clear();
     return VA_STATUS_SUCCESS;
 }
 
@@ -370,6 +426,52 @@ static VAStatus rockchip_vaQuerySurfaceError(VADriverContextP ctx,
     (void)ctx;
     (void)surface;
     (void)error_status;
+    return VA_STATUS_SUCCESS;
+}
+
+static VAStatus rockchip_vaExportSurfaceHandle(VADriverContextP ctx,
+                                               VASurfaceID surface,
+                                               uint32_t mem_type,
+                                               uint32_t flags,
+                                               void* descriptor) {
+    (void)flags;
+    auto* d = toDriver(ctx);
+    if (!d) return VA_STATUS_ERROR_INVALID_DISPLAY;
+    auto it = d->surfaces.find(surface);
+    if (it == d->surfaces.end()) return VA_STATUS_ERROR_INVALID_SURFACE;
+    if (!descriptor) return VA_STATUS_ERROR_INVALID_PARAMETER;
+
+    if (mem_type != VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2 &&
+        mem_type != VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME) {
+        return VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE;
+    }
+
+    auto* desc = static_cast<VADRMPRIMESurfaceDescriptor*>(descriptor);
+    memset(desc, 0, sizeof(*desc));
+
+    const auto& surf = it->second->surface;
+    const uint32_t stride = ((surf.width + 63) / 64) * 64;
+    const uint32_t y_size = stride * surf.height;
+    const uint32_t uv_offset = y_size;
+
+    desc->fourcc = VA_FOURCC_NV12;
+    desc->width = surf.width;
+    desc->height = surf.height;
+    desc->num_objects = 1;
+    desc->objects[0].fd = surf.dmabuf_fd;
+    desc->objects[0].size = uv_offset + (stride / 2) * ((surf.height + 1) / 2) * 2;
+    desc->objects[0].drm_format_modifier = 0;
+
+    desc->num_layers = 1;
+    desc->layers[0].drm_format = DRM_FORMAT_NV12;
+    desc->layers[0].num_planes = 2;
+    desc->layers[0].object_index[0] = 0;
+    desc->layers[0].object_index[1] = 0;
+    desc->layers[0].offset[0] = 0;
+    desc->layers[0].offset[1] = uv_offset;
+    desc->layers[0].pitch[0] = stride;
+    desc->layers[0].pitch[1] = stride;
+
     return VA_STATUS_SUCCESS;
 }
 
@@ -599,20 +701,40 @@ static VAStatus rockchip_vaSetDisplayAttributes(VADriverContextP ctx,
 
 static VAStatus rockchip_vaRenderPicture(VADriverContextP ctx,
                                         VAContextID /*context*/,
-                                        VABufferID* /*buffers*/,
-                                        int /*num_buffers*/) {
+                                        VABufferID* buffers,
+                                        int num_buffers) {
     auto* d = toDriver(ctx);
     if (!d) return VA_STATUS_ERROR_INVALID_CONTEXT;
+    if (!buffers || num_buffers <= 0) return VA_STATUS_ERROR_INVALID_PARAMETER;
 
-    // Minimal stub: mark the first allocated surface as ready.
-    // A full implementation would parse VA buffers and feed the bitstream to MPP.
-    if (d->surfaces.empty()) {
-        return VA_STATUS_ERROR_INVALID_SURFACE;
+    // Collect bitstream from slice data buffers.
+    std::vector<uint8_t> bitstream;
+    for (int i = 0; i < num_buffers; i++) {
+        auto it = d->buffers.find(buffers[i]);
+        if (it == d->buffers.end()) continue;
+        if (it->second.type != VASliceDataBufferType) continue;
+
+        auto* data = static_cast<uint8_t*>(it->second.data);
+        if (!data || it->second.size == 0) continue;
+
+        bitstream.insert(bitstream.end(), data, data + it->second.size);
     }
 
-    auto it = d->surfaces.begin();
-    d->decoder.markSurfaceReady(it->first);
-    it->second->surface.ready.store(true);
+    if (bitstream.empty()) {
+        return VA_STATUS_ERROR_INVALID_BUFFER;
+    }
+
+    // Save the buffer IDs for potential future use.
+    d->current_buffers.assign(buffers, buffers + num_buffers);
+
+    // Enqueue decode job for the current surface.
+    DecodeJob job;
+    job.target_surface = d->current_surface;
+    job.bitstream = std::move(bitstream);
+
+    if (!d->decoder.enqueueJob(std::move(job))) {
+        return VA_STATUS_ERROR_ALLOCATION_FAILED;
+    }
 
     return VA_STATUS_SUCCESS;
 }
@@ -678,6 +800,9 @@ static VAStatus rockchip_vaDriverInit(VADriverContextP ctx) {
     vt->vaGetDisplayAttributes = rockchip_vaGetDisplayAttributes;
     vt->vaSetDisplayAttributes = rockchip_vaSetDisplayAttributes;
 
+    // Required for VA-API DMABUF export (zero copy).
+    vt->vaExportSurfaceHandle = rockchip_vaExportSurfaceHandle;
+
     ctx->vtable = vt;
     void* data = malloc(sizeof(DriverState));
     ctx->pDriverData = data;
@@ -685,6 +810,10 @@ static VAStatus rockchip_vaDriverInit(VADriverContextP ctx) {
         auto* driver_state = new (data) DriverState();
         driver_state->vtable = vt;
     }
+
+    // Pretend to be VA-API 1.2+ to satisfy modern clients.
+    ctx->version_major = 1;
+    ctx->version_minor = 2;
 
     // Required by libva initialization checks.
     ctx->max_profiles = 4;

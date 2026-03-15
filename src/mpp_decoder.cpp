@@ -39,6 +39,14 @@ MppDecoder::~MppDecoder() {
 }
 
 bool MppDecoder::initialize(CodecProfile profile, int width, int height) {
+    // Make initialize idempotent: if already initialized, ensure required resources exist.
+    if (ctx_) {
+        if (group_) {
+            return true;
+        }
+        // If the MPP context exists but the buffer group is missing, attempt to create it.
+    }
+
     profile_ = profile;
 
     if (profile_ == CodecProfile::Unknown) {
@@ -47,10 +55,12 @@ bool MppDecoder::initialize(CodecProfile profile, int width, int height) {
         return false;
     }
 
-    if (mpp_create(&ctx_, &api_) != MPP_OK) {
-        util::log(util::stderr_sink, util::LogLevel::Error,
-                  "mpp_create failed");
-        return false;
+    if (!ctx_) {
+        if (mpp_create(&ctx_, &api_) != MPP_OK) {
+            util::log(util::stderr_sink, util::LogLevel::Error,
+                      "mpp_create failed");
+            return false;
+        }
     }
 
     if (mpp_init(ctx_, MPP_CTX_DEC, codecProfileToMpp(profile_)) != MPP_OK) {
@@ -76,8 +86,11 @@ bool MppDecoder::initialize(CodecProfile profile, int width, int height) {
 
 bool MppDecoder::allocateSurface(VASurfaceID id, DecodedSurface& out, int width, int height) {
     if (!group_) {
+        void* ctx_ptr = ctx_;
+        void* group_ptr = group_;
         util::log(util::stderr_sink, util::LogLevel::Error,
-                  "Cannot allocate surface before decoder init");
+                  "Cannot allocate surface before decoder init (ctx={} group={})",
+                  ctx_ptr, group_ptr);
         return false;
     }
 
@@ -100,14 +113,16 @@ bool MppDecoder::allocateSurface(VASurfaceID id, DecodedSurface& out, int width,
         return false;
     }
 
-    // Commit the DMABUF into the group so MPP can use it as an output buffer.
-    MppBufferInfo info{};
-    info.type = MPP_BUFFER_TYPE_EXT_DMA;
-    info.fd = fd;
-    info.size = allocationSize;
-    if (mpp_buffer_commit(group_, &info) != MPP_OK) {
+    // Import the DMABUF into MPP so it can be used as a decode output buffer.
+    MppBufferInfo bufInfo{};
+    bufInfo.type = MPP_BUFFER_TYPE_EXT_DMA;
+    bufInfo.fd = fd;
+    bufInfo.size = allocationSize;
+
+    MppBuffer imported = nullptr;
+    if (mpp_buffer_import(&imported, &bufInfo) != MPP_OK) {
         util::log(util::stderr_sink, util::LogLevel::Error,
-                  "mpp_buffer_commit failed");
+                  "mpp_buffer_import failed");
         mpp_buffer_put(allocBuf);
         close(fd);
         return false;
@@ -121,6 +136,7 @@ bool MppDecoder::allocateSurface(VASurfaceID id, DecodedSurface& out, int width,
 
     SurfaceInfo surfaceInfo;
     surfaceInfo.dmabuf_fd = fd;
+    surfaceInfo.buffer = imported;
     surfaceInfo.width = static_cast<uint32_t>(width);
     surfaceInfo.height = static_cast<uint32_t>(height);
     surfaceInfo.stride = stride;
@@ -128,7 +144,7 @@ bool MppDecoder::allocateSurface(VASurfaceID id, DecodedSurface& out, int width,
 
     surfaces_[id] = std::move(surfaceInfo);
 
-    // Release the original allocation handle; the fd remains valid for VA.
+    // Drop the canonical allocation handle; the imported buffer holds the ref.
     mpp_buffer_put(allocBuf);
     return true;
 }
@@ -142,6 +158,10 @@ bool MppDecoder::enqueueJob(DecodeJob job) {
     return true;
 }
 
+bool MppDecoder::isInitialized() const {
+    return ctx_ != nullptr;
+}
+
 bool MppDecoder::waitSurfaceReady(VASurfaceID surface, uint32_t timeout_ms) {
     auto it = surfaces_.find(surface);
     if (it == surfaces_.end()) {
@@ -149,15 +169,13 @@ bool MppDecoder::waitSurfaceReady(VASurfaceID surface, uint32_t timeout_ms) {
     }
     auto& ready_flag = *it->second.ready;
 
-    auto start = std::chrono::steady_clock::now();
+    auto deadline = std::chrono::steady_clock::now() +
+                    std::chrono::milliseconds(timeout_ms ? timeout_ms : 5000);
     while (!ready_flag.load(std::memory_order_acquire)) {
-        if (timeout_ms &&
-            std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - start)
-                    .count() >= timeout_ms) {
+        if (timeout_ms && std::chrono::steady_clock::now() >= deadline) {
             return false;
         }
-        ready_flag.wait(false);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     return true;
 }
@@ -186,8 +204,12 @@ void MppDecoder::shutdown() {
         api_ = nullptr;
     }
     if (group_) {
-        // Release DMABUF FDs for VA surfaces.
+        // Release DMABUF FDs and imported MPP buffers.
         for (auto& [id, info] : surfaces_) {
+            if (info.buffer) {
+                mpp_buffer_put(info.buffer);
+                info.buffer = nullptr;
+            }
             if (info.dmabuf_fd >= 0) {
                 close(info.dmabuf_fd);
                 info.dmabuf_fd = -1;
@@ -221,44 +243,194 @@ bool MppDecoder::processJob(const DecodeJob& job) {
     }
     SurfaceInfo& info = it->second;
 
-    // Create an MPP packet for the bitstream.
-    MppPacket packet = nullptr;
-    if (mpp_packet_init(&packet, nullptr, 0) != MPP_OK) {
+    // Feed the bitstream to MPP per-NAL unit for more robust decoding.
+    const uint8_t* data = job.bitstream.data();
+    size_t dataSize = job.bitstream.size();
+
+    auto findStart = [&](size_t pos) -> size_t {
+        for (size_t i = pos; i + 3 < dataSize; ++i) {
+            if (data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1) {
+                return i;
+            }
+            if (i + 4 < dataSize && data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 0 && data[i + 3] == 1) {
+                return i;
+            }
+        }
+        return dataSize;
+    };
+
+    size_t nalStart = findStart(0);
+    if (nalStart == dataSize) {
+        // If no start codes were found, fall back to feeding the whole buffer.
+        nalStart = 0;
+    }
+
+    bool gotFrame = false;
+
+    const size_t maxPacketSize = 64 * 1024;
+
+    auto sendPacketRange = [&](size_t begin, size_t end, bool isLast) {
+        size_t offset = begin;
+        while (offset < end) {
+            size_t chunkSize = std::min(maxPacketSize, end - offset);
+            bool isLastChunk = isLast && (offset + chunkSize == end);
+
+            MppPacket packet = nullptr;
+            if (mpp_packet_init(&packet, (void*)(data + offset), chunkSize) != MPP_OK) {
+                return false;
+            }
+            if (isLastChunk) {
+                mpp_packet_set_eos(packet);
+            }
+
+            int ret = api_->decode_put_packet(ctx_, packet);
+            mpp_packet_deinit(&packet);
+            if (ret != MPP_OK) {
+                util::log(util::stderr_sink, util::LogLevel::Warn,
+                          "mpp_decode_put_packet failed: {} (offset={} size={})",
+                          ret, offset, chunkSize);
+                return false;
+            }
+
+            offset += chunkSize;
+        }
+        return true;
+    };
+
+    auto parseAv1Obu = [&](size_t off, size_t& obu_size) -> bool {
+        if (off >= dataSize) return false;
+        size_t ptr = off;
+        uint8_t header = data[ptr++];
+        bool has_size = header & 0x40;
+        size_t size_field_len = 0;
+        uint64_t payload_size = 0;
+
+        if (has_size) {
+            // leb128
+            while (true) {
+                if (ptr >= dataSize) return false;
+                uint8_t b = data[ptr++];
+                payload_size |= uint64_t(b & 0x7F) << (7 * size_field_len);
+                size_field_len++;
+                if (!(b & 0x80)) break;
+                if (size_field_len > 8) return false;
+            }
+        } else {
+            // No size field implies OBU extends to end of stream.
+            payload_size = dataSize - ptr;
+        }
+
+        size_t total = 1 + size_field_len + payload_size;
+        if (off + total > dataSize) return false;
+        obu_size = total;
+        return true;
+    };
+
+    auto drainFrames = [&]() -> bool {
+        while (true) {
+            MppFrame frame = nullptr;
+            if (mpp_frame_init(&frame) != MPP_OK) {
+                return false;
+            }
+
+            if (profile_ == CodecProfile::AV1) {
+                // Let MPP choose output format for AV1 (some HW may not support external NV12 buffers).
+            } else {
+                mpp_frame_set_fmt(frame, MPP_FMT_YUV420SP);
+                mpp_frame_set_width(frame, info.width);
+                mpp_frame_set_height(frame, info.height);
+                mpp_frame_set_hor_stride(frame, info.stride);
+                mpp_frame_set_ver_stride(frame, info.height);
+                mpp_frame_set_buf_size(frame, computeNv12Size(info.width, info.height, info.stride));
+                if (info.buffer) {
+                    mpp_frame_set_buffer(frame, info.buffer);
+                }
+            }
+
+            int ret = api_->decode_get_frame(ctx_, &frame);
+            if (ret == MPP_ERR_DISPLAY_FULL) {
+                mpp_frame_deinit(&frame);
+                break;
+            }
+
+            if (ret != MPP_OK || !frame) {
+                if (ret != MPP_OK) {
+                    util::log(util::stderr_sink, util::LogLevel::Warn,
+                              "mpp_decode_get_frame returned %d", ret);
+                }
+                if (frame) mpp_frame_deinit(&frame);
+                break;
+            }
+
+            if (info.buffer) {
+                mpp_buffer_sync_end(info.buffer);
+            }
+
+            gotFrame = true;
+            if (info.ready) {
+                info.ready->store(true, std::memory_order_release);
+                info.ready->notify_all();
+            }
+
+            mpp_frame_deinit(&frame);
+            return true;
+        }
         return false;
+    };
+
+    if (profile_ == CodecProfile::AV1) {
+        // MPP may expect AV1 data in a length-prefixed (IVF-style) format.
+        size_t pos = 0;
+        while (pos < dataSize) {
+            size_t obu_size = 0;
+            if (!parseAv1Obu(pos, obu_size)) break;
+
+            bool isLast = (pos + obu_size == dataSize);
+
+            // Create a packet: [4-byte LE size][OBU bytes]
+            uint32_t len_le = static_cast<uint32_t>(obu_size);
+            std::vector<uint8_t> packet_data;
+            packet_data.reserve(4 + obu_size);
+            packet_data.push_back(len_le & 0xff);
+            packet_data.push_back((len_le >> 8) & 0xff);
+            packet_data.push_back((len_le >> 16) & 0xff);
+            packet_data.push_back((len_le >> 24) & 0xff);
+            packet_data.insert(packet_data.end(), data + pos, data + pos + obu_size);
+
+            MppPacket packet = nullptr;
+            if (mpp_packet_init(&packet, packet_data.data(), packet_data.size()) != MPP_OK) {
+                return false;
+            }
+            if (isLast) {
+                mpp_packet_set_eos(packet);
+            }
+
+            int ret = api_->decode_put_packet(ctx_, packet);
+            mpp_packet_deinit(&packet);
+            if (ret != MPP_OK) {
+                util::log(util::stderr_sink, util::LogLevel::Warn,
+                          "mpp_decode_put_packet failed: {} (obu_offset={} obu_size={})",
+                          ret, pos, obu_size);
+                return false;
+            }
+
+            if (drainFrames()) return true;
+            pos += obu_size;
+        }
+    } else {
+        // H.264/HEVC: split on start codes.
+        while (nalStart < dataSize) {
+            size_t nalEnd = findStart(nalStart + 3);
+            bool isLastNal = (nalEnd == dataSize);
+            if (!sendPacketRange(nalStart, nalEnd, isLastNal)) {
+                return false;
+            }
+            if (drainFrames()) return true;
+            nalStart = nalEnd;
+        }
     }
-mpp_packet_set_data(packet, const_cast<void*>(static_cast<const void*>(job.bitstream.data())));
-    mpp_packet_set_length(packet, job.bitstream.size());
 
-    // Prepare the output frame (decoder should pull from our committed buffer group).
-    MppFrame frame = nullptr;
-    if (mpp_frame_init(&frame) != MPP_OK) {
-        mpp_packet_deinit(&packet);
-        return false;
-    }
-
-    mpp_frame_set_fmt(frame, MPP_FMT_YUV420SP);
-    mpp_frame_set_width(frame, info.width);
-    mpp_frame_set_height(frame, info.height);
-    mpp_frame_set_hor_stride(frame, info.stride);
-    mpp_frame_set_ver_stride(frame, info.height);
-    mpp_frame_set_buf_size(frame, computeNv12Size(info.width, info.height, info.stride));
-
-    // Send packet and get decoded frame.
-    if (api_->decode(ctx_, packet, &frame) != MPP_OK) {
-        mpp_frame_deinit(&frame);
-        mpp_packet_deinit(&packet);
-        return false;
-    }
-
-    // Notify the surface that decoding is complete.
-    if (info.ready) {
-        info.ready->store(true, std::memory_order_release);
-        info.ready->notify_all();
-    }
-
-    mpp_frame_deinit(&frame);
-    mpp_packet_deinit(&packet);
-    return true;
+    return gotFrame;
 }
 
 CodecProfile vaProfileToCodec(VAProfile profile) {
