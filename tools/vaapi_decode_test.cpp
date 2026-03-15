@@ -12,51 +12,19 @@
 #include <string>
 
 static bool read_file(const char* path, std::vector<uint8_t>& out) {
-    FILE* f = fopen(path, "rb");
-    if (!f) return false;
-    fseek(f, 0, SEEK_END);
-    long sz = ftell(f);
-    if (sz <= 0) {
-        fclose(f);
-        return false;
-    }
-    fseek(f, 0, SEEK_SET);
-    out.resize(sz);
-    if (fread(out.data(), 1, sz, f) != (size_t)sz) {
-        fclose(f);
-        return false;
-    }
-    fclose(f);
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f.is_open()) return false;
+    std::streamsize sz = f.tellg();
+    if (sz <= 0) return false;
+    f.seekg(0, std::ios::beg);
+    out.resize(static_cast<size_t>(sz));
+    if (!f.read(reinterpret_cast<char*>(out.data()), sz)) return false;
     return true;
 }
 
-static bool extract_elementary_stream(const char* mp4_path,
-                                     const char* parser_name,
-                                     const char* output_caps,
-                                     std::vector<uint8_t>& out) {
-    char tmp_path[] = "/tmp/vaapi_decode_test_XXXXXX";
-    int tmp_fd = mkstemp(tmp_path);
-    if (tmp_fd < 0) return false;
-    close(tmp_fd);
-
-    std::string cmd = "gst-launch-1.0 -q filesrc location=\"" + std::string(mp4_path) +
-                      "\" ! qtdemux name=d d.video_0 ! queue ! " + std::string(parser_name);
-    
-    if (output_caps && strlen(output_caps) > 0) {
-        cmd += " ! \"" + std::string(output_caps) + "\"";
-    }
-
-    cmd += " ! filesink location=\"" + std::string(tmp_path) + "\"";
-
-    int ret = system(cmd.c_str());
-    if (ret != 0) {
-        unlink(tmp_path);
-        return false;
-    }
-
-    bool ok = read_file(tmp_path, out);
-    unlink(tmp_path);
-    return ok;
+// Simplified: read raw elementary stream from disk using std::ifstream.
+static bool extract_elementary_stream(const char* path, std::vector<uint8_t>& out) {
+    return read_file(path, out);
 }
 
 int main(int argc, char** argv) {
@@ -90,7 +58,8 @@ int main(int argc, char** argv) {
         profile = VAProfileAV1Profile0;
     }
 
-    if (!extract_elementary_stream(file, parser, out_caps, bitstream)) {
+    if (!extract_elementary_stream(file, bitstream)) {
+        fprintf(stderr, "Failed to read input stream: %s\n", file);
         return 1;
     }
 
