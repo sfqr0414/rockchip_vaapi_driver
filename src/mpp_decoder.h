@@ -31,7 +31,6 @@ enum class CodecProfile {
     Unknown,
 };
 
-/// Encapsulates a single decoded surface.
 struct DecodedSurface {
     VASurfaceID va_id = VA_INVALID_ID;
     int dmabuf_fd = -1;
@@ -39,27 +38,20 @@ struct DecodedSurface {
     uint32_t height = 0;
     uint32_t stride = 0;
     bool is_10bit = false;
+};
+
+struct SurfaceInfo {
+    DecodedSurface surface;
+    MppBuffer buffer = nullptr;
     std::atomic<bool> ready{false};
+    std::atomic<bool> failed{false};
 };
 
 struct DecodeJob {
     VASurfaceID target_surface = VA_INVALID_ID;
     std::vector<uint8_t> bitstream;
-    std::vector<uint8_t> extra_data; // For SPS/PPS or AV1 Sequence Header
+    std::vector<uint8_t> extra_data;
     bool eos = false;
-};
-
-struct SurfaceInfo {
-    // DMABUF returned to VA (exported by the driver)
-    int dmabuf_fd = -1;
-    // Imported MPP buffer handle used for decode output.
-    MppBuffer buffer = nullptr;
-
-    uint32_t width = 0;
-    uint32_t height = 0;
-    uint32_t stride = 0;
-    std::shared_ptr<std::atomic<bool>> ready;
-    std::shared_ptr<std::atomic<bool>> decode_failed;
 };
 
 class MppDecoder {
@@ -71,52 +63,36 @@ public:
     bool isInitialized() const;
     bool enqueueJob(DecodeJob job);
 
-    /// Wait until the surface is ready to be used (decoded).
-    bool waitSurfaceReady(VASurfaceID surface, uint32_t timeout_ms = 5000);
-
-    /// Allocates a surface (with an exported dmabuf FD) and tracks readiness.
     bool allocateSurface(VASurfaceID id, DecodedSurface& out, int width, int height);
-
-    /// Update the output surface size/stride when MPP reports a resolution change.
     bool updateSurfaceResolution(VASurfaceID id, int width, int height);
-
     bool getSurfaceInfo(VASurfaceID id, uint32_t& width, uint32_t& height, uint32_t& stride, int& dmabuf_fd, bool& failed);
-
-    /// Reset ready/failed flags for the given surface (called prior to submit).
+    bool waitSurfaceReady(VASurfaceID surface, uint32_t timeout_ms = 5000);
     void resetSurface(VASurfaceID surface);
-
-    /// Notify the decoder that a surface is ready for display.
-    void markSurfaceReady(VASurfaceID surface);
-
-    /// Signals the decoder to tear down.
+    void releaseSurface(VASurfaceID surface);
     void shutdown();
 
 private:
-    void decoderThreadMain(std::stop_token st);
-    bool processJob(const DecodeJob& job);
-    bool drainFrames(const DecodeJob& job, SurfaceInfo& info);
-    CodecProfile profile_{CodecProfile::Unknown};
+    void inputThreadMain(std::stop_token st);
+    void outputThreadMain(std::stop_token st);
 
+    CodecProfile profile_{CodecProfile::Unknown};
     MppCtx ctx_ = nullptr;
     MppApi* api_ = nullptr;
     MppBufferGroup group_ = nullptr;
 
-    util::AtomicSyncQueue<DecodeJob, 16> job_queue_;
-
+    util::AtomicSyncQueue<DecodeJob, 16> input_queue_;
     std::atomic<bool> running_{false};
-    std::jthread decoder_thread_;
+    std::atomic<bool> eos_sent_{false};
+    std::atomic<bool> eos_seen_{false};
 
-    // Per-surface readiness indicator.
+    std::jthread input_thread_;
+    std::jthread output_thread_;
+
     std::unordered_map<VASurfaceID, SurfaceInfo> surfaces_;
-
-    // Queue of pending target surfaces corresponding to jobs that have been
-    // submitted (bitstream fed to MPP). The decoder thread will use this list
-    // to associate output frames with the correct VA surface.
     std::deque<VASurfaceID> pending_surfaces_;
-    std::mutex pending_mutex_;
 
-    // Condition variable used by waitSurfaceReady to block until the decoder
-    // thread reports that a surface is ready (or has failed).
+    std::mutex surface_mutex_;
+    std::mutex pending_mutex_;
     std::mutex cv_mutex_;
     std::condition_variable cv_;
 };

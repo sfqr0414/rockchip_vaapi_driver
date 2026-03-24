@@ -32,9 +32,14 @@ target_link_libraries(vaapi_decode_test PRIVATE
     pthread
 )
 
+target_include_directories(test_mpp_decode PRIVATE
+    src
+)
+
 target_include_directories(vaapi_decode_test PRIVATE
     ${LIBVA_INCLUDE_DIRS}
     ${LIBVA_DRM_INCLUDE_DIRS}
+    src
 )
 
 # The VA-API driver naming convention expects <driver>_drv_video.so (no lib prefix).

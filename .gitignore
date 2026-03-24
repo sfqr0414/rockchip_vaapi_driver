@@ -3,3 +3,7 @@ build/
 
 # Ignore recorded video samples (too large)
 videos/
+
+output/
+
+.vscode/

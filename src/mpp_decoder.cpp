@@ -4,8 +4,8 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <mutex>
-#include <span>
 #include <thread>
+#include <vector>
 #include <cassert>
 
 namespace rockchip {
@@ -24,351 +24,358 @@ static uint32_t alignUp(uint32_t value, uint32_t align) {
     return (value + align - 1) / align * align;
 }
 
-static std::mutex g_surfaces_mutex;
-
 MppDecoder::MppDecoder() = default;
 MppDecoder::~MppDecoder() { shutdown(); }
 
 bool MppDecoder::initialize(CodecProfile profile, int width, int height) {
-    if (ctx_ && group_) return true;
+    if (ctx_ && api_) return true;
     profile_ = profile;
 
     if (mpp_create(&ctx_, &api_) != MPP_OK) return false;
-
     if (mpp_init(ctx_, MPP_CTX_DEC, codecProfileToMpp(profile_)) != MPP_OK) {
         mpp_destroy(ctx_);
         ctx_ = nullptr;
         return false;
     }
 
-    // Configure MPP to split parse input into packets (per-slice parsing)
-    // If the SDK provides mpp_dec_cfg helpers, set the 'base:split_parse' flag.
-    // These symbols are normally available in Rockchip MPP builds; if not,
-    // the calls are skipped safely by checking their presence at compile-time.
-    // Force-enable split-parse so MPP will split input into smaller packets
-    // required by some hardware decoders. Use the cfg helper unconditionally.
-    {
-        MppDecCfg cfg = nullptr;
-        if (mpp_dec_cfg_init(&cfg) == MPP_OK && cfg) {
-            mpp_dec_cfg_set_u32(cfg, "base:split_parse", 1);
-            api_->control(ctx_, MPP_DEC_SET_CFG, cfg);
-            mpp_dec_cfg_deinit(cfg);
-        }
+    MppDecCfg cfg = nullptr;
+    if (mpp_dec_cfg_init(&cfg) == MPP_OK && cfg) {
+        mpp_dec_cfg_set_u32(cfg, "base:split_parse", 1);
+        api_->control(ctx_, MPP_DEC_SET_CFG, cfg);
+        mpp_dec_cfg_deinit(cfg);
     }
 
-    // Try buffer group types in priority order: DMA_HEAP then DRM. If the
-    // chosen group doesn't produce exportable DMABUF fds, fall back.
-    auto try_group = [&](MppBufferType type, const char* name) -> bool {
-        MppBufferGroup g = nullptr;
-        if (mpp_buffer_group_get_internal(&g, type) != MPP_OK) return false;
-        // Quick check: allocate a buffer of a size similar to what we'll need and make sure it has an exportable fd.
-        MppBuffer test_buf = nullptr;
-        bool ok = false;
-        const size_t test_size = 8 * 1024 * 1024;
-        if (mpp_buffer_get(g, &test_buf, test_size) == MPP_OK && test_buf) {
-            int fd = mpp_buffer_get_fd(test_buf);
-            ok = (fd >= 0);
-            mpp_buffer_put(test_buf);
-        }
-        if (!ok) {
-            mpp_buffer_group_put(g);
-            return false;
-        }
-        group_ = g;
-        util::log(util::stderr_sink, util::LogLevel::Info, "mpp: using {} buffer group", name);
-        return true;
-    };
+    MppPollType nonblock = MPP_POLL_NON_BLOCK;
+    api_->control(ctx_, MPP_SET_OUTPUT_TIMEOUT, &nonblock);
 
-    if (!try_group(MPP_BUFFER_TYPE_DMA_HEAP, "DMA_HEAP") &&
-        !try_group(MPP_BUFFER_TYPE_DRM, "DRM")) {
-        util::log(util::stderr_sink, util::LogLevel::Error, "mpp: failed to create DMA_HEAP or DRM buffer group");
-        mpp_destroy(ctx_);
-        ctx_ = nullptr;
-        return false;
-    }
-
-    // Bind the created external buffer group into the decoder context so output
-    // buffers are allocated from this group and can provide exportable DMABUF fds.
-    api_->control(ctx_, MPP_DEC_SET_EXT_BUF_GROUP, group_);
-
-    // Short output timeout to avoid long hangs in tests
-    RK_U32 timeout = 100; // ms
-    api_->control(ctx_, MPP_SET_OUTPUT_TIMEOUT, &timeout);
-
-    return true;
-}
-
-bool MppDecoder::allocateSurface(VASurfaceID id, DecodedSurface& out, int width, int height) {
-    uint32_t stride = alignUp(static_cast<uint32_t>(width), 64);
-    if (profile_ == CodecProfile::AV1) {
-        // For 10-bit AV1, MPP expects a stride close to width*10/8 and aligned to 16.
-        stride = alignUp((width * 10U + 7U) / 8U, 16U);
-    }
-    out.va_id = id;
-    out.width = static_cast<uint32_t>(width);
-    out.height = static_cast<uint32_t>(height);
-    out.stride = stride;
-    out.is_10bit = (profile_ == CodecProfile::AV1);
-    out.ready.store(false);
-
-    SurfaceInfo info;
-    info.width = out.width;
-    info.height = out.height;
-    info.stride = out.stride;
-    info.ready = std::make_shared<std::atomic<bool>>(false);
-    info.decode_failed = std::make_shared<std::atomic<bool>>(false);
-
-    // Try to allocate an output buffer from the bound group so we have an
-    // exportable DMABUF ready for VA to import/export. This ensures the
-    // surface mapping contains a real MppBuffer and fd before decoding.
-    if (group_) {
-        MppBuffer buf = nullptr;
-        // Estimate buffer size: stride * height * bytes-per-pixel (approx).
-        // For 8-bit YUV420 use 1.5 bytes per pixel; for 10-bit YUV420 use 2.5 bytes per pixel.
-        size_t bytes_per_pixel_mul = out.is_10bit ? 5 : 3;
-        size_t bytes_per_pixel_div = out.is_10bit ? 2 : 2;
-        size_t buf_size = (static_cast<size_t>(out.stride) * static_cast<size_t>(out.height) * bytes_per_pixel_mul) / bytes_per_pixel_div;
-        if (buf_size == 0) buf_size = 8 * 1024 * 1024; // fallback 8MB
-        if (mpp_buffer_get(group_, &buf, buf_size) == MPP_OK && buf) {
-            int fd = mpp_buffer_get_fd(buf);
-            util::log(util::stderr_sink, util::LogLevel::Debug,
-                      "mpp: allocated surface {} buf_size={} fd={}", id, buf_size, fd);
-            info.buffer = buf;
-            info.dmabuf_fd = fd;
-        } else {
-            // Allocation failed — leave buffer null and fd -1, but continue.
-            util::log(util::stderr_sink, util::LogLevel::Warn,
-                      "mpp: failed to allocate buffer for surface %u (size=%zu)", id, buf_size);
-            info.buffer = nullptr;
-            info.dmabuf_fd = -1;
-        }
-    }
-
-    std::lock_guard<std::mutex> lock(g_surfaces_mutex);
-    surfaces_[id] = std::move(info);
-    return true;
-}
-
-bool MppDecoder::updateSurfaceResolution(VASurfaceID id, int width, int height) { return true; }
-
-bool MppDecoder::getSurfaceInfo(VASurfaceID id, uint32_t& width, uint32_t& height, uint32_t& stride, int& dmabuf_fd, bool& failed) {
-    std::lock_guard<std::mutex> lock(g_surfaces_mutex);
-    auto it = surfaces_.find(id);
-    if (it == surfaces_.end()) return false;
-    width = it->second.width;
-    height = it->second.height;
-    stride = it->second.stride;
-    dmabuf_fd = it->second.dmabuf_fd;
-    failed = it->second.decode_failed ? it->second.decode_failed->load() : false;
-    return true;
-}
-
-bool MppDecoder::enqueueJob(DecodeJob job) {
-    if (!running_) {
-        running_ = true;
-        decoder_thread_ = std::jthread([this](std::stop_token st){ decoderThreadMain(st); });
-    }
-    {
-        std::lock_guard<std::mutex> lock(pending_mutex_);
-        pending_surfaces_.push_back(job.target_surface);
-    }
-    job_queue_.push(std::move(job));
     return true;
 }
 
 bool MppDecoder::isInitialized() const { return ctx_ != nullptr; }
 
+bool MppDecoder::allocateSurface(VASurfaceID id, DecodedSurface& out, int width, int height) {
+    uint32_t stride = alignUp(static_cast<uint32_t>(width), 64);
+    if (profile_ == CodecProfile::AV1) {
+        // AV1 in this path is treated as 10-bit surface, but mpp_buffer API is intentionally avoided.
+        stride = alignUp(static_cast<uint32_t>(width), 128);
+    }
+
+    DecodedSurface ds;
+    ds.va_id = id;
+    ds.width = static_cast<uint32_t>(width);
+    ds.height = static_cast<uint32_t>(height);
+    ds.stride = stride;
+    ds.is_10bit = (profile_ == CodecProfile::AV1);
+
+    SurfaceInfo info;
+    info.surface = ds;
+    info.buffer = nullptr;
+    info.ready.store(false);
+    info.failed.store(false);
+
+    std::lock_guard<std::mutex> lock(surface_mutex_);
+    auto& entry = surfaces_[id];
+    entry.surface = ds;
+    entry.buffer = nullptr;
+    entry.ready.store(false);
+    entry.failed.store(false);
+    out = ds;
+    return true;
+}
+
+bool MppDecoder::updateSurfaceResolution(VASurfaceID id, int width, int height) {
+    std::lock_guard<std::mutex> lock(surface_mutex_);
+    auto it = surfaces_.find(id);
+    if (it == surfaces_.end()) return false;
+
+    uint32_t stride = alignUp(static_cast<uint32_t>(width), 64);
+    it->second.surface.width = static_cast<uint32_t>(width);
+    it->second.surface.height = static_cast<uint32_t>(height);
+    it->second.surface.stride = stride;
+    return true;
+}
+
+bool MppDecoder::getSurfaceInfo(VASurfaceID id, uint32_t& width, uint32_t& height, uint32_t& stride, int& dmabuf_fd, bool& failed) {
+    std::lock_guard<std::mutex> lock(surface_mutex_);
+    auto it = surfaces_.find(id);
+    if (it == surfaces_.end()) return false;
+    width = it->second.surface.width;
+    height = it->second.surface.height;
+    stride = it->second.surface.stride;
+    dmabuf_fd = it->second.surface.dmabuf_fd;
+    failed = it->second.failed.load();
+    return true;
+}
+
+bool MppDecoder::enqueueJob(DecodeJob job) {
+    if (!ctx_ || !api_) return false;
+
+    bool expected = false;
+    if (running_.compare_exchange_strong(expected, true)) {
+        input_thread_ = std::jthread([this](std::stop_token st){ inputThreadMain(st); });
+        output_thread_ = std::jthread([this](std::stop_token st){ outputThreadMain(st); });
+    }
+
+    if (job.target_surface != VA_INVALID_ID) {
+        std::lock_guard<std::mutex> lock(pending_mutex_);
+        pending_surfaces_.push_back(job.target_surface);
+    }
+
+    input_queue_.push(std::move(job));
+    return true;
+}
+
 bool MppDecoder::waitSurfaceReady(VASurfaceID surface, uint32_t timeout_ms) {
-    std::shared_ptr<std::atomic<bool>> ready_flag;
-    std::shared_ptr<std::atomic<bool>> failed_flag;
+    std::atomic<bool>* ready_flag = nullptr;
+    std::atomic<bool>* failed_flag = nullptr;
     {
-        std::lock_guard<std::mutex> lock(g_surfaces_mutex);
+        std::lock_guard<std::mutex> lock(surface_mutex_);
         auto it = surfaces_.find(surface);
         if (it == surfaces_.end()) return false;
-        ready_flag = it->second.ready;
-        failed_flag = it->second.decode_failed;
+        ready_flag = &it->second.ready;
+        failed_flag = &it->second.failed;
     }
-    if (!ready_flag) return false;
+
+    if (!ready_flag || !failed_flag) return false;
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
     std::unique_lock<std::mutex> lock(cv_mutex_);
-    while (!ready_flag->load()) {
-        if (std::chrono::steady_clock::now() >= deadline) break;
+    while (!ready_flag->load() && std::chrono::steady_clock::now() < deadline) {
         cv_.wait_until(lock, deadline);
     }
 
-    if (failed_flag && failed_flag->load()) return false;
+    if (failed_flag->load()) return false;
     return ready_flag->load();
 }
 
 void MppDecoder::resetSurface(VASurfaceID surface) {
-    std::lock_guard<std::mutex> lock(g_surfaces_mutex);
+    std::lock_guard<std::mutex> lock(surface_mutex_);
     auto it = surfaces_.find(surface);
     if (it == surfaces_.end()) return;
-    if (it->second.ready) it->second.ready->store(false);
-    if (it->second.decode_failed) it->second.decode_failed->store(false);
+    it->second.ready.store(false);
+    it->second.failed.store(false);
     std::lock_guard<std::mutex> lock2(cv_mutex_);
     cv_.notify_all();
 }
 
-void MppDecoder::shutdown() {
-    running_ = false;
-    job_queue_.shutdown();
-    if (decoder_thread_.joinable()) {
-        decoder_thread_.request_stop();
-        decoder_thread_.join();
+void MppDecoder::releaseSurface(VASurfaceID surface) {
+    std::lock_guard<std::mutex> lock(surface_mutex_);
+    auto it = surfaces_.find(surface);
+    if (it == surfaces_.end()) return;
+
+    if (it->second.buffer) {
+        mpp_buffer_put(it->second.buffer);
+        it->second.buffer = nullptr;
     }
 
-    std::lock_guard<std::mutex> lock(g_surfaces_mutex);
+    if (it->second.surface.dmabuf_fd >= 0) {
+        close(it->second.surface.dmabuf_fd);
+        it->second.surface.dmabuf_fd = -1;
+    }
+
+    it->second.ready.store(false);
+    it->second.failed.store(false);
+}
+
+void MppDecoder::shutdown() {
+    if (!ctx_ && !api_) return;
+
+    running_ = false;
+
+    if (!eos_sent_) {
+        DecodeJob eos;
+        eos.target_surface = VA_INVALID_ID;
+        eos.eos = true;
+        input_queue_.push(eos);
+        eos_sent_ = true;
+    }
+
+    input_queue_.shutdown();
+
+    if (input_thread_.joinable()) {
+        input_thread_.request_stop();
+        input_thread_.join();
+    }
+
+    if (output_thread_.joinable()) {
+        output_thread_.request_stop();
+        output_thread_.join();
+    }
+
     if (ctx_) {
         mpp_destroy(ctx_);
         ctx_ = nullptr;
     }
-    if (group_) {
-        for (auto& pair : surfaces_) {
-            if (pair.second.buffer) {
-                mpp_buffer_put(pair.second.buffer);
-                pair.second.buffer = nullptr;
-                pair.second.dmabuf_fd = -1;
-            }
+
+    std::lock_guard<std::mutex> lock(surface_mutex_);
+    for (auto& kv : surfaces_) {
+        if (kv.second.buffer) {
+            mpp_buffer_put(kv.second.buffer);
+            kv.second.buffer = nullptr;
         }
-        mpp_buffer_group_put(group_);
-        group_ = nullptr;
+        if (kv.second.surface.dmabuf_fd >= 0) {
+            close(kv.second.surface.dmabuf_fd);
+            kv.second.surface.dmabuf_fd = -1;
+        }
     }
     surfaces_.clear();
+    pending_surfaces_.clear();
 }
 
-void MppDecoder::decoderThreadMain(std::stop_token st) {
-    while (!st.stop_requested()) {
-        auto job = job_queue_.pop();
-        if (!job) break;
-        processJob(*job);
-    }
-}
+void MppDecoder::inputThreadMain(std::stop_token st) {
+    while (!st.stop_requested() && (running_ || !eos_sent_)) {
+        auto job_opt = input_queue_.pop();
+        if (!job_opt) break;
+        DecodeJob job = std::move(*job_opt);
 
-bool MppDecoder::processJob(const DecodeJob& job) {
-    if (!ctx_) return false;
+        std::vector<uint8_t> payload;
+        const uint8_t* payload_ptr = nullptr;
+        size_t payload_size = 0;
 
-    std::shared_ptr<std::atomic<bool>> ready_flag;
-    std::shared_ptr<std::atomic<bool>> failed_flag;
-    {
-        std::lock_guard<std::mutex> lock(g_surfaces_mutex);
-        auto it = surfaces_.find(job.target_surface);
-        if (it == surfaces_.end()) return false;
-        ready_flag = it->second.ready;
-        failed_flag = it->second.decode_failed;
-    }
+        if (job.eos) {
+            MppPacket pkt = nullptr;
+            mpp_packet_init(&pkt, nullptr, 0);
+            mpp_packet_set_eos(pkt);
+            for (int i = 0; i < 200 && running_; ++i) {
+                int ret = api_->decode_put_packet(ctx_, pkt);
+                if (ret == MPP_OK) break;
+                if (ret == MPP_ERR_BUFFER_FULL) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                    continue;
+                }
+                break;
+            }
+            mpp_packet_deinit(&pkt);
+            eos_sent_ = true;
+            continue;
+        }
 
-    if (ready_flag) ready_flag->store(false);
-    if (failed_flag) failed_flag->store(false);
+        if (!job.extra_data.empty() && !job.bitstream.empty()) {
+            payload.reserve(job.extra_data.size() + job.bitstream.size());
+            payload.insert(payload.end(), job.extra_data.begin(), job.extra_data.end());
+            payload.insert(payload.end(), job.bitstream.begin(), job.bitstream.end());
+            payload_ptr = payload.data();
+            payload_size = payload.size();
+        } else if (!job.extra_data.empty()) {
+            payload_ptr = job.extra_data.data();
+            payload_size = job.extra_data.size();
+        } else {
+            payload_ptr = job.bitstream.data();
+            payload_size = job.bitstream.size();
+        }
 
-    // Feed extra_data first (e.g. sequence headers)
-    if (!job.extra_data.empty()) {
-        std::span<const uint8_t> extra(job.extra_data);
-        MppPacket pkt;
-        mpp_packet_init(&pkt, const_cast<uint8_t*>(extra.data()), extra.size());
-        mpp_packet_set_extra_data(pkt);
-        api_->decode_put_packet(ctx_, pkt);
+        if (payload_size == 0) continue;
+
+        MppPacket pkt = nullptr;
+        if (mpp_packet_init(&pkt, const_cast<uint8_t*>(payload_ptr), payload_size) != MPP_OK) {
+            continue;
+        }
+
+        while (running_) {
+            int ret = api_->decode_put_packet(ctx_, pkt);
+            if (ret == MPP_OK) break;
+            if (ret == MPP_ERR_BUFFER_FULL) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                continue;
+            }
+            util::log(util::stderr_sink, util::LogLevel::Error,
+                      "mpp: decode_put_packet returned %d", ret);
+            break;
+        }
+
         mpp_packet_deinit(&pkt);
     }
 
-    // Feed bitstream
-    std::span<const uint8_t> bit(job.bitstream);
-    MppPacket pkt;
-    mpp_packet_init(&pkt, const_cast<uint8_t*>(bit.data()), bit.size());
-    if (job.eos) {
-        mpp_packet_set_eos(pkt);
-    }
-    int ret = api_->decode_put_packet(ctx_, pkt);
-    mpp_packet_deinit(&pkt);
+}
 
-    if (ret != MPP_OK) {
-        if (failed_flag) failed_flag->store(true);
-        if (ready_flag) {
-            ready_flag->store(true);
-            std::lock_guard<std::mutex> lock(cv_mutex_);
-            cv_.notify_all();
-        }
-        return false;
-    }
-
-    // Capture output frames; update surface stride on resolution change or when frame available
-    bool got = false;
-    while (true) {
+void MppDecoder::outputThreadMain(std::stop_token st) {
+    while (!st.stop_requested() && (running_ || !eos_seen_)) {
         MppFrame frame = nullptr;
-        mpp_frame_init(&frame);
-        int cret = api_->decode_get_frame(ctx_, &frame);
-        if (cret != MPP_OK || !frame) {
-            if (frame) mpp_frame_deinit(&frame);
-            break;
+        int ret = api_->decode_get_frame(ctx_, &frame);
+
+        if (ret == MPP_ERR_DISPLAY_FULL) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            continue;
+        }
+
+        if (ret == MPP_ERR_TIMEOUT) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            continue;
+        }
+
+        if (ret != MPP_OK || !frame) {
+            continue;
         }
 
         if (mpp_frame_get_info_change(frame)) {
             uint32_t new_w = mpp_frame_get_width(frame);
             uint32_t new_h = mpp_frame_get_height(frame);
-            uint32_t new_stride = mpp_frame_get_hor_stride(frame);
-            std::lock_guard<std::mutex> lock(g_surfaces_mutex);
-            auto it = surfaces_.find(job.target_surface);
-            if (it != surfaces_.end()) {
-                it->second.width = new_w;
-                it->second.height = new_h;
-                it->second.stride = new_stride;
+            std::lock_guard<std::mutex> lock(surface_mutex_);
+            for (auto& item : surfaces_) {
+                item.second.surface.width = new_w;
+                item.second.surface.height = new_h;
             }
             api_->control(ctx_, MPP_DEC_SET_INFO_CHANGE_READY, nullptr);
             mpp_frame_deinit(&frame);
             continue;
         }
 
-        MppBuffer buf = mpp_frame_get_buffer(frame);
-        if (buf) {
-            // Increment buffer ref before querying/exporting FD to ensure the
-            // buffer remains valid while we inspect and assign it to our surface
-            // structure. If we don't keep a ref and fail to store it, we must put it.
-            mpp_buffer_inc_ref(buf);
-            int fd = mpp_buffer_get_fd(buf);
-            if (fd >= 0) {
-                std::lock_guard<std::mutex> lock(g_surfaces_mutex);
-                auto it = surfaces_.find(job.target_surface);
-                if (it != surfaces_.end()) {
-                    if (it->second.buffer) mpp_buffer_put(it->second.buffer);
-                    it->second.buffer = buf;
-                    it->second.dmabuf_fd = fd;
-                    it->second.width = mpp_frame_get_width(frame);
-                    it->second.height = mpp_frame_get_height(frame);
-                    // Immediately update stride from frame to avoid mismatch
-                    it->second.stride = mpp_frame_get_hor_stride(frame);
-                    got = true;
-                } else {
-                    // No surface entry to attach to; release our ref.
-                    mpp_buffer_put(buf);
-                }
-            } else {
-                // Buffer has no exportable fd; drop our ref.
-                mpp_buffer_put(buf);
+        bool is_error = mpp_frame_get_errinfo(frame) || mpp_frame_get_discard(frame);
+        bool is_eos_frame = mpp_frame_get_eos(frame);
+
+        VASurfaceID surface_id = VA_INVALID_ID;
+        {
+            std::lock_guard<std::mutex> lock(pending_mutex_);
+            if (!pending_surfaces_.empty()) {
+                surface_id = pending_surfaces_.front();
+                pending_surfaces_.pop_front();
             }
+        }
+
+        if (surface_id != VA_INVALID_ID) {
+            std::lock_guard<std::mutex> lock(surface_mutex_);
+            auto it = surfaces_.find(surface_id);
+            if (it != surfaces_.end()) {
+                it->second.surface.width = mpp_frame_get_width(frame);
+                it->second.surface.height = mpp_frame_get_height(frame);
+                it->second.surface.stride = mpp_frame_get_hor_stride(frame);
+
+                MppBuffer mpp_buf = mpp_frame_get_buffer(frame);
+                if (mpp_buf) {
+                    int buffer_fd = mpp_buffer_get_fd(mpp_buf);
+                    if (mpp_buffer_inc_ref(mpp_buf) == MPP_OK) {
+                        if (it->second.buffer) {
+                            mpp_buffer_put(it->second.buffer);
+                        }
+                        it->second.buffer = mpp_buf;
+
+                        if (it->second.surface.dmabuf_fd >= 0) {
+                            close(it->second.surface.dmabuf_fd);
+                        }
+                        it->second.surface.dmabuf_fd = (buffer_fd >= 0 ? dup(buffer_fd) : -1);
+                    } else {
+                        util::log(util::stderr_sink, util::LogLevel::Warn,
+                                  "mpp: failed to inc ref buffer for surface %u", surface_id);
+                    }
+                }
+
+                it->second.failed.store(is_error);
+                it->second.ready.store(!is_error);
+            }
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(cv_mutex_);
+            cv_.notify_all();
+        }
+
+        if (is_eos_frame) {
+            eos_seen_ = true;
+            running_ = false;
         }
 
         mpp_frame_deinit(&frame);
     }
-
-    if (ready_flag) {
-        ready_flag->store(true);
-        std::lock_guard<std::mutex> lock(cv_mutex_);
-        cv_.notify_all();
-    }
-
-    // Ensure surfaces_ contains the latest dmabuf_fd for the surface even if
-    // the fd was obtained during frame handling above.
-    {
-        std::lock_guard<std::mutex> lock(g_surfaces_mutex);
-        auto it = surfaces_.find(job.target_surface);
-        if (it != surfaces_.end() && it->second.buffer) {
-            int fd = mpp_buffer_get_fd(it->second.buffer);
-            it->second.dmabuf_fd = fd;
-        }
-    }
-
-    return got;
 }
 
 CodecProfile vaProfileToCodec(VAProfile profile) {
