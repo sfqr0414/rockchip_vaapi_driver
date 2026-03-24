@@ -49,6 +49,7 @@ struct SurfaceInfo {
 
 struct DecodeJob {
     VASurfaceID target_surface = VA_INVALID_ID;
+    uint64_t token = 0;
     std::vector<uint8_t> bitstream;
     std::vector<uint8_t> extra_data;
     bool eos = false;
@@ -69,6 +70,7 @@ public:
     bool waitSurfaceReady(VASurfaceID surface, uint32_t timeout_ms = 5000);
     void resetSurface(VASurfaceID surface);
     void releaseSurface(VASurfaceID surface);
+    void destroySurface(VASurfaceID surface);
     void shutdown();
 
 private:
@@ -89,10 +91,15 @@ private:
     std::jthread output_thread_;
 
     std::unordered_map<VASurfaceID, SurfaceInfo> surfaces_;
-    std::deque<VASurfaceID> pending_surfaces_;
+    std::unordered_map<uint64_t, VASurfaceID> pending_surfaces_;
+    std::deque<uint64_t> pending_order_;
+    uint64_t next_token_ = 1;
+    size_t pending_count_ = 0;
 
     std::mutex surface_mutex_;
     std::mutex pending_mutex_;
+    std::condition_variable pending_cv_;
+
     std::mutex cv_mutex_;
     std::condition_variable cv_;
 };

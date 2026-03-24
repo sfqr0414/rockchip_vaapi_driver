@@ -21,6 +21,7 @@ extern "C" {
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -40,16 +41,51 @@ static std::string probe_codec(const std::string& infile) {
     return result;
 }
 
+static bool probe_dimensions(const std::string& infile, int& width, int& height) {
+    std::string cmd = util::format_to("ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of default=noprint_wrappers=1:nokey=1 \"{}\"", infile);
+    util::SubProcess proc(cmd, util::SubProcess::READ);
+    std::vector<uint8_t> buffer(128);
+    std::string result;
+    while (size_t bytes = proc.read(buffer)) {
+        result.append(reinterpret_cast<char*>(buffer.data()), bytes);
+    }
+    if (result.empty()) return false;
+
+    // ffprobe prints width and height on separate lines.
+    std::istringstream iss(result);
+    std::string width_str;
+    std::string height_str;
+    if (!std::getline(iss, width_str)) return false;
+    if (!std::getline(iss, height_str)) return false;
+    try {
+        width = std::stoi(width_str);
+        height = std::stoi(height_str);
+    } catch (...) {
+        return false;
+    }
+    return width > 0 && height > 0;
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) {
-        util::console("Usage: {} <input.mp4> [width] [height] [max_decoded_frames]\n", argv[0]);
+        util::console("Usage: {} <input.mp4> [max_decoded_frames]\n", argv[0]);
         return 1;
     }
 
     const char* infile = argv[1];
-    int width = (argc > 2) ? atoi(argv[2]) : 1920;
-    int height = (argc > 3) ? atoi(argv[3]) : 1080;
-    int kMaxDecodedFrames = (argc > 4) ? atoi(argv[4]) : 0; // 0 means no limit (decode full stream)
+    int width = 0;
+    int height = 0;
+    int kMaxDecodedFrames = (argc > 2) ? atoi(argv[2]) : 0; // 0 means no limit (decode full stream)
+
+    if (!probe_dimensions(infile, width, height)) {
+        if (!probe_dimensions(infile, width, height)) {
+            util::console(std::cerr, "Failed to probe resolution from file, using fallback 1920x1080\n");
+            width = 1920;
+            height = 1080;
+        } else {
+            util::console("Probed resolution: {}x{}\n", width, height);
+        }
+    }
 
     util::console("Probing codec for file: {}\n", infile);
     std::string codec = probe_codec(infile);
@@ -235,16 +271,18 @@ int main(int argc, char** argv) {
                                                                VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
                                                                VA_EXPORT_SURFACE_READ_ONLY, &desc);
                 if (export_status == VA_STATUS_SUCCESS) {
-                    int export_fd = desc.objects[0].fd;
-                    if (export_fd >= 0) {
-                        close(export_fd);
+                    for (uint32_t i = 0; i < desc.num_objects; i++) {
+                        if (desc.objects[i].fd >= 0) {
+                            close(desc.objects[i].fd);
+                            desc.objects[i].fd = -1;
+                        }
                     }
 
                     decoded_frames++;
                     surface_idx++;
                     if ((decoded_frames % 100) == 0) {
-                        util::console(std::cerr, "Decoded {} frames (surface={} fd={} stride={})\n",
-                                      decoded_frames, surface_idx - 1, export_fd, desc.layers[0].pitch[0]);
+                        util::console(std::cerr, "Decoded {} frames (surface={} stride={})\n",
+                                      decoded_frames, surface_idx - 1, desc.layers[0].pitch[0]);
                     }
                 } else {
                     util::console(std::cerr, "vaExportSurfaceHandle failed: {}\n", export_status);

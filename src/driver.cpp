@@ -1,46 +1,31 @@
-#include "mpp_decoder.h"
-#include "util/log.h"
-
-#include <cstdarg>
-#include <cstddef>
+#include <drm/drm_fourcc.h>
 #include <fcntl.h>
+#include <sys/mman.h>
 #include <va/va.h>
 #include <va/va_backend.h>
+#include <va/va_dec_av1.h>
 #include <va/va_drm.h>
 #include <va/va_drmcommon.h>
-#include <va/va_dec_av1.h>
-#include <drm/drm_fourcc.h>
 
 #include <algorithm>
 #include <atomic>
 #include <cassert>
+#include <cstdarg>
+#include <cstddef>
 #include <cstring>
+#include <mutex>
 #include <memory>
-#include <sys/mman.h>
 #include <unordered_map>
 #include <vector>
+
+#include "mpp_decoder.h"
+#include "util/log.h"
 
 using namespace rockchip;
 
 namespace rockchip_vaapi {
 
-struct SpinLock {
-    std::atomic_flag flag = ATOMIC_FLAG_INIT;
-    void lock() {
-        while (flag.test_and_set(std::memory_order_acquire)) {
-            // busy-wait
-        }
-    }
-    void unlock() {
-        flag.clear(std::memory_order_release);
-    }
-};
-
-struct ScopedSpinLock {
-    SpinLock& lock;
-    explicit ScopedSpinLock(SpinLock& l) : lock(l) { lock.lock(); }
-    ~ScopedSpinLock() { lock.unlock(); }
-};
+namespace impl {
 
 struct SurfaceState {
     DecodedSurface surface;
@@ -63,7 +48,7 @@ struct DriverState {
     VASurfaceID current_surface = VA_INVALID_ID;
     std::vector<VABufferID> current_buffers;
     VADriverVTable* vtable = nullptr;
-    SpinLock lock;
+    std::mutex lock;
     VAProfile profile = VAProfileNone;
 
     // Current expected decoding resolution (from vaCreateContext or MPP feedback).
@@ -73,9 +58,6 @@ struct DriverState {
     // atomically in vaEndPicture.
     std::vector<uint8_t> frame_buffer;
     std::vector<uint8_t> frame_extra_data;
-    // For AV1 we may receive picture params separately; keep a copy to
-    // synthesize sequence header at EndPicture if needed.
-    std::vector<uint8_t> pending_av1_pic_blob;
 
     // Images created via vaCreateImage / vaDeriveImage.
     struct ImageState {
@@ -94,11 +76,20 @@ struct DriverState {
         unsigned int chromakey_mask = 0;
         float global_alpha = 1.0f;
         std::vector<VASurfaceID> target_surfaces;
+        short src_x = 0;
+        short src_y = 0;
+        unsigned short src_width = 0;
+        unsigned short src_height = 0;
+        short dest_x = 0;
+        short dest_y = 0;
+        unsigned short dest_width = 0;
+        unsigned short dest_height = 0;
+        unsigned int flags = 0;
     };
     std::unordered_map<VASubpictureID, SubpictureState> subpictures;
     VASubpictureID next_subpicture_id = 1;
+    bool config_created = false;
 };
-
 
 static void* mapDmabuf(int fd, size_t size) {
     if (fd < 0 || size == 0) return nullptr;
@@ -148,39 +139,99 @@ static DriverState* toDriver(VADriverContextP ctx) {
     return reinterpret_cast<DriverState*>(ctx->pDriverData);
 }
 
-static void log_info(const char* fmt, ...) {
-    va_list ap;
-    va_start(ap, fmt);
-    char buf[512];
-    vsnprintf(buf, sizeof(buf), fmt, ap);
-    va_end(ap);
-    util::log(util::stdout_sink, util::LogLevel::Info, "{}", buf);
+static bool isSupportedProfile(VAProfile profile) {
+    switch (profile) {
+        case VAProfileH264High:
+        case VAProfileHEVCMain:
+        case VAProfileVP9Profile0:
+        case VAProfileAV1Profile0:
+            return true;
+        default:
+            return false;
+    }
 }
 
-static VAStatus vaCreateSurfaces(VADriverContextP ctx,
-                                    int width,
-                                    int height,
-                                    int format,
-                                    int num_surfaces,
-                                    VASurfaceID* surfaces) {
+template <auto Member, typename Fn>
+static constexpr auto make_entry(Fn* fn) {
+    return std::pair{Member, fn};
+}
+
+}  // namespace impl
+
+using namespace impl;
+
+/* api: VA driver callbacks (VADriverVTable functions only).
+ * impl: internal helpers and state logic.
+ */
+namespace api {
+
+static VAStatus vaCreateSurfaces1(VADriverContextP ctx,
+                                  int width,
+                                  int height,
+                                  int format,
+                                  int num_surfaces,
+                                  VASurfaceID* surfaces,
+                                  const VASurfaceAttrib* attrib_list,
+                                  int num_attribs) {
+    if (!ctx) return VA_STATUS_ERROR_INVALID_CONTEXT;
     auto* d = toDriver(ctx);
     if (!d) return VA_STATUS_ERROR_INVALID_CONTEXT;
 
-    ScopedSpinLock lock(d->lock);
+    if (width <= 0 || height <= 0 || num_surfaces <= 0 || !surfaces)
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+
+    if (format != VA_RT_FORMAT_YUV420) {
+        util::log(util::stderr_sink, util::LogLevel::Error,
+                  "vaCreateSurfaces1: unsupported format={} (only VA_RT_FORMAT_YUV420)", format);
+        return VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT;
+    }
+
+    for (int i = 0; i < num_attribs; i++) {
+        const auto& attr = attrib_list[i];
+        if (!(attr.flags & VA_SURFACE_ATTRIB_SETTABLE)) {
+            util::log(util::stderr_sink, util::LogLevel::Warn,
+                      "vaCreateSurfaces1: unsupported attrib {} (not settable)", attr.type);
+            return VA_STATUS_ERROR_INVALID_PARAMETER;
+        }
+
+        switch (attr.type) {
+            case VASurfaceAttribNone:
+                break;
+            case VASurfaceAttribPixelFormat:
+                if (attr.value.type != VAGenericValueTypeInteger) {
+                    return VA_STATUS_ERROR_INVALID_PARAMETER;
+                }
+                if (static_cast<uint32_t>(attr.value.value.i) != VA_FOURCC_NV12) {
+                    util::log(util::stderr_sink, util::LogLevel::Error,
+                              "vaCreateSurfaces1: unsupported pixel format {}", attr.value.value.i);
+                    return VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT;
+                }
+                break;
+            case VASurfaceAttribMemoryType:
+            case VASurfaceAttribUsageHint:
+            case VASurfaceAttribExternalBufferDescriptor:
+            case VASurfaceAttribDRMFormatModifiers:
+                // Supported as hints, but this lightweight driver ignores specifics.
+                break;
+            default:
+                util::log(util::stderr_sink, util::LogLevel::Warn,
+                          "vaCreateSurfaces1: unsupported attrib type {}", attr.type);
+                return VA_STATUS_ERROR_INVALID_PARAMETER;
+        }
+    }
+
+    std::lock_guard<std::mutex> lock(d->lock);
     {
         int initialized = d->decoder.isInitialized() ? 1 : 0;
         util::log(util::stderr_sink, util::LogLevel::Info,
-                  "vaCreateSurfaces: decoder isInitialized={}", initialized);
+                  "vaCreateSurfaces1: decoder isInitialized={}", initialized);
     }
 
-    // Ensure decoder is initialized before allocating surfaces.
     if (!d->decoder.isInitialized()) {
         int profile_int = static_cast<int>(d->profile);
-        int w = width;
-        int h = height;
         util::log(util::stderr_sink, util::LogLevel::Info,
                   "Initializing decoder for profile={} width={} height={}",
-                  profile_int, w, h);
+                  profile_int, width, height);
         if (!d->decoder.initialize(vaProfileToCodec(d->profile), width, height)) {
             util::log(util::stderr_sink, util::LogLevel::Error,
                       "Failed to initialize decoder for surface allocation");
@@ -197,10 +248,9 @@ static VAStatus vaCreateSurfaces(VADriverContextP ctx,
         state->surface.stride = ((state->surface.width + 63) / 64) * 64;
         state->surface.is_10bit = (d->profile == VAProfileAV1Profile0);
 
-        // Allocate a buffer for the surface using MPP.
         if (!d->decoder.allocateSurface(id, state->surface, width, height)) {
             util::log(util::stderr_sink, util::LogLevel::Error,
-                      "Failed to allocate MPP surface for VA surface %u", id);
+                      "Failed to allocate MPP surface for VA surface {}", id);
             return VA_STATUS_ERROR_ALLOCATION_FAILED;
         }
 
@@ -210,17 +260,28 @@ static VAStatus vaCreateSurfaces(VADriverContextP ctx,
     return VA_STATUS_SUCCESS;
 }
 
+static VAStatus vaCreateSurfaces(VADriverContextP ctx,
+                                 int width,
+                                 int height,
+                                 int format,
+                                 int num_surfaces,
+                                 VASurfaceID* surfaces) {
+    return vaCreateSurfaces1(ctx, width, height, format, num_surfaces, surfaces, nullptr, 0);
+}
+
 static VAStatus vaDestroySurfaces(VADriverContextP ctx,
-                                     VASurfaceID* surfaces,
-                                     int num_surfaces) {
+                                  VASurfaceID* surfaces,
+                                  int num_surfaces) {
     auto* d = toDriver(ctx);
     if (!d) return VA_STATUS_ERROR_INVALID_CONTEXT;
-    ScopedSpinLock lock(d->lock);
+    std::lock_guard<std::mutex> lock(d->lock);
     for (int i = 0; i < num_surfaces; i++) {
+        d->decoder.destroySurface(surfaces[i]);
         auto it = d->surfaces.find(surfaces[i]);
         if (it != d->surfaces.end()) {
             if (it->second->surface.dmabuf_fd >= 0) {
                 close(it->second->surface.dmabuf_fd);
+                it->second->surface.dmabuf_fd = -1;
             }
             d->surfaces.erase(it);
         }
@@ -251,19 +312,32 @@ static VAStatus vaSyncSurface(VADriverContextP ctx, VASurfaceID surface) {
                       "vaSyncSurface: surface={} failed={} fd={}", surface, (int)failed, fd);
             return (failed) ? VA_STATUS_ERROR_DECODING_ERROR : VA_STATUS_ERROR_INVALID_SURFACE;
         }
+
+        if (it->second->surface.dmabuf_fd >= 0 && it->second->surface.dmabuf_fd != fd) {
+            close(it->second->surface.dmabuf_fd);
+            it->second->surface.dmabuf_fd = -1;
+        }
+
+        int driver_fd = dup(fd);
+        if (driver_fd < 0) {
+            util::log(util::stderr_sink, util::LogLevel::Error,
+                      "vaSyncSurface: dup failed for surface={} fd={}", surface, fd);
+            return VA_STATUS_ERROR_ALLOCATION_FAILED;
+        }
+
         it->second->surface.width = width;
         it->second->surface.height = height;
         it->second->surface.stride = stride;
-        it->second->surface.dmabuf_fd = fd;
+        it->second->surface.dmabuf_fd = driver_fd;
     }
 
     return VA_STATUS_SUCCESS;
 }
 
 static VAStatus vaQueryConfigProfiles(VADriverContextP ctx,
-                                                   VAProfile* profile_list,
-                                                   int* num_profiles) {
-    (void)ctx;
+                                      VAProfile* profile_list,
+                                      int* num_profiles) {
+    if (!ctx) return VA_STATUS_ERROR_INVALID_CONTEXT;
     static const VAProfile supported[] = {
         VAProfileH264High,
         VAProfileHEVCMain,
@@ -293,10 +367,11 @@ static VAStatus vaQueryConfigProfiles(VADriverContextP ctx,
 }
 
 static VAStatus vaQueryConfigEntrypoints(VADriverContextP ctx,
-                                                 VAProfile profile,
-                                                 VAEntrypoint* entrypoint_list,
-                                                 int* num_entrypoints) {
-    (void)ctx;
+                                         VAProfile profile,
+                                         VAEntrypoint* entrypoint_list,
+                                         int* num_entrypoints) {
+    if (!ctx) return VA_STATUS_ERROR_INVALID_CONTEXT;
+    if (!isSupportedProfile(profile)) return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;
     if (!num_entrypoints) return VA_STATUS_ERROR_INVALID_PARAMETER;
     // We only support decoding
     if (*num_entrypoints < 1) {
@@ -308,28 +383,15 @@ static VAStatus vaQueryConfigEntrypoints(VADriverContextP ctx,
     return VA_STATUS_SUCCESS;
 }
 
-static bool isSupportedProfile(VAProfile profile) {
-    switch (profile) {
-        case VAProfileH264High:
-        case VAProfileHEVCMain:
-        case VAProfileVP9Profile0:
-        case VAProfileAV1Profile0:
-            return true;
-        default:
-            return false;
-    }
-}
-
 static VAStatus vaGetConfigAttributes(VADriverContextP ctx,
-                                               VAProfile profile,
-                                               VAEntrypoint entrypoint,
-                                               VAConfigAttrib* attrib_list,
-                                               int num_attribs) {
-    (void)ctx;
-    (void)entrypoint;
-
-    if (!attrib_list) return VA_STATUS_ERROR_INVALID_PARAMETER;
+                                      VAProfile profile,
+                                      VAEntrypoint entrypoint,
+                                      VAConfigAttrib* attrib_list,
+                                      int num_attribs) {
+    if (!ctx) return VA_STATUS_ERROR_INVALID_CONTEXT;
     if (!isSupportedProfile(profile)) return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;
+    if (!attrib_list) return VA_STATUS_ERROR_INVALID_PARAMETER;
+    if (entrypoint != VAEntrypointVLD) return VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT;
 
     for (int i = 0; i < num_attribs; i++) {
         if (attrib_list[i].type == VAConfigAttribRTFormat) {
@@ -342,65 +404,114 @@ static VAStatus vaGetConfigAttributes(VADriverContextP ctx,
 }
 
 static VAStatus vaCreateConfig(VADriverContextP ctx,
-                                       VAProfile profile,
-                                       VAEntrypoint entrypoint,
-                                       VAConfigAttrib* attrib_list,
-                                       int num_attribs,
-                                       VAConfigID* config_id) {
+                               VAProfile profile,
+                               VAEntrypoint entrypoint,
+                               VAConfigAttrib* attrib_list,
+                               int num_attribs,
+                               VAConfigID* config_id) {
     auto* d = toDriver(ctx);
     if (!d) return VA_STATUS_ERROR_INVALID_CONTEXT;
+    if (!isSupportedProfile(profile)) return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;
+    if (entrypoint != VAEntrypointVLD) return VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT;
+    if (!config_id) return VA_STATUS_ERROR_INVALID_PARAMETER;
+
+    // We support only minimal config and ignore per-config attributes here.
+    if (attrib_list && num_attribs > 0) {
+        for (int i = 0; i < num_attribs; i++) {
+            if (attrib_list[i].type == VAConfigAttribRTFormat) {
+                attrib_list[i].value = VA_RT_FORMAT_YUV420;
+            }
+        }
+    }
 
     d->profile = profile;
-    (void)entrypoint;
-    (void)attrib_list;
-    (void)num_attribs;
-
-    // Minimal driver: single config.
-    if (config_id) *config_id = 1;
+    d->config_created = true;
+    *config_id = 1;
     return VA_STATUS_SUCCESS;
 }
 
 static VAStatus vaDestroyConfig(VADriverContextP ctx, VAConfigID config_id) {
-    (void)ctx;
-    (void)config_id;
+    auto* d = toDriver(ctx);
+    if (!d) return VA_STATUS_ERROR_INVALID_CONTEXT;
+
+    // This driver only has a single config
+    if (!d->config_created || config_id != 1) {
+        return VA_STATUS_ERROR_INVALID_CONFIG;
+    }
+
+    d->config_created = false;
     return VA_STATUS_SUCCESS;
 }
 
 static VAStatus vaQueryConfigAttributes(VADriverContextP ctx,
-                                                 VAConfigID config_id,
-                                                 VAProfile* profile,
-                                                 VAEntrypoint* entrypoint,
-                                                 VAConfigAttrib* attrib_list,
-                                                 int* num_attribs) {
-    (void)ctx;
-    (void)config_id;
-    if (profile) *profile = VAProfileH264High;
+                                        VAConfigID config_id,
+                                        VAProfile* profile,
+                                        VAEntrypoint* entrypoint,
+                                        VAConfigAttrib* attrib_list,
+                                        int* num_attribs) {
+    if (!ctx) return VA_STATUS_ERROR_INVALID_CONTEXT;
+    if (!num_attribs) return VA_STATUS_ERROR_INVALID_PARAMETER;
+    auto* d = toDriver(ctx);
+    if (!d) return VA_STATUS_ERROR_INVALID_CONTEXT;
+    if (!d->config_created || config_id != 1) return VA_STATUS_ERROR_INVALID_CONFIG;
+
+    if (profile) *profile = d->profile;
     if (entrypoint) *entrypoint = VAEntrypointVLD;
-    if (attrib_list && num_attribs) {
+
+    // This driver does not expose additional config-level attributes.
+    if (attrib_list) {
         for (int i = 0; i < *num_attribs; i++) {
             attrib_list[i].value = 0;
         }
     }
+
+    // Indicate no extra attributes provided.
+    *num_attribs = 0;
     return VA_STATUS_SUCCESS;
 }
 
 static VAStatus vaCreateContext(VADriverContextP ctx,
-                                        VAConfigID config_id,
-                                        int picture_width,
-                                        int picture_height,
-                                        int flag,
-                                        VASurfaceID* render_targets,
-                                        int num_render_targets,
-                                        VAContextID* context) {
+                                VAConfigID config_id,
+                                int picture_width,
+                                int picture_height,
+                                int flag,
+                                VASurfaceID* render_targets,
+                                int num_render_targets,
+                                VAContextID* context) {
+    if (!ctx || !context) {
+        util::log(util::stderr_sink, util::LogLevel::Warn, "vaCreateContext: invalid pointer ctx={} context={}", (void*)ctx, (void*)context);
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+    }
     auto* d = toDriver(ctx);
-    if (!d) return VA_STATUS_ERROR_INVALID_CONTEXT;
-    (void)config_id;
-    (void)flag;
-    (void)render_targets;
-    (void)num_render_targets;
+    if (!d) {
+        util::log(util::stderr_sink, util::LogLevel::Warn, "vaCreateContext: invalid driver state");
+        return VA_STATUS_ERROR_INVALID_CONTEXT;
+    }
+    if (!d->config_created || config_id != 1) {
+        util::log(util::stderr_sink, util::LogLevel::Warn, "vaCreateContext: config not ready config_created={} config_id={}", d->config_created, config_id);
+        return VA_STATUS_ERROR_INVALID_CONFIG;
+    }
+    if (num_render_targets <= 0 || !render_targets) {
+        util::log(util::stderr_sink, util::LogLevel::Warn, "vaCreateContext: invalid render targets count={} ptr={}", num_render_targets, (void*)render_targets);
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+    }
+    if (flag != 0 && flag != VA_PROGRESSIVE) {
+        util::log(util::stderr_sink, util::LogLevel::Warn,
+                  "vaCreateContext: unsupported flag={} (expect 0/VA_PROGRESSIVE)", flag);
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+    }
 
-    if (!isSupportedProfile(d->profile))
+    for (int i = 0; i < num_render_targets; i++) {
+        if (d->surfaces.find(render_targets[i]) == d->surfaces.end()) {
+            util::log(util::stderr_sink, util::LogLevel::Warn, "vaCreateContext: target surface {} not found", render_targets[i]);
+            return VA_STATUS_ERROR_INVALID_SURFACE;
+        }
+    }
+
+    if (!isSupportedProfile(d->profile)) {
+        util::log(util::stderr_sink, util::LogLevel::Warn, "vaCreateContext: unsupported profile={}", d->profile);
         return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;
+    }
 
     // Remember the dimensions requested by the client.
     d->picture_width = static_cast<uint32_t>(picture_width);
@@ -417,22 +528,24 @@ static VAStatus vaCreateContext(VADriverContextP ctx,
 }
 
 static VAStatus vaDestroyContext(VADriverContextP ctx, VAContextID context) {
-    (void)context;
     if (!ctx) return VA_STATUS_ERROR_INVALID_CONTEXT;
+    if (context != 1) return VA_STATUS_ERROR_INVALID_CONTEXT;
     auto* d = toDriver(ctx);
     if (!d) return VA_STATUS_ERROR_INVALID_CONTEXT;
 
-    ScopedSpinLock lock(d->lock);
+    std::lock_guard<std::mutex> lock(d->lock);
 
     // Stop any decoding activity.
     d->decoder.shutdown();
 
-    // Release all allocated surfaces and their dmabuf fds.
+    // Release driver-owned surface handles after MPP has fully stopped.
     for (auto& kv : d->surfaces) {
         if (kv.second->surface.dmabuf_fd >= 0) {
             close(kv.second->surface.dmabuf_fd);
+            kv.second->surface.dmabuf_fd = -1;
         }
     }
+
     d->surfaces.clear();
     d->current_surface = VA_INVALID_ID;
     d->current_buffers.clear();
@@ -454,12 +567,12 @@ static VAStatus vaDestroyContext(VADriverContextP ctx, VAContextID context) {
 }
 
 static VAStatus vaCreateBuffer(VADriverContextP ctx,
-                                       VAContextID /*context*/,
-                                       VABufferType type,
-                                       unsigned int size,
-                                       unsigned int num_elements,
-                                       void* data,
-                                       VABufferID* buf_id) {
+                               VAContextID /*context*/,
+                               VABufferType type,
+                               unsigned int size,
+                               unsigned int num_elements,
+                               void* data,
+                               VABufferID* buf_id) {
     auto* d = toDriver(ctx);
     if (!d || !buf_id) return VA_STATUS_ERROR_INVALID_CONTEXT;
 
@@ -482,8 +595,8 @@ static VAStatus vaCreateBuffer(VADriverContextP ctx,
 }
 
 static VAStatus vaBufferSetNumElements(VADriverContextP ctx,
-                                                VABufferID buf_id,
-                                                unsigned int num_elements) {
+                                       VABufferID buf_id,
+                                       unsigned int num_elements) {
     auto* d = toDriver(ctx);
     if (!d) return VA_STATUS_ERROR_INVALID_CONTEXT;
     auto it = d->buffers.find(buf_id);
@@ -494,8 +607,8 @@ static VAStatus vaBufferSetNumElements(VADriverContextP ctx,
 }
 
 static VAStatus vaMapBuffer(VADriverContextP ctx,
-                                     VABufferID buf_id,
-                                     void** pbuf) {
+                            VABufferID buf_id,
+                            void** pbuf) {
     if (!pbuf) return VA_STATUS_ERROR_INVALID_PARAMETER;
     auto* d = toDriver(ctx);
     if (!d) return VA_STATUS_ERROR_INVALID_CONTEXT;
@@ -507,7 +620,7 @@ static VAStatus vaMapBuffer(VADriverContextP ctx,
 }
 
 static VAStatus vaUnmapBuffer(VADriverContextP ctx,
-                                       VABufferID buf_id) {
+                              VABufferID buf_id) {
     auto* d = toDriver(ctx);
     if (!d) return VA_STATUS_ERROR_INVALID_CONTEXT;
     if (d->buffers.find(buf_id) == d->buffers.end()) return VA_STATUS_ERROR_INVALID_BUFFER;
@@ -515,7 +628,7 @@ static VAStatus vaUnmapBuffer(VADriverContextP ctx,
 }
 
 static VAStatus vaDestroyBuffer(VADriverContextP ctx,
-                                         VABufferID buf_id) {
+                                VABufferID buf_id) {
     auto* d = toDriver(ctx);
     if (!d) return VA_STATUS_ERROR_INVALID_CONTEXT;
     auto it = d->buffers.find(buf_id);
@@ -526,8 +639,8 @@ static VAStatus vaDestroyBuffer(VADriverContextP ctx,
 }
 
 static VAStatus vaBeginPicture(VADriverContextP ctx,
-                                       VAContextID /*context*/,
-                                       VASurfaceID render_target) {
+                               VAContextID /*context*/,
+                               VASurfaceID render_target) {
     auto* d = toDriver(ctx);
     if (!d) return VA_STATUS_ERROR_INVALID_CONTEXT;
 
@@ -541,7 +654,7 @@ static VAStatus vaBeginPicture(VADriverContextP ctx,
 }
 
 static VAStatus vaEndPicture(VADriverContextP ctx,
-                                     VAContextID /*context*/) {
+                             VAContextID /*context*/) {
     auto* d = toDriver(ctx);
     if (!d) return VA_STATUS_ERROR_INVALID_CONTEXT;
 
@@ -572,15 +685,14 @@ static VAStatus vaEndPicture(VADriverContextP ctx,
     // Clear per-picture state so next picture can be collected.
     d->frame_buffer.clear();
     d->frame_extra_data.clear();
-    d->pending_av1_pic_blob.clear();
     d->current_buffers.clear();
 
     return VA_STATUS_SUCCESS;
 }
 
 static VAStatus vaQuerySurfaceStatus(VADriverContextP ctx,
-                                              VASurfaceID surface,
-                                              VASurfaceStatus* status) {
+                                     VASurfaceID surface,
+                                     VASurfaceStatus* status) {
     if (!status) return VA_STATUS_ERROR_INVALID_PARAMETER;
     auto* d = toDriver(ctx);
     if (!d) return VA_STATUS_ERROR_INVALID_CONTEXT;
@@ -597,9 +709,9 @@ static VAStatus vaQuerySurfaceStatus(VADriverContextP ctx,
 }
 
 static VAStatus vaQuerySurfaceError(VADriverContextP ctx,
-                                             VASurfaceID surface,
-                                             VAStatus error_status,
-                                             void** error_info) {
+                                    VASurfaceID surface,
+                                    VAStatus error_status,
+                                    void** error_info) {
     if (!ctx) return VA_STATUS_ERROR_INVALID_CONTEXT;
     auto* d = toDriver(ctx);
     if (!d) return VA_STATUS_ERROR_INVALID_CONTEXT;
@@ -612,12 +724,19 @@ static VAStatus vaQuerySurfaceError(VADriverContextP ctx,
 }
 
 static VAStatus vaExportSurfaceHandle(VADriverContextP ctx,
-                                               VASurfaceID surface,
-                                               uint32_t mem_type,
-                                               uint32_t flags,
-                                               void* descriptor) {
-    (void)flags;
+                                      VASurfaceID surface,
+                                      uint32_t mem_type,
+                                      uint32_t flags,
+                                      void* descriptor) {
+    if (!ctx) return VA_STATUS_ERROR_INVALID_CONTEXT;
     auto* d = toDriver(ctx);
+    if (!d) return VA_STATUS_ERROR_INVALID_CONTEXT;
+
+    // Accept no flags or the defined export flags. In this simple driver,
+    // flags are currently ignored but validated to be within supported set.
+    if ((flags & ~VA_SURFACE_ATTRIB_MEM_TYPE_VA) != 0) {
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+    }
     if (!d) return VA_STATUS_ERROR_INVALID_DISPLAY;
     auto it = d->surfaces.find(surface);
     if (it == d->surfaces.end()) return VA_STATUS_ERROR_INVALID_SURFACE;
@@ -650,7 +769,10 @@ static VAStatus vaExportSurfaceHandle(VADriverContextP ctx,
     desc->width = surf.width;
     desc->height = surf.height;
     desc->num_objects = 1;
-    desc->objects[0].fd = surf.dmabuf_fd;
+    desc->objects[0].fd = dup(surf.dmabuf_fd);
+    if (desc->objects[0].fd < 0) {
+        return VA_STATUS_ERROR_ALLOCATION_FAILED;
+    }
     desc->objects[0].size = static_cast<uint32_t>(total_size);
     desc->objects[0].drm_format_modifier = 0;
 
@@ -668,8 +790,8 @@ static VAStatus vaExportSurfaceHandle(VADriverContextP ctx,
 }
 
 static VAStatus vaQueryImageFormats(VADriverContextP ctx,
-                                             VAImageFormat* format_list,
-                                             int* num_formats) {
+                                    VAImageFormat* format_list,
+                                    int* num_formats) {
     if (!num_formats) return VA_STATUS_ERROR_INVALID_PARAMETER;
     if (!format_list) {
         *num_formats = 1;
@@ -688,10 +810,10 @@ static VAStatus vaQueryImageFormats(VADriverContextP ctx,
 }
 
 static VAStatus vaCreateImage(VADriverContextP ctx,
-                                      VAImageFormat* format,
-                                      int width,
-                                      int height,
-                                      VAImage* image) {
+                              VAImageFormat* format,
+                              int width,
+                              int height,
+                              VAImage* image) {
     if (!ctx || !format || !image) return VA_STATUS_ERROR_INVALID_PARAMETER;
     auto* d = toDriver(ctx);
     if (!d) return VA_STATUS_ERROR_INVALID_CONTEXT;
@@ -742,8 +864,8 @@ static VAStatus vaCreateImage(VADriverContextP ctx,
 }
 
 static VAStatus vaDeriveImage(VADriverContextP ctx,
-                                      VASurfaceID surface,
-                                      VAImage* image) {
+                              VASurfaceID surface,
+                              VAImage* image) {
     if (!ctx || !image) return VA_STATUS_ERROR_INVALID_PARAMETER;
     auto* d = toDriver(ctx);
     if (!d) return VA_STATUS_ERROR_INVALID_CONTEXT;
@@ -804,7 +926,7 @@ static VAStatus vaDeriveImage(VADriverContextP ctx,
 }
 
 static VAStatus vaDestroyImage(VADriverContextP ctx,
-                                       VAImageID image) {
+                               VAImageID image) {
     if (!ctx) return VA_STATUS_ERROR_INVALID_CONTEXT;
     auto* d = toDriver(ctx);
     if (!d) return VA_STATUS_ERROR_INVALID_CONTEXT;
@@ -819,8 +941,8 @@ static VAStatus vaDestroyImage(VADriverContextP ctx,
 }
 
 static VAStatus vaSetImagePalette(VADriverContextP ctx,
-                                          VAImageID image,
-                                          unsigned char* palette) {
+                                  VAImageID image,
+                                  unsigned char* palette) {
     if (!ctx || !palette) return VA_STATUS_ERROR_INVALID_PARAMETER;
     auto* d = toDriver(ctx);
     if (!d) return VA_STATUS_ERROR_INVALID_CONTEXT;
@@ -835,12 +957,12 @@ static VAStatus vaSetImagePalette(VADriverContextP ctx,
 }
 
 static VAStatus vaGetImage(VADriverContextP ctx,
-                                   VASurfaceID surface,
-                                   int x,
-                                   int y,
-                                   unsigned int w,
-                                   unsigned int h,
-                                   VAImageID image) {
+                           VASurfaceID surface,
+                           int x,
+                           int y,
+                           unsigned int w,
+                           unsigned int h,
+                           VAImageID image) {
     if (!ctx) return VA_STATUS_ERROR_INVALID_CONTEXT;
     auto* d = toDriver(ctx);
     if (!d) return VA_STATUS_ERROR_INVALID_CONTEXT;
@@ -914,16 +1036,16 @@ static VAStatus vaGetImage(VADriverContextP ctx,
 }
 
 static VAStatus vaPutImage(VADriverContextP ctx,
-                                   VASurfaceID surface,
-                                   VAImageID image,
-                                   int srcx,
-                                   int srcy,
-                                   unsigned int srcw,
-                                   unsigned int srch,
-                                   int destx,
-                                   int desty,
-                                   unsigned int destw,
-                                   unsigned int desth) {
+                           VASurfaceID surface,
+                           VAImageID image,
+                           int srcx,
+                           int srcy,
+                           unsigned int srcw,
+                           unsigned int srch,
+                           int destx,
+                           int desty,
+                           unsigned int destw,
+                           unsigned int desth) {
     if (!ctx) return VA_STATUS_ERROR_INVALID_CONTEXT;
     auto* d = toDriver(ctx);
     if (!d) return VA_STATUS_ERROR_INVALID_CONTEXT;
@@ -1008,18 +1130,33 @@ static VAStatus vaPutImage(VADriverContextP ctx,
 }
 
 static VAStatus vaQuerySubpictureFormats(VADriverContextP ctx,
-                                                  VAImageFormat* format_list,
-                                                  unsigned int* flags,
-                                                  unsigned int* num_formats) {
-    (void)ctx;
-    if (num_formats) *num_formats = 0;
+                                         VAImageFormat* format_list,
+                                         unsigned int* flags,
+                                         unsigned int* num_formats) {
+    if (!ctx) return VA_STATUS_ERROR_INVALID_CONTEXT;
+    if (!num_formats) return VA_STATUS_ERROR_INVALID_PARAMETER;
+
+    // Only NV12 is supported in this driver, matching image format behavior.
+    if (!format_list) {
+        *num_formats = 1;
+    } else {
+        if (*num_formats < 1) return VA_STATUS_ERROR_MAX_NUM_EXCEEDED;
+        format_list[0].fourcc = VA_FOURCC_NV12;
+        format_list[0].depth = 12;
+        format_list[0].red_mask = 0;
+        format_list[0].green_mask = 0;
+        format_list[0].blue_mask = 0;
+        format_list[0].alpha_mask = 0;
+        *num_formats = 1;
+    }
+
     if (flags) *flags = 0;
     return VA_STATUS_SUCCESS;
 }
 
 static VAStatus vaCreateSubpicture(VADriverContextP ctx,
-                                            VAImageID image,
-                                            VASubpictureID* subpicture) {
+                                   VAImageID image,
+                                   VASubpictureID* subpicture) {
     if (!ctx || !subpicture) return VA_STATUS_ERROR_INVALID_PARAMETER;
     auto* d = toDriver(ctx);
     if (!d) return VA_STATUS_ERROR_INVALID_CONTEXT;
@@ -1033,7 +1170,7 @@ static VAStatus vaCreateSubpicture(VADriverContextP ctx,
 }
 
 static VAStatus vaDestroySubpicture(VADriverContextP ctx,
-                                             VASubpictureID subpicture) {
+                                    VASubpictureID subpicture) {
     if (!ctx) return VA_STATUS_ERROR_INVALID_CONTEXT;
     auto* d = toDriver(ctx);
     if (!d) return VA_STATUS_ERROR_INVALID_CONTEXT;
@@ -1042,8 +1179,8 @@ static VAStatus vaDestroySubpicture(VADriverContextP ctx,
 }
 
 static VAStatus vaSetSubpictureImage(VADriverContextP ctx,
-                                              VASubpictureID subpicture,
-                                              VAImageID image) {
+                                     VASubpictureID subpicture,
+                                     VAImageID image) {
     if (!ctx) return VA_STATUS_ERROR_INVALID_CONTEXT;
     auto* d = toDriver(ctx);
     if (!d) return VA_STATUS_ERROR_INVALID_CONTEXT;
@@ -1057,10 +1194,10 @@ static VAStatus vaSetSubpictureImage(VADriverContextP ctx,
 }
 
 static VAStatus vaSetSubpictureChromakey(VADriverContextP ctx,
-                                                  VASubpictureID subpicture,
-                                                  unsigned int chromakey_min,
-                                                  unsigned int chromakey_max,
-                                                  unsigned int chromakey_mask) {
+                                         VASubpictureID subpicture,
+                                         unsigned int chromakey_min,
+                                         unsigned int chromakey_max,
+                                         unsigned int chromakey_mask) {
     if (!ctx) return VA_STATUS_ERROR_INVALID_CONTEXT;
     auto* d = toDriver(ctx);
     if (!d) return VA_STATUS_ERROR_INVALID_CONTEXT;
@@ -1075,8 +1212,8 @@ static VAStatus vaSetSubpictureChromakey(VADriverContextP ctx,
 }
 
 static VAStatus vaSetSubpictureGlobalAlpha(VADriverContextP ctx,
-                                                     VASubpictureID subpicture,
-                                                     float global_alpha) {
+                                           VASubpictureID subpicture,
+                                           float global_alpha) {
     if (!ctx) return VA_STATUS_ERROR_INVALID_CONTEXT;
     auto* d = toDriver(ctx);
     if (!d) return VA_STATUS_ERROR_INVALID_CONTEXT;
@@ -1089,18 +1226,18 @@ static VAStatus vaSetSubpictureGlobalAlpha(VADriverContextP ctx,
 }
 
 static VAStatus vaAssociateSubpicture(VADriverContextP ctx,
-                                               VASubpictureID subpicture,
-                                               VASurfaceID* target_surfaces,
-                                               int num_surfaces,
-                                               short src_x,
-                                               short src_y,
-                                               unsigned short src_width,
-                                               unsigned short src_height,
-                                               short dest_x,
-                                               short dest_y,
-                                               unsigned short dest_width,
-                                               unsigned short dest_height,
-                                               unsigned int flags) {
+                                      VASubpictureID subpicture,
+                                      VASurfaceID* target_surfaces,
+                                      int num_surfaces,
+                                      short src_x,
+                                      short src_y,
+                                      unsigned short src_width,
+                                      unsigned short src_height,
+                                      short dest_x,
+                                      short dest_y,
+                                      unsigned short dest_width,
+                                      unsigned short dest_height,
+                                      unsigned int flags) {
     if (!ctx || !target_surfaces || num_surfaces <= 0) return VA_STATUS_ERROR_INVALID_PARAMETER;
     auto* d = toDriver(ctx);
     if (!d) return VA_STATUS_ERROR_INVALID_CONTEXT;
@@ -1114,24 +1251,27 @@ static VAStatus vaAssociateSubpicture(VADriverContextP ctx,
         sp_it->second.target_surfaces.push_back(target_surfaces[i]);
     }
 
-    // This driver does not perform actual composition, but stores the last
-    // association parameters for debugging / future implementation.
-    (void)src_x;
-    (void)src_y;
-    (void)src_width;
-    (void)src_height;
-    (void)dest_x;
-    (void)dest_y;
-    (void)dest_width;
-    (void)dest_height;
-    (void)flags;
+    // Apply and validate association rectangle values.
+    if (src_width == 0 || src_height == 0 || dest_width == 0 || dest_height == 0)
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+
+    sp_it->second.src_x = src_x;
+    sp_it->second.src_y = src_y;
+    sp_it->second.src_width = src_width;
+    sp_it->second.src_height = src_height;
+    sp_it->second.dest_x = dest_x;
+    sp_it->second.dest_y = dest_y;
+    sp_it->second.dest_width = dest_width;
+    sp_it->second.dest_height = dest_height;
+    sp_it->second.flags = flags;
+
     return VA_STATUS_SUCCESS;
 }
 
 static VAStatus vaDeassociateSubpicture(VADriverContextP ctx,
-                                                 VASubpictureID subpicture,
-                                                 VASurfaceID* target_surfaces,
-                                                 int num_surfaces) {
+                                        VASubpictureID subpicture,
+                                        VASurfaceID* target_surfaces,
+                                        int num_surfaces) {
     if (!ctx) return VA_STATUS_ERROR_INVALID_CONTEXT;
     auto* d = toDriver(ctx);
     if (!d) return VA_STATUS_ERROR_INVALID_CONTEXT;
@@ -1164,8 +1304,8 @@ static VAStatus vaDeassociateSubpicture(VADriverContextP ctx,
 }
 
 static VAStatus vaQueryDisplayAttributes(VADriverContextP /*ctx*/,
-                                                  VADisplayAttribute* attr_list,
-                                                  int* num_attributes) {
+                                         VADisplayAttribute* attr_list,
+                                         int* num_attributes) {
     if (!num_attributes) return VA_STATUS_ERROR_INVALID_PARAMETER;
 
     ensureDisplayAttributesInitialized();
@@ -1184,8 +1324,8 @@ static VAStatus vaQueryDisplayAttributes(VADriverContextP /*ctx*/,
 }
 
 static VAStatus vaGetDisplayAttributes(VADriverContextP /*ctx*/,
-                                                VADisplayAttribute* attr_list,
-                                                int num_attributes) {
+                                       VADisplayAttribute* attr_list,
+                                       int num_attributes) {
     if (!attr_list || num_attributes <= 0) return VA_STATUS_ERROR_INVALID_PARAMETER;
 
     ensureDisplayAttributesInitialized();
@@ -1206,8 +1346,8 @@ static VAStatus vaGetDisplayAttributes(VADriverContextP /*ctx*/,
 }
 
 static VAStatus vaSetDisplayAttributes(VADriverContextP /*ctx*/,
-                                                VADisplayAttribute* attr_list,
-                                                int num_attributes) {
+                                       VADisplayAttribute* attr_list,
+                                       int num_attributes) {
     if (!attr_list || num_attributes <= 0) return VA_STATUS_ERROR_INVALID_PARAMETER;
 
     ensureDisplayAttributesInitialized();
@@ -1224,40 +1364,121 @@ static VAStatus vaSetDisplayAttributes(VADriverContextP /*ctx*/,
 }
 
 static VAStatus vaRenderPicture(VADriverContextP ctx,
-                                        VAContextID /*context*/,
-                                        VABufferID* buffers,
-                                        int num_buffers) {
+                                VAContextID /*context*/,
+                                VABufferID* buffers,
+                                int num_buffers) {
     auto* d = toDriver(ctx);
     if (!d) return VA_STATUS_ERROR_INVALID_CONTEXT;
     if (!buffers || num_buffers <= 0) return VA_STATUS_ERROR_INVALID_PARAMETER;
 
-    const uint8_t start_code[] = {0, 0, 0, 1};
-
     // Collect slice data and any picture-parameter blobs into the driver's
-    // persistent per-picture buffers. Do NOT submit to the decoder here.
+    // persistent per-picture buffers. We now rely on MPP to parse bitstream
+    // boundaries and frame splitting internally, so we pass raw buffers directly.
     for (int i = 0; i < num_buffers; i++) {
         auto it = d->buffers.find(buffers[i]);
         if (it == d->buffers.end()) continue;
 
         if (it->second.type == VASliceDataBufferType) {
             uint8_t* data = static_cast<uint8_t*>(it->second.data);
-            // For H264/HEVC append start codes; for AV1 append raw OBUs.
-            if (d->profile == VAProfileH264High || d->profile == VAProfileHEVCMain) {
-                d->frame_buffer.insert(d->frame_buffer.end(), start_code, start_code + 4);
-                d->frame_buffer.insert(d->frame_buffer.end(), data, data + it->second.size);
-            } else {
-                d->frame_buffer.insert(d->frame_buffer.end(), data, data + it->second.size);
-            }
+            d->frame_buffer.insert(d->frame_buffer.end(), data, data + it->second.size);
         }
 
-        // Capture AV1 picture parameter buffer so EndPicture can synthesize
-        // a sequence header if needed.
-        if (d->profile == VAProfileAV1Profile0 && it->second.type == VAPictureParameterBufferType) {
-            d->pending_av1_pic_blob.assign(static_cast<uint8_t*>(it->second.data), static_cast<uint8_t*>(it->second.data) + it->second.size);
-        }
+        // For AV1, we currently rely on in-band stream data.
+        // Per-picture blobs are not maintained in this simplified path.
     }
 
     return VA_STATUS_SUCCESS;
+}
+
+static VAStatus vaTerminate(VADriverContextP ctx) {
+    auto* d = toDriver(ctx);
+    if (d) {
+        // Clean up remaining surfaces before decoder teardown so held MPP buffers are released.
+        {
+            std::lock_guard<std::mutex> lock(d->lock);
+            for (auto& kv : d->surfaces) {
+                d->decoder.destroySurface(kv.first);
+                if (kv.second->surface.dmabuf_fd >= 0) {
+                    close(kv.second->surface.dmabuf_fd);
+                    kv.second->surface.dmabuf_fd = -1;
+                }
+                if (kv.second->buffer) {
+                    // Ensure any remaining MPP buffers are released.
+                    mpp_buffer_put(kv.second->buffer);
+                    kv.second->buffer = nullptr;
+                }
+            }
+            d->surfaces.clear();
+
+            for (auto& kv : d->buffers) {
+                free(kv.second.data);
+            }
+            d->buffers.clear();
+
+            for (auto& kv : d->images) {
+                destroyBuffer(d, kv.second.image.buf);
+            }
+            d->images.clear();
+            d->subpictures.clear();
+        }
+
+        // Stop any decoding activity after surface resources have been dropped.
+        d->decoder.shutdown();
+
+        // Destroy the driver state but do not free the memory; libva may manage it.
+        d->~DriverState();
+        ctx->pDriverData = nullptr;
+    }
+    return VA_STATUS_SUCCESS;
+}
+
+}  // namespace api
+
+template <typename T>
+static constexpr auto make_vtable_entries_template() {
+    using namespace api;
+    return std::tuple{
+        make_entry<&T::vaTerminate>(vaTerminate),
+        make_entry<&T::vaQueryConfigProfiles>(vaQueryConfigProfiles),
+        make_entry<&T::vaQueryConfigEntrypoints>(vaQueryConfigEntrypoints),
+        make_entry<&T::vaGetConfigAttributes>(vaGetConfigAttributes),
+        make_entry<&T::vaCreateConfig>(vaCreateConfig),
+        make_entry<&T::vaDestroyConfig>(vaDestroyConfig),
+        make_entry<&T::vaQueryConfigAttributes>(vaQueryConfigAttributes),
+        make_entry<&T::vaCreateSurfaces>(vaCreateSurfaces),
+        make_entry<&T::vaDestroySurfaces>(vaDestroySurfaces),
+        make_entry<&T::vaCreateContext>(vaCreateContext),
+        make_entry<&T::vaDestroyContext>(vaDestroyContext),
+        make_entry<&T::vaCreateBuffer>(vaCreateBuffer),
+        make_entry<&T::vaBufferSetNumElements>(vaBufferSetNumElements),
+        make_entry<&T::vaMapBuffer>(vaMapBuffer),
+        make_entry<&T::vaUnmapBuffer>(vaUnmapBuffer),
+        make_entry<&T::vaDestroyBuffer>(vaDestroyBuffer),
+        make_entry<&T::vaBeginPicture>(vaBeginPicture),
+        make_entry<&T::vaRenderPicture>(vaRenderPicture),
+        make_entry<&T::vaEndPicture>(vaEndPicture),
+        make_entry<&T::vaSyncSurface>(vaSyncSurface),
+        make_entry<&T::vaQuerySurfaceStatus>(vaQuerySurfaceStatus),
+        make_entry<&T::vaQuerySurfaceError>(vaQuerySurfaceError),
+        make_entry<&T::vaQueryImageFormats>(vaQueryImageFormats),
+        make_entry<&T::vaCreateImage>(vaCreateImage),
+        make_entry<&T::vaDeriveImage>(vaDeriveImage),
+        make_entry<&T::vaDestroyImage>(vaDestroyImage),
+        make_entry<&T::vaSetImagePalette>(vaSetImagePalette),
+        make_entry<&T::vaGetImage>(vaGetImage),
+        make_entry<&T::vaPutImage>(vaPutImage),
+        make_entry<&T::vaQuerySubpictureFormats>(vaQuerySubpictureFormats),
+        make_entry<&T::vaCreateSubpicture>(vaCreateSubpicture),
+        make_entry<&T::vaDestroySubpicture>(vaDestroySubpicture),
+        make_entry<&T::vaSetSubpictureImage>(vaSetSubpictureImage),
+        make_entry<&T::vaSetSubpictureChromakey>(vaSetSubpictureChromakey),
+        make_entry<&T::vaSetSubpictureGlobalAlpha>(vaSetSubpictureGlobalAlpha),
+        make_entry<&T::vaAssociateSubpicture>(vaAssociateSubpicture),
+        make_entry<&T::vaDeassociateSubpicture>(vaDeassociateSubpicture),
+        make_entry<&T::vaQueryDisplayAttributes>(vaQueryDisplayAttributes),
+        make_entry<&T::vaGetDisplayAttributes>(vaGetDisplayAttributes),
+        make_entry<&T::vaSetDisplayAttributes>(vaSetDisplayAttributes),
+        make_entry<&T::vaExportSurfaceHandle>(vaExportSurfaceHandle)};
 }
 
 static VAStatus vaDriverInit(VADriverContextP ctx) {
@@ -1268,90 +1489,18 @@ static VAStatus vaDriverInit(VADriverContextP ctx) {
     auto* vt = static_cast<VADriverVTable*>(calloc(1, sizeof(VADriverVTable)));
     if (!vt) return VA_STATUS_ERROR_ALLOCATION_FAILED;
 
-    vt->vaTerminate = [](VADriverContextP ctx) {
-        auto* d = toDriver(ctx);
-        if (d) {
-            // Stop any decoding activity first.
-            d->decoder.shutdown();
-
-            // Clean up remaining surfaces and buffers (libva may not call vaDestroy*).
-            {
-                ScopedSpinLock lock(d->lock);
-                for (auto& kv : d->surfaces) {
-                    if (kv.second->surface.dmabuf_fd >= 0) {
-                        close(kv.second->surface.dmabuf_fd);
-                    }
-                    if (kv.second->buffer) {
-                        // Ensure any remaining MPP buffers are released.
-                        mpp_buffer_put(kv.second->buffer);
-                        kv.second->buffer = nullptr;
-                    }
-                }
-                d->surfaces.clear();
-
-                for (auto& kv : d->buffers) {
-                    free(kv.second.data);
-                }
-                d->buffers.clear();
-
-                for (auto& kv : d->images) {
-                    destroyBuffer(d, kv.second.image.buf);
-                }
-                d->images.clear();
-                d->subpictures.clear();
-            }
-
-            // Destroy the driver state but do not free the memory; libva may manage it.
-            d->~DriverState();
-            ctx->pDriverData = nullptr;
-        }
-        return VA_STATUS_SUCCESS;
+    auto register_vtable_fn = [&](auto member_ptr, auto fn) {
+        vt->*member_ptr = fn;
     };
-    vt->vaQueryConfigProfiles = vaQueryConfigProfiles;
-    vt->vaQueryConfigEntrypoints = vaQueryConfigEntrypoints;
-    vt->vaGetConfigAttributes = vaGetConfigAttributes;
-    vt->vaCreateConfig = vaCreateConfig;
-    vt->vaDestroyConfig = vaDestroyConfig;
-    vt->vaQueryConfigAttributes = vaQueryConfigAttributes;
-    vt->vaCreateSurfaces = vaCreateSurfaces;
-    vt->vaDestroySurfaces = vaDestroySurfaces;
-    vt->vaCreateContext = vaCreateContext;
-    vt->vaDestroyContext = vaDestroyContext;
-    vt->vaCreateBuffer = vaCreateBuffer;
-    vt->vaBufferSetNumElements = vaBufferSetNumElements;
-    vt->vaMapBuffer = vaMapBuffer;
-    vt->vaUnmapBuffer = vaUnmapBuffer;
-    vt->vaDestroyBuffer = vaDestroyBuffer;
-    vt->vaBeginPicture = vaBeginPicture;
-    vt->vaRenderPicture = vaRenderPicture;
-    vt->vaEndPicture = vaEndPicture;
-    vt->vaSyncSurface = vaSyncSurface;
-    vt->vaQuerySurfaceStatus = vaQuerySurfaceStatus;
-    vt->vaQuerySurfaceError = vaQuerySurfaceError;
 
-    vt->vaQueryImageFormats = vaQueryImageFormats;
-    vt->vaCreateImage = vaCreateImage;
-    vt->vaDeriveImage = vaDeriveImage;
-    vt->vaDestroyImage = vaDestroyImage;
-    vt->vaSetImagePalette = vaSetImagePalette;
-    vt->vaGetImage = vaGetImage;
-    vt->vaPutImage = vaPutImage;
+    // Static, compile-time known mappings (template-based T).
+    static constexpr auto entries = make_vtable_entries_template<VADriverVTable>();
 
-    vt->vaQuerySubpictureFormats = vaQuerySubpictureFormats;
-    vt->vaCreateSubpicture = vaCreateSubpicture;
-    vt->vaDestroySubpicture = vaDestroySubpicture;
-    vt->vaSetSubpictureImage = vaSetSubpictureImage;
-    vt->vaSetSubpictureChromakey = vaSetSubpictureChromakey;
-    vt->vaSetSubpictureGlobalAlpha = vaSetSubpictureGlobalAlpha;
-    vt->vaAssociateSubpicture = vaAssociateSubpicture;
-    vt->vaDeassociateSubpicture = vaDeassociateSubpicture;
-
-    vt->vaQueryDisplayAttributes = vaQueryDisplayAttributes;
-    vt->vaGetDisplayAttributes = vaGetDisplayAttributes;
-    vt->vaSetDisplayAttributes = vaSetDisplayAttributes;
-
-    // Required for VA-API DMABUF export (zero copy).
-    vt->vaExportSurfaceHandle = vaExportSurfaceHandle;
+    std::apply(
+        [&](auto&&... entry) {
+            (register_vtable_fn(entry.first, entry.second), ...);
+        },
+        entries);
 
     ctx->vtable = vt;
     void* data = malloc(sizeof(DriverState));
@@ -1381,7 +1530,7 @@ static VAStatus vaDriverInit(VADriverContextP ctx) {
     return VA_STATUS_SUCCESS;
 }
 
-} // namespace rockchip_vaapi
+}  // namespace rockchip_vaapi
 
 extern "C" VAStatus vaDriverInit_0_40(VADriverContextP ctx) {
     return rockchip_vaapi::vaDriverInit(ctx);
@@ -1395,5 +1544,3 @@ extern "C" VAStatus vaDriverInit_1_20(VADriverContextP ctx) {
 extern "C" VAStatus __vaDriverInit_1_0(VADriverContextP ctx) {
     return rockchip_vaapi::vaDriverInit(ctx);
 }
-
-
