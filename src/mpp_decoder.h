@@ -4,6 +4,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <thread>
 #include <stop_token>
 #include <unordered_map>
@@ -49,7 +50,6 @@ struct SurfaceInfo {
 
 struct DecodeJob {
     VASurfaceID target_surface = VA_INVALID_ID;
-    uint64_t token = 0;
     std::vector<uint8_t> bitstream;
     std::vector<uint8_t> extra_data;
     bool eos = false;
@@ -67,7 +67,9 @@ public:
     bool allocateSurface(VASurfaceID id, DecodedSurface& out, int width, int height);
     bool updateSurfaceResolution(VASurfaceID id, int width, int height);
     bool getSurfaceInfo(VASurfaceID id, uint32_t& width, uint32_t& height, uint32_t& stride, int& dmabuf_fd, bool& failed);
-    bool waitSurfaceReady(VASurfaceID surface, uint32_t timeout_ms = 5000);
+    bool getSurfaceState(VASurfaceID id, bool& ready, bool& failed);
+    bool waitSurfaceReady(VASurfaceID surface, uint32_t timeout_ms = 30000);
+    void forceSurfaceReady(VASurfaceID surface);
     void resetSurface(VASurfaceID surface);
     void releaseSurface(VASurfaceID surface);
     void destroySurface(VASurfaceID surface);
@@ -81,7 +83,6 @@ private:
     MppCtx ctx_ = nullptr;
     MppApi* api_ = nullptr;
     MppBufferGroup group_ = nullptr;
-
     util::AtomicSyncQueue<DecodeJob, 16> input_queue_;
     std::atomic<bool> running_{false};
     std::atomic<bool> eos_sent_{false};
@@ -91,10 +92,11 @@ private:
     std::jthread output_thread_;
 
     std::unordered_map<VASurfaceID, SurfaceInfo> surfaces_;
-    std::unordered_map<uint64_t, VASurfaceID> pending_surfaces_;
-    std::deque<uint64_t> pending_order_;
-    uint64_t next_token_ = 1;
+    std::deque<VASurfaceID> pending_surfaces_;
+    std::deque<MppPacket> pending_packets_;
+    std::deque<std::shared_ptr<std::vector<uint8_t>>> pending_payloads_;
     size_t pending_count_ = 0;
+    std::atomic<uint64_t> last_enqueue_us_{0};
 
     std::mutex surface_mutex_;
     std::mutex pending_mutex_;
