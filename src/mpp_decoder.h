@@ -53,6 +53,7 @@ struct DecodeJob {
     std::vector<uint8_t> bitstream;
     std::vector<uint8_t> extra_data;
     bool eos = false;
+    uint64_t job_id = 0;
 };
 
 class MppDecoder {
@@ -68,7 +69,7 @@ public:
     bool updateSurfaceResolution(VASurfaceID id, int width, int height);
     bool getSurfaceInfo(VASurfaceID id, uint32_t& width, uint32_t& height, uint32_t& stride, int& dmabuf_fd, bool& failed);
     bool getSurfaceState(VASurfaceID id, bool& ready, bool& failed);
-    bool waitSurfaceReady(VASurfaceID surface, uint32_t timeout_ms = 30000);
+    bool waitSurfaceReady(VASurfaceID surface, uint32_t timeout_ms = 120000);
     void forceSurfaceReady(VASurfaceID surface);
     void resetSurface(VASurfaceID surface);
     void releaseSurface(VASurfaceID surface);
@@ -93,10 +94,12 @@ private:
 
     std::unordered_map<VASurfaceID, SurfaceInfo> surfaces_;
     std::deque<VASurfaceID> pending_surfaces_;
+    std::unordered_map<uint64_t, VASurfaceID> pending_surface_pts_;
     std::deque<MppPacket> pending_packets_;
     std::deque<std::shared_ptr<std::vector<uint8_t>>> pending_payloads_;
     size_t pending_count_ = 0;
     std::atomic<uint64_t> last_enqueue_us_{0};
+    std::atomic<uint64_t> next_job_id_{1};
 
     std::mutex surface_mutex_;
     std::mutex pending_mutex_;

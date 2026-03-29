@@ -70,30 +70,17 @@ static void unpackPacked10RowLE(const uint8_t* src,
             return;
         }
 
-        uint16_t base_u16[5] = {0, 0, 0, 0, 0};
-        std::memcpy(base_u16, src + src_index, sizeof(base_u16));
-        const uint16_t pix0 = base_u16[0] & 0x03FF;
-        const uint16_t pix1 = ((base_u16[0] & 0xFC00) >> 10) | ((base_u16[1] & 0x000F) << 6);
-        const uint16_t pix2 = (base_u16[1] & 0x3FF0) >> 4;
-        const uint16_t pix3 = ((base_u16[1] & 0xC000) >> 14) | ((base_u16[2] & 0x00FF) << 2);
-        const uint16_t pix4 = ((base_u16[2] & 0xFF00) >> 8) | ((base_u16[3] & 0x0003) << 8);
-        const uint16_t pix5 = (base_u16[3] & 0x0FFC) >> 2;
-        const uint16_t pix6 = ((base_u16[3] & 0xF000) >> 12) | ((base_u16[4] & 0x003F) << 4);
-        const uint16_t pix7 = (base_u16[4] & 0xFFC0) >> 6;
-
-        const uint16_t packed[8] = {
-            static_cast<uint16_t>(pix0 << 6),
-            static_cast<uint16_t>(pix1 << 6),
-            static_cast<uint16_t>(pix2 << 6),
-            static_cast<uint16_t>(pix3 << 6),
-            static_cast<uint16_t>(pix4 << 6),
-            static_cast<uint16_t>(pix5 << 6),
-            static_cast<uint16_t>(pix6 << 6),
-            static_cast<uint16_t>(pix7 << 6),
-        };
-
-        const size_t copy_count = std::min<size_t>(8, sample_count - dst_index);
-        std::memcpy(dst + dst_index, packed, copy_count * sizeof(uint16_t));
+        for (size_t sample = 0; sample < 8 && dst_index + sample < sample_count; ++sample) {
+            uint16_t value = 0;
+            const size_t bit_base = sample * 10;
+            for (size_t bit = 0; bit < 10; ++bit) {
+                const size_t bit_index = bit_base + bit;
+                const size_t byte_index = src_index + (bit_index >> 3);
+                const uint8_t bit_offset = static_cast<uint8_t>(bit_index & 7u);
+                value |= static_cast<uint16_t>(((src[byte_index] >> bit_offset) & 0x1u) << bit);
+            }
+            dst[dst_index + sample] = static_cast<uint16_t>(value << 6);
+        }
     }
 }
 
@@ -262,7 +249,7 @@ bool MppDecoder::allocateSurface(VASurfaceID id, DecodedSurface& out, int width,
     auto& entry = surfaces_[id];
     entry.surface = ds;
     entry.buffer = nullptr;
-    entry.ready.store(false);
+    entry.ready.store(true);
     entry.failed.store(false);
     out = ds;
     return true;
@@ -304,6 +291,8 @@ bool MppDecoder::getSurfaceState(VASurfaceID id, bool& ready, bool& failed) {
 bool MppDecoder::enqueueJob(DecodeJob job) {
     if (!ctx_ || !api_) return false;
 
+    job.job_id = next_job_id_.fetch_add(1, std::memory_order_relaxed);
+
     bool expected = false;
     if (running_.compare_exchange_strong(expected, true)) {
         input_thread_ = std::jthread([this](std::stop_token st){ inputThreadMain(st); });
@@ -319,10 +308,19 @@ bool MppDecoder::enqueueJob(DecodeJob job) {
 
         std::unique_lock<std::mutex> lock(pending_mutex_);
         const size_t max_in_flight = std::max<size_t>(1, std::min<size_t>(surface_count == 0 ? 1 : surface_count, 4));
-        pending_cv_.wait(lock, [this, max_in_flight]() {
-            return pending_count_ < max_in_flight || !running_.load();
-        });
+        static std::atomic<int> enqueue_wait_log_count{0};
+        while (pending_count_ >= max_in_flight && running_.load()) {
+            if (enqueue_wait_log_count.fetch_add(1, std::memory_order_relaxed) < 5) {
+                util::log(util::stderr_sink, util::LogLevel::Info,
+                          "mpp: enqueueJob waiting surface={} pending={} max_in_flight={}",
+                          job.target_surface, pending_count_, max_in_flight);
+            }
+            lock.unlock();
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            lock.lock();
+        }
         pending_surfaces_.push_back(job.target_surface);
+        pending_surface_pts_[job.job_id] = job.target_surface;
         ++pending_count_;
         pending_cv_.notify_all();
     }
@@ -352,14 +350,29 @@ bool MppDecoder::waitSurfaceReady(VASurfaceID surface, uint32_t timeout_ms) {
 
     if (!ready_flag || !failed_flag) return false;
 
-    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
-    std::unique_lock<std::mutex> lock(cv_mutex_);
-    while (!ready_flag->load() && !failed_flag->load() && std::chrono::steady_clock::now() < deadline) {
-        cv_.wait_until(lock, deadline);
+    static std::atomic<int> wait_start_log_count{0};
+    if (wait_start_log_count.fetch_add(1, std::memory_order_relaxed) < 3) {
+        util::log(util::stderr_sink, util::LogLevel::Info,
+                  "mpp: waitSurfaceReady start surface={} timeout_ms={}", surface, timeout_ms);
     }
 
-    if (failed_flag->load()) return false;
-    return ready_flag->load();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    while (!ready_flag->load(std::memory_order_acquire) &&
+           !failed_flag->load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    const bool failed = failed_flag->load(std::memory_order_acquire);
+    const bool ready = ready_flag->load(std::memory_order_acquire);
+    static std::atomic<int> wait_end_log_count{0};
+    if (wait_end_log_count.fetch_add(1, std::memory_order_relaxed) < 3) {
+        util::log(util::stderr_sink, util::LogLevel::Info,
+                  "mpp: waitSurfaceReady end surface={} ready={} failed={}", surface, ready ? 1 : 0, failed ? 1 : 0);
+    }
+
+    if (failed) return false;
+    return ready;
 }
 
 void MppDecoder::forceSurfaceReady(VASurfaceID surface) {
@@ -446,7 +459,7 @@ void MppDecoder::shutdown() {
 
     if (input_thread_.joinable()) {
         input_thread_.request_stop();
-        input_thread_.join();
+        util::log(util::stderr_sink, util::LogLevel::Info, "joining input thread"); input_thread_.join(); util::log(util::stderr_sink, util::LogLevel::Info, "joined input thread");
     }
 
     // Give the output thread a short window to drain any in-flight frames and
@@ -463,7 +476,7 @@ void MppDecoder::shutdown() {
 
     if (output_thread_.joinable()) {
         output_thread_.request_stop();
-        output_thread_.join();
+        util::log(util::stderr_sink, util::LogLevel::Info, "joining output thread"); output_thread_.join(); util::log(util::stderr_sink, util::LogLevel::Info, "joined output thread");
     }
 
     {
@@ -520,7 +533,7 @@ void MppDecoder::inputThreadMain(std::stop_token st) {
                 break;
             }
             static std::atomic<int> eos_log_count{0};
-            if (eos_log_count.fetch_add(1, std::memory_order_relaxed) < 3) {
+            if (eos_log_count.fetch_add(1, std::memory_order_relaxed) < 1) {
                 util::log(util::stderr_sink, util::LogLevel::Info,
                           "mpp: inputThread EOS submitted");
             }
@@ -536,11 +549,13 @@ void MppDecoder::inputThreadMain(std::stop_token st) {
             payload_ptr = payload.data();
             payload_size = payload.size();
         } else if (!job.extra_data.empty()) {
-            payload_ptr = job.extra_data.data();
-            payload_size = job.extra_data.size();
+            payload = std::move(job.extra_data);
+            payload_ptr = payload.data();
+            payload_size = payload.size();
         } else {
-            payload_ptr = job.bitstream.data();
-            payload_size = job.bitstream.size();
+            payload = std::move(job.bitstream);
+            payload_ptr = payload.data();
+            payload_size = payload.size();
         }
 
         if (payload_size == 0) continue;
@@ -548,6 +563,11 @@ void MppDecoder::inputThreadMain(std::stop_token st) {
         MppPacket pkt = nullptr;
         if (mpp_packet_init(&pkt, const_cast<uint8_t*>(payload_ptr), payload_size) != MPP_OK) {
             continue;
+        }
+
+        if (job.job_id > 0) {
+            mpp_packet_set_pts(pkt, static_cast<RK_S64>(job.job_id));
+            mpp_packet_set_dts(pkt, static_cast<RK_S64>(job.job_id));
         }
 
         while (running_) {
@@ -665,10 +685,25 @@ void MppDecoder::outputThreadMain(std::stop_token st) {
         VASurfaceID surface_id = VA_INVALID_ID;
         {
             std::lock_guard<std::mutex> lock(pending_mutex_);
-            if (!pending_surfaces_.empty()) {
+            RK_S64 frame_pts = mpp_frame_get_pts(frame);
+            if (frame_pts > 0) {
+                auto it = pending_surface_pts_.find(static_cast<uint64_t>(frame_pts));
+                if (it != pending_surface_pts_.end()) {
+                    surface_id = it->second;
+                    pending_surface_pts_.erase(it);
+                    auto queue_it = std::find(pending_surfaces_.begin(), pending_surfaces_.end(), surface_id);
+                    if (queue_it != pending_surfaces_.end())
+                        pending_surfaces_.erase(queue_it);
+                }
+            }
+
+            if (surface_id == VA_INVALID_ID && !pending_surfaces_.empty()) {
                 surface_id = pending_surfaces_.front();
                 pending_surfaces_.pop_front();
-                if (pending_count_ > 0) --pending_count_;
+            }
+
+            if (surface_id != VA_INVALID_ID && pending_count_ > 0) {
+                --pending_count_;
                 pending_cv_.notify_all();
             }
         }
@@ -688,12 +723,12 @@ void MppDecoder::outputThreadMain(std::stop_token st) {
                 const uint32_t dst_stride = it->second.surface.stride;
                 bool copy_ok = false;
 
-                if (mpp_buf && it->second.surface.dmabuf_fd >= 0 && output_width > 0 && output_height > 0) {
+                if (mpp_buf && it->second.surface.dmabuf_fd >= 0 && output_width > 0 && output_height > 0 && !is_error) {
                     const uint8_t* src_ptr = static_cast<const uint8_t*>(mpp_buffer_get_ptr(mpp_buf));
                     size_t src_size = mpp_buffer_get_size(mpp_buf);
                     std::vector<uint8_t> mapped_copy;
                     static std::atomic<int> copy_trace_count{0};
-                    if (copy_trace_count.fetch_add(1, std::memory_order_relaxed) < 5) {
+                    if (copy_trace_count.fetch_add(1, std::memory_order_relaxed) < 1) {
                         util::log(util::stderr_sink, util::LogLevel::Info,
                                   "mpp: copy frame surface={} fmt={} mode={} out_w={} out_h={} src_stride_px={} src_stride_bytes={} src_ver_stride={} src_size={}",
                                   surface_id, static_cast<uint32_t>(frame_fmt), frame_mode,
@@ -736,9 +771,9 @@ void MppDecoder::outputThreadMain(std::stop_token st) {
                     }
                 }
 
-                if (!copy_ok) {
+                if (is_error || !copy_ok) {
                     static std::atomic<int> err_log_count{0};
-                    if (err_log_count.fetch_add(1, std::memory_order_relaxed) < 5) {
+                    if (err_log_count.fetch_add(1, std::memory_order_relaxed) < 1) {
                         util::log(util::stderr_sink, util::LogLevel::Warn,
                                   "mpp: failed to copy decoded frame to surface={} width={} height={} stride={}",
                                   surface_id, output_width, output_height, src_stride_pixels);
