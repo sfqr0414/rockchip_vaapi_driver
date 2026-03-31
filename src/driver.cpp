@@ -17,6 +17,8 @@
 #include <sys/stat.h>
 #include <mutex>
 #include <memory>
+#include <array>
+#include <fstream>
 #include <unordered_map>
 #include <vector>
 
@@ -96,6 +98,17 @@ struct DriverState {
     std::vector<uint8_t> frame_buffer;
     std::vector<uint8_t> frame_extra_data;
     bool sequence_headers_sent = false;
+    bool av1_sequence_enable_restoration = false;
+    std::array<VASurfaceID, 8> av1_ref_frame_map{};
+    bool av1_ref_frame_map_valid = false;
+    struct PendingAv1Frame {
+        bool valid = false;
+        VASurfaceID surface = VA_INVALID_ID;
+        uint8_t provisional_refresh_frame_flags = 0;
+        bool sequence_enable_restoration = false;
+        VADecPictureParameterBufferAV1 pic{};
+        std::vector<uint8_t> tile_payload;
+    } pending_av1_frame;
 
     // Images created via vaCreateImage / vaDeriveImage.
     struct ImageState {
@@ -146,6 +159,48 @@ static void unmapDmabuf(void* ptr, size_t size) {
 static constexpr uint32_t alignTo(uint32_t value, uint32_t align) {
     assert(align && (align & (align - 1)) == 0);
     return (value + align - 1) & ~(align - 1);
+}
+
+static uint8_t deriveAv1RefreshFrameFlags(const VADecPictureParameterBufferAV1& pic,
+                                          const std::array<VASurfaceID, 8>& previous_ref_frame_map,
+                                          bool previous_ref_frame_map_valid,
+                                          VASurfaceID current_surface) {
+    const uint8_t frame_type = static_cast<uint8_t>(pic.pic_info_fields.bits.frame_type & 0x3);
+    const bool show_frame = pic.pic_info_fields.bits.show_frame != 0;
+    const bool is_key_show_frame = frame_type == 0 && show_frame;
+    const bool is_intra_only = frame_type == 2;
+    const bool is_switch_frame = frame_type == 3;
+    if (is_key_show_frame || is_intra_only) {
+        return 0xff;
+    }
+
+    uint8_t flags = 0;
+    if (previous_ref_frame_map_valid) {
+        for (uint8_t slot = 0; slot < 8; ++slot) {
+            if (pic.ref_frame_map[slot] != previous_ref_frame_map[slot] &&
+                pic.ref_frame_map[slot] == current_surface) {
+                flags |= static_cast<uint8_t>(1u << slot);
+            }
+        }
+    }
+
+    if (flags == 0 && is_switch_frame) {
+        return 0xff;
+    }
+
+    return flags;
+}
+
+static uint8_t provisionalAv1RefreshFrameFlags(const VADecPictureParameterBufferAV1& pic) {
+    const uint8_t frame_type = static_cast<uint8_t>(pic.pic_info_fields.bits.frame_type & 0x3);
+    const bool show_frame = pic.pic_info_fields.bits.show_frame != 0;
+    const bool is_key_show_frame = frame_type == 0 && show_frame;
+    const bool is_intra_only = frame_type == 2;
+    const bool is_switch_frame = frame_type == 3;
+    if (is_key_show_frame || is_intra_only || is_switch_frame) {
+        return 0xff;
+    }
+    return 0;
 }
 
 static void resetPictureState(DriverState* d) {
@@ -282,11 +337,12 @@ static VAStatus vaCreateSurfaces1(VADriverContextP ctx,
     if (width <= 0 || height <= 0 || num_surfaces <= 0 || !surfaces)
         return VA_STATUS_ERROR_INVALID_PARAMETER;
 
-    const bool av1_10bit = (d->profile == VAProfileAV1Profile0);
-    const int expected_format = av1_10bit ? static_cast<int>(VA_RT_FORMAT_YUV420_10) : static_cast<int>(VA_RT_FORMAT_YUV420);
-    if (format != expected_format) {
+    const bool av1_10bit = false;
+    const bool format_supported = (format == static_cast<int>(VA_RT_FORMAT_YUV420) ||
+                                   format == static_cast<int>(VA_RT_FORMAT_YUV420_10));
+    if (!format_supported) {
         util::log(util::stderr_sink, util::LogLevel::Error,
-                  "vaCreateSurfaces1: unsupported format={} (expected {})", format, expected_format);
+                  "vaCreateSurfaces1: unsupported format={}", format);
         return VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT;
     }
 
@@ -662,7 +718,7 @@ static VAStatus vaQuerySurfaceAttributes(VADriverContextP ctx,
     if (!d) return VA_STATUS_ERROR_INVALID_CONTEXT;
     if (config_id != VA_INVALID_ID && config_id != 1) return VA_STATUS_ERROR_INVALID_CONFIG;
 
-    const bool av1_10bit = (d->profile == VAProfileAV1Profile0);
+    const bool av1_10bit = false;
     constexpr unsigned int kSupportedCount = 2;
     if (!attrib_list) {
         *num_attribs = kSupportedCount;
@@ -760,6 +816,8 @@ static VAStatus vaCreateContext(VADriverContextP ctx,
     // Remember the dimensions requested by the client.
     d->picture_width = static_cast<uint32_t>(picture_width);
     d->picture_height = static_cast<uint32_t>(picture_height);
+    d->av1_ref_frame_map.fill(VA_INVALID_SURFACE);
+    d->av1_ref_frame_map_valid = false;
 
     // Initialize decoder with the requested size; it may adjust later.
     if (!d->decoder.initialize(vaProfileToCodec(d->profile), picture_width, picture_height)) {
@@ -794,6 +852,8 @@ static VAStatus vaDestroyContext(VADriverContextP ctx, VAContextID context) {
     d->ready_flags.clear();
     d->current_surface = VA_INVALID_ID;
     d->current_buffers.clear();
+    d->av1_ref_frame_map.fill(VA_INVALID_SURFACE);
+    d->av1_ref_frame_map_valid = false;
 
     for (auto& kv : d->images) {
         destroyBuffer(d, kv.second.image.buf);
@@ -946,10 +1006,41 @@ static VAStatus vaEndPicture(VADriverContextP ctx,
                 case VAProfileAV1Profile0:
                     {
                         const auto& av1_pic = *reinterpret_cast<const VADecPictureParameterBufferAV1*>(picture_param_buffer.data.data());
+                        if (d->pending_av1_frame.valid) {
+                            std::array<VASurfaceID, 8> pending_ref_frame_map{};
+                            std::copy(std::begin(d->pending_av1_frame.pic.ref_frame_map),
+                                      std::end(d->pending_av1_frame.pic.ref_frame_map),
+                                      pending_ref_frame_map.begin());
+                            const uint8_t resolved_refresh_frame_flags = deriveAv1RefreshFrameFlags(
+                                av1_pic,
+                                pending_ref_frame_map,
+                                true,
+                                d->pending_av1_frame.surface);
+                            if (resolved_refresh_frame_flags != d->pending_av1_frame.provisional_refresh_frame_flags) {
+                                DecodeJob correction_job;
+                                correction_job.target_surface = d->pending_av1_frame.surface;
+                                correction_job.bitstream = bitstream::build_av1_frame_obu(
+                                    d->pending_av1_frame.pic,
+                                    d->pending_av1_frame.tile_payload,
+                                    resolved_refresh_frame_flags,
+                                    d->pending_av1_frame.sequence_enable_restoration);
+                                correction_job.eos = false;
+                                if (!d->decoder.enqueueJob(std::move(correction_job))) {
+                                    util::log(util::stderr_sink, util::LogLevel::Error,
+                                              "vaEndPicture: enqueue AV1 correction failed for surface={}",
+                                              d->pending_av1_frame.surface);
+                                    return VA_STATUS_ERROR_ALLOCATION_FAILED;
+                                }
+                            }
+                            d->pending_av1_frame.valid = false;
+                        }
+
+                        const uint8_t refresh_frame_flags = provisionalAv1RefreshFrameFlags(av1_pic);
                         static std::atomic<int> av1_param_log_count{0};
                         if (av1_param_log_count.fetch_add(1, std::memory_order_relaxed) < 3) {
                             util::log(util::stderr_sink, util::LogLevel::Info,
-                                      "av1 params: frame_type={} show_frame={} showable_frame={} error_resilient={} allow_sct={} force_imv={} allow_intrabc={} order_hint={} primary_ref_frame={} base_qindex={} tile_cols={} tile_rows={} interp_filter={} tx_mode={} reference_select={} skip_mode_present={} reduced_tx_set_used={} loop_filter_y0={} loop_filter_y1={} loop_filter_u={} loop_filter_v={} cdef_bits={} cdef_damping={} ref0={} ref1={} ref2={} ref3={} ref4={} ref5={} ref6={}",
+                                      "av1 params: surface={} frame_type={} show_frame={} showable_frame={} error_resilient={} allow_sct={} force_imv={} allow_intrabc={} order_hint={} primary_ref_frame={} provisional_refresh_frame_flags={} base_qindex={} tile_cols={} tile_rows={} interp_filter={} tx_mode={} reference_select={} skip_mode_present={} reduced_tx_set_used={} loop_filter_y0={} loop_filter_y1={} loop_filter_u={} loop_filter_v={} cdef_bits={} cdef_damping={} lr_y={} lr_u={} lr_v={} lr_shift={} lr_uv_shift={} ref0={} ref1={} ref2={} ref3={} ref4={} ref5={} ref6={} map0={} map1={} map2={} map3={} map4={} map5={} map6={} map7={}",
+                                      d->current_surface,
                                       av1_pic.pic_info_fields.bits.frame_type,
                                       av1_pic.pic_info_fields.bits.show_frame,
                                       av1_pic.pic_info_fields.bits.showable_frame,
@@ -959,6 +1050,7 @@ static VAStatus vaEndPicture(VADriverContextP ctx,
                                       av1_pic.pic_info_fields.bits.allow_intrabc,
                                       av1_pic.order_hint,
                                       av1_pic.primary_ref_frame,
+                                      refresh_frame_flags,
                                       av1_pic.base_qindex,
                                       av1_pic.tile_cols,
                                       av1_pic.tile_rows,
@@ -973,29 +1065,55 @@ static VAStatus vaEndPicture(VADriverContextP ctx,
                                       av1_pic.filter_level_v,
                                       av1_pic.cdef_bits,
                                       av1_pic.cdef_damping_minus_3,
+                                      av1_pic.loop_restoration_fields.bits.yframe_restoration_type,
+                                      av1_pic.loop_restoration_fields.bits.cbframe_restoration_type,
+                                      av1_pic.loop_restoration_fields.bits.crframe_restoration_type,
+                                      av1_pic.loop_restoration_fields.bits.lr_unit_shift,
+                                      av1_pic.loop_restoration_fields.bits.lr_uv_shift,
                                       av1_pic.ref_deltas[0],
                                       av1_pic.ref_deltas[1],
                                       av1_pic.ref_deltas[2],
                                       av1_pic.ref_deltas[3],
                                       av1_pic.ref_deltas[4],
                                       av1_pic.ref_deltas[5],
-                                      av1_pic.ref_deltas[6]);
+                                      av1_pic.ref_deltas[6],
+                                      av1_pic.ref_frame_map[0],
+                                      av1_pic.ref_frame_map[1],
+                                      av1_pic.ref_frame_map[2],
+                                      av1_pic.ref_frame_map[3],
+                                      av1_pic.ref_frame_map[4],
+                                      av1_pic.ref_frame_map[5],
+                                      av1_pic.ref_frame_map[6],
+                                      av1_pic.ref_frame_map[7]);
                         }
-                        if (av1_param_log_count.load(std::memory_order_relaxed) <= 3) {
-                            char prefix[64] = {0};
-                            size_t prefix_len = std::min<size_t>(8, d->frame_buffer.size());
-                            for (size_t i = 0; i < prefix_len; ++i) {
-                                std::snprintf(prefix + i * 3, sizeof(prefix) - i * 3, "%02x ", d->frame_buffer[i]);
-                            }
-                            util::log(util::stderr_sink, util::LogLevel::Info,
-                                      "av1 frame_buffer prefix size={} prefix={}", d->frame_buffer.size(), prefix);
-                        }
+                        d->av1_sequence_enable_restoration = d->av1_sequence_enable_restoration ||
+                                                             av1_pic.loop_restoration_fields.bits.yframe_restoration_type != 0 ||
+                                                             av1_pic.loop_restoration_fields.bits.cbframe_restoration_type != 0 ||
+                                                             av1_pic.loop_restoration_fields.bits.crframe_restoration_type != 0;
+                        const auto tile_payload = d->frame_buffer;
                         auto sequence_header = bitstream::build_av1_sequence_header(av1_pic);
                         if (!d->sequence_headers_sent) {
                             d->frame_extra_data = std::move(sequence_header);
                         }
-                        auto frame_obu = bitstream::build_av1_frame_obu(av1_pic, d->frame_buffer);
+                        auto frame_obu = bitstream::build_av1_frame_obu(
+                            av1_pic,
+                            tile_payload,
+                            refresh_frame_flags,
+                            d->av1_sequence_enable_restoration);
                         d->frame_buffer = std::move(frame_obu);
+                        for (size_t slot = 0; slot < d->av1_ref_frame_map.size(); ++slot) {
+                            d->av1_ref_frame_map[slot] = av1_pic.ref_frame_map[slot];
+                        }
+                        d->av1_ref_frame_map_valid = true;
+
+                        if (refresh_frame_flags == 0) {
+                            d->pending_av1_frame.valid = true;
+                            d->pending_av1_frame.surface = d->current_surface;
+                            d->pending_av1_frame.provisional_refresh_frame_flags = refresh_frame_flags;
+                            d->pending_av1_frame.sequence_enable_restoration = d->av1_sequence_enable_restoration;
+                            d->pending_av1_frame.pic = av1_pic;
+                            d->pending_av1_frame.tile_payload = tile_payload;
+                        }
                     }
                     break;
                 default:
@@ -1394,8 +1512,6 @@ static VAStatus vaDestroyImage(VADriverContextP ctx,
     auto it = d->images.find(image);
     if (it == d->images.end()) return VA_STATUS_ERROR_INVALID_IMAGE;
 
-    // Free the backing buffer.
-    destroyBuffer(d, it->second.image.buf);
     d->images.erase(it);
     return VA_STATUS_SUCCESS;
 }
@@ -1503,7 +1619,10 @@ static VAStatus vaGetImage(VADriverContextP ctx,
                   "vaGetImage: mapping surface fd={} size={}", surf.dmabuf_fd, surf_total_size);
     }
     void* surf_ptr = mapDmabuf(surf.dmabuf_fd, surf_total_size);
-    if (!surf_ptr) return VA_STATUS_ERROR_UNKNOWN;
+    if (!surf_ptr) {
+        vaUnmapBuffer(ctx, img_it->second.image.buf);
+        return VA_STATUS_ERROR_UNKNOWN;
+    }
     static std::atomic<int> get_image_mapdmabuf_done_log_count{0};
     if (get_image_mapdmabuf_done_log_count.fetch_add(1, std::memory_order_relaxed) < 1) {
         util::log(util::stderr_sink, util::LogLevel::Info,
@@ -1539,6 +1658,7 @@ static VAStatus vaGetImage(VADriverContextP ctx,
     }
 
     unmapDmabuf(surf_ptr, surf_total_size);
+    vaUnmapBuffer(ctx, img_it->second.image.buf);
     return VA_STATUS_SUCCESS;
 }
 
@@ -1610,7 +1730,10 @@ static VAStatus vaPutImage(VADriverContextP ctx,
     uint32_t surf_total_size = surf_y_size + surf_pitch * ((surf.height + 1) / 2);
 
     void* surf_ptr = mapDmabuf(surf.dmabuf_fd, surf_total_size);
-    if (!surf_ptr) return VA_STATUS_ERROR_UNKNOWN;
+    if (!surf_ptr) {
+        vaUnmapBuffer(ctx, img_it->second.image.buf);
+        return VA_STATUS_ERROR_UNKNOWN;
+    }
 
     uint8_t* dst_y = static_cast<uint8_t*>(surf_ptr);
     uint8_t* src_y = static_cast<uint8_t*>(img_buf);
@@ -1633,6 +1756,7 @@ static VAStatus vaPutImage(VADriverContextP ctx,
     }
 
     unmapDmabuf(surf_ptr, surf_total_size);
+    vaUnmapBuffer(ctx, img_it->second.image.buf);
     return VA_STATUS_SUCCESS;
 }
 
@@ -1945,6 +2069,30 @@ static VAStatus vaRenderPicture(VADriverContextP ctx,
                     slice_param_buffer->num_elements,
                     slice_data.data(),
                     slice_data.size());
+            } else if (d->profile == VAProfileAV1Profile0 &&
+                       slice_param_buffer->size_bytes() >= slice_param_buffer->num_elements * sizeof(VASliceParameterBufferAV1)) {
+                const auto* av1_slices = reinterpret_cast<const VASliceParameterBufferAV1*>(slice_param_buffer->data.data());
+                size_t total_size = 0;
+                bool valid = true;
+                for (uint32_t index = 0; index < slice_param_buffer->num_elements; ++index) {
+                    const auto offset = static_cast<size_t>(av1_slices[index].slice_data_offset);
+                    const auto size = static_cast<size_t>(av1_slices[index].slice_data_size);
+                    if (offset > slice_data.size() || size > slice_data.size() - offset) {
+                        valid = false;
+                        break;
+                    }
+                    total_size += size;
+                }
+                if (valid) {
+                    framed.reserve(total_size);
+                    for (uint32_t index = 0; index < slice_param_buffer->num_elements; ++index) {
+                        const auto offset = static_cast<size_t>(av1_slices[index].slice_data_offset);
+                        const auto size = static_cast<size_t>(av1_slices[index].slice_data_size);
+                        framed.insert(framed.end(), slice_data.begin() + offset, slice_data.begin() + offset + size);
+                    }
+                } else {
+                    framed.clear();
+                }
             }
         }
 

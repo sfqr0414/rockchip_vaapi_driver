@@ -37,9 +37,12 @@ public:
         write_ue(code_num);
     }
 
-    void byte_align() {
+    void put_ue(uint32_t value) { write_ue(value); }
+    void put_se(int32_t value) { write_se(value); }
+
+    void byte_align(uint8_t fill_bit = 1) {
         if (bit_count_ == 0) return;
-        put_bit(true);
+        put_bit(fill_bit != 0);
         while (bit_count_ != 0) {
             put_bit(false);
         }
@@ -489,6 +492,7 @@ inline std::vector<uint8_t> build_av1_sequence_header(const VADecPictureParamete
     const bool subsampling_y = (pic.profile == 0) ? true : (pic.seq_info_fields.fields.subsampling_y != 0);
     const bool has_color_description = true;
     const bool enable_ref_frame_mvs = true;
+    const bool enable_warped_motion = true;
     const bool enable_restoration = (pic.loop_restoration_fields.bits.yframe_restoration_type != 0) ||
                                     (pic.loop_restoration_fields.bits.cbframe_restoration_type != 0) ||
                                     (pic.loop_restoration_fields.bits.crframe_restoration_type != 0);
@@ -512,7 +516,7 @@ inline std::vector<uint8_t> build_av1_sequence_header(const VADecPictureParamete
     payload.put_bits(pic.seq_info_fields.fields.enable_intra_edge_filter ? 1u : 0u, 1);
     payload.put_bits(pic.seq_info_fields.fields.enable_interintra_compound ? 1u : 0u, 1);
     payload.put_bits(pic.seq_info_fields.fields.enable_masked_compound ? 1u : 0u, 1);
-    payload.put_bits(pic.pic_info_fields.bits.allow_warped_motion ? 1u : 0u, 1);
+    payload.put_bits(enable_warped_motion ? 1u : 0u, 1);
     payload.put_bits(pic.seq_info_fields.fields.enable_dual_filter ? 1u : 0u, 1);
     payload.put_bits(pic.seq_info_fields.fields.enable_order_hint, 1);
     if (pic.seq_info_fields.fields.enable_order_hint) {
@@ -591,8 +595,20 @@ inline void write_av1_frame_size(BitWriter& writer, const VADecPictureParameterB
 }
 
 inline std::vector<uint8_t> build_av1_frame_obu(const VADecPictureParameterBufferAV1& pic,
-                                                std::span<const uint8_t> tile_payload) {
+                                                std::span<const uint8_t> tile_payload,
+                                                uint8_t refresh_frame_flags,
+                                                bool sequence_enable_restoration) {
     BitWriter payload;
+
+    auto map_restoration_type = [](uint8_t value) -> uint8_t {
+        switch (value & 0x3u) {
+            case 0: return 0; // NONE
+            case 1: return 2; // WIENER -> bitstream lr_type
+            case 2: return 3; // SGRPROJ -> bitstream lr_type
+            case 3: return 1; // SWITCHABLE -> bitstream lr_type
+            default: return 0;
+        }
+    };
 
     auto put_su_bits = [&](int32_t value, int count) {
         const uint32_t mask = (count >= 32) ? 0xffffffffu : ((1u << count) - 1u);
@@ -603,6 +619,18 @@ inline std::vector<uint8_t> build_av1_frame_obu(const VADecPictureParameterBuffe
         payload.put_bits(delta_q != 0 ? 1u : 0u, 1);
         if (delta_q != 0) {
             put_su_bits(delta_q, 7);
+        }
+    };
+
+    auto write_increment = [&](uint32_t value, uint32_t range_min, uint32_t range_max) {
+        uint32_t current = range_min;
+        while (current < range_max) {
+            const bool increment = value > current;
+            payload.put_bits(increment ? 1u : 0u, 1);
+            if (!increment) {
+                break;
+            }
+            ++current;
         }
     };
 
@@ -618,15 +646,25 @@ inline std::vector<uint8_t> build_av1_frame_obu(const VADecPictureParameterBuffe
     const bool use_ref_frame_mvs = pic.pic_info_fields.bits.use_ref_frame_mvs != 0;
     const bool uniform_tile_spacing_flag = pic.pic_info_fields.bits.uniform_tile_spacing_flag != 0;
     const bool allow_warped_motion = pic.pic_info_fields.bits.allow_warped_motion != 0;
-    const bool enable_restoration = (pic.loop_restoration_fields.bits.yframe_restoration_type != 0) ||
-                                    (pic.loop_restoration_fields.bits.cbframe_restoration_type != 0) ||
-                                    (pic.loop_restoration_fields.bits.crframe_restoration_type != 0);
+    uint8_t y_restoration_type = pic.loop_restoration_fields.bits.yframe_restoration_type & 0x3;
+    uint8_t u_restoration_type = pic.loop_restoration_fields.bits.cbframe_restoration_type & 0x3;
+    uint8_t v_restoration_type = pic.loop_restoration_fields.bits.crframe_restoration_type & 0x3;
+    const bool likely_no_restoration = !frame_is_intra &&
+                                       pic.filter_level[0] == 0 &&
+                                       pic.filter_level[1] == 0 &&
+                                       pic.filter_level_u == 0 &&
+                                       pic.filter_level_v == 0 &&
+                                       pic.cdef_bits == 0;
+    if (likely_no_restoration) {
+        y_restoration_type = 0;
+        u_restoration_type = 0;
+        v_restoration_type = 0;
+    }
+    const bool enable_restoration = sequence_enable_restoration;
     const uint8_t frame_type = static_cast<uint8_t>(pic.pic_info_fields.bits.frame_type & 0x3);
     const uint8_t order_hint_bits = static_cast<uint8_t>(pic.order_hint_bits_minus_1 + 1);
     const bool is_switch_frame = frame_type == 3;
     const bool is_key_show_frame = frame_type == 0 && show_frame;
-    const uint8_t refresh_frame_flags = frame_is_intra ? 0xff : 0x00;
-
     payload.put_bits(0, 1);  // show_existing_frame
     payload.put_bits(frame_type, 2);
     payload.put_bits(show_frame ? 1u : 0u, 1);
@@ -712,12 +750,16 @@ inline std::vector<uint8_t> build_av1_frame_obu(const VADecPictureParameterBuffe
         const uint32_t max_log2_cols = 0;
         const uint32_t min_log2_rows = 0;
         const uint32_t max_log2_rows = 0;
-        (void)frame_width_sb;
-        (void)frame_height_sb;
+        if (col_count <= 1) {
+            payload.put_bits(0, 1);
+        }
         for (uint32_t i = min_log2_cols; i < max_log2_cols; ++i) {
             payload.put_bits(1, 1);
         }
         if (col_count > 1) {
+            payload.put_bits(0, 1);
+        }
+        if (row_count <= 1) {
             payload.put_bits(0, 1);
         }
         for (uint32_t i = min_log2_rows; i < max_log2_rows; ++i) {
@@ -730,6 +772,10 @@ inline std::vector<uint8_t> build_av1_frame_obu(const VADecPictureParameterBuffe
 
     payload.put_bits(pic.base_qindex, 8);
     write_delta_q(pic.y_dc_delta_q);
+    if (!pic.seq_info_fields.fields.mono_chrome) {
+        write_delta_q(pic.u_dc_delta_q);
+        write_delta_q(pic.u_ac_delta_q);
+    }
     payload.put_bits(pic.qmatrix_fields.bits.using_qmatrix ? 1u : 0u, 1);
     if (pic.qmatrix_fields.bits.using_qmatrix) {
         payload.put_bits(pic.qmatrix_fields.bits.qm_y & 0xf, 4);
@@ -805,11 +851,20 @@ inline std::vector<uint8_t> build_av1_frame_obu(const VADecPictureParameterBuffe
     }
 
     if (enable_restoration && !allow_intrabc) {
-        payload.put_bits(pic.loop_restoration_fields.bits.yframe_restoration_type & 0x3, 2);
-        payload.put_bits(pic.loop_restoration_fields.bits.cbframe_restoration_type & 0x3, 2);
-        payload.put_bits(pic.loop_restoration_fields.bits.crframe_restoration_type & 0x3, 2);
-        payload.put_bits(pic.loop_restoration_fields.bits.lr_unit_shift & 0x3, 2);
-        payload.put_bits(pic.loop_restoration_fields.bits.lr_uv_shift ? 1u : 0u, 1);
+        const bool chroma_restoration = (u_restoration_type != 0) || (v_restoration_type != 0);
+        payload.put_bits(map_restoration_type(y_restoration_type), 2);
+        payload.put_bits(map_restoration_type(u_restoration_type), 2);
+        payload.put_bits(map_restoration_type(v_restoration_type), 2);
+        if (y_restoration_type != 0 || u_restoration_type != 0 || v_restoration_type != 0) {
+            if (pic.seq_info_fields.fields.use_128x128_superblock) {
+                write_increment(pic.loop_restoration_fields.bits.lr_unit_shift & 0x3, 1, 2);
+            } else {
+                write_increment(pic.loop_restoration_fields.bits.lr_unit_shift & 0x3, 0, 2);
+            }
+        }
+        if (chroma_restoration) {
+            payload.put_bits(pic.loop_restoration_fields.bits.lr_uv_shift ? 1u : 0u, 1);
+        }
     }
 
     if (!allow_intrabc) {
@@ -818,6 +873,9 @@ inline std::vector<uint8_t> build_av1_frame_obu(const VADecPictureParameterBuffe
 
     if (!frame_is_intra) {
         payload.put_bits(pic.mode_control_fields.bits.reference_select ? 1u : 0u, 1);
+        if (pic.mode_control_fields.bits.skip_mode_present) {
+            payload.put_bits(1, 1);
+        }
 
         if (!error_resilient_mode) {
             payload.put_bits(pic.pic_info_fields.bits.allow_warped_motion ? 1u : 0u, 1);

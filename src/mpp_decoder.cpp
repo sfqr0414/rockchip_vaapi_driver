@@ -17,6 +17,8 @@
 
 namespace rockchip {
 
+static constexpr bool kAv1ExportAsP010 = false;
+
 static MppCodingType codecProfileToMpp(CodecProfile profile) {
     switch (profile) {
         case CodecProfile::H264: return MPP_VIDEO_CodingAVC;
@@ -97,28 +99,18 @@ static void unpackPacked10RowLE(const uint8_t* src,
                                 size_t src_bytes,
                                 uint16_t* dst,
                                 size_t sample_count) {
-    const size_t block_count = (sample_count + 7) / 8;
-    for (size_t block = 0; block < block_count; ++block) {
-        const size_t src_index = block * 10;
-        const size_t dst_index = block * 8;
-        if (src_index + 10 > src_bytes) {
-            for (size_t i = dst_index; i < sample_count; ++i) {
-                dst[i] = 0;
-            }
-            return;
+    for (size_t sample = 0; sample < sample_count; ++sample) {
+        const size_t src_index = (sample * 10) / 8;
+        const uint8_t bit_offset = static_cast<uint8_t>((sample * 2) & 7u);
+        if (src_index + 1 >= src_bytes) {
+            dst[sample] = 0;
+            continue;
         }
 
-        for (size_t sample = 0; sample < 8 && dst_index + sample < sample_count; ++sample) {
-            uint16_t value = 0;
-            const size_t bit_base = sample * 10;
-            for (size_t bit = 0; bit < 10; ++bit) {
-                const size_t bit_index = bit_base + bit;
-                const size_t byte_index = src_index + (bit_index >> 3);
-                const uint8_t bit_offset = static_cast<uint8_t>(bit_index & 7u);
-                value |= static_cast<uint16_t>(((src[byte_index] >> bit_offset) & 0x1u) << bit);
-            }
-            dst[dst_index + sample] = static_cast<uint16_t>(value << 6);
-        }
+        const uint16_t packed = static_cast<uint16_t>((src[src_index] >> bit_offset) |
+                                                       (src[src_index + 1] << (8 - bit_offset)));
+        const uint16_t value8 = static_cast<uint16_t>((packed & 0x03FFu) >> 2);
+        dst[sample] = static_cast<uint16_t>(value8 << 8);
     }
 }
 
@@ -247,9 +239,7 @@ bool MppDecoder::initialize(CodecProfile profile, int width, int height) {
         return false;
     }
 
-    MppFrameFormat output_format = (profile_ == CodecProfile::AV1)
-        ? MPP_FMT_YUV420SP_10BIT
-        : MPP_FMT_YUV420SP;
+    MppFrameFormat output_format = MPP_FMT_YUV420SP;
     api_->control(ctx_, MPP_DEC_SET_OUTPUT_FORMAT, &output_format);
 
     MppDecCfg cfg = nullptr;
@@ -271,7 +261,7 @@ bool MppDecoder::isInitialized() const { return ctx_ != nullptr; }
 
 bool MppDecoder::allocateSurface(VASurfaceID id, DecodedSurface& out, int width, int height) {
     uint32_t stride = alignUp(static_cast<uint32_t>(width), 64);
-    if (profile_ == CodecProfile::AV1) {
+    if (profile_ == CodecProfile::AV1 && kAv1ExportAsP010) {
         stride = alignUp(static_cast<uint32_t>(width), 128);
     }
 
@@ -280,7 +270,7 @@ bool MppDecoder::allocateSurface(VASurfaceID id, DecodedSurface& out, int width,
     ds.width = static_cast<uint32_t>(width);
     ds.height = static_cast<uint32_t>(height);
     ds.stride = stride;
-    ds.is_10bit = (profile_ == CodecProfile::AV1);
+    ds.is_10bit = (profile_ == CodecProfile::AV1) && kAv1ExportAsP010;
     ds.dmabuf_fd = createFallbackSurfaceFd(ds.width, ds.height, ds.is_10bit);
     if (ds.dmabuf_fd < 0) {
         return false;
@@ -906,7 +896,7 @@ void MppDecoder::outputThreadMain(std::stop_token st) {
                     }
 
                     if (src_ptr) {
-                        if (profile_ == CodecProfile::AV1) {
+                        if (it->second.surface.is_10bit) {
                             copy_ok = writeSurfaceP010(it->second.surface.dmabuf_fd,
                                                        output_width,
                                                        output_height,
