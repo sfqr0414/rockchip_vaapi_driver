@@ -200,6 +200,16 @@ static void destroyBuffer(DriverState* d, VABufferID buf_id) {
     d->buffers.erase(it);
 }
 
+static bool isImageBackingBuffer(const DriverState* d, VABufferID buf_id) {
+    if (!d) return false;
+    for (const auto& kv : d->images) {
+        if (kv.second.image.buf == buf_id) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // Display attributes (vaQueryDisplayAttributes / vaGetDisplayAttributes / vaSetDisplayAttributes)
 // are global in this driver (no per-display state tracked).
 static std::vector<VADisplayAttribute> g_display_attributes;
@@ -785,13 +795,14 @@ static VAStatus vaDestroyContext(VADriverContextP ctx, VAContextID context) {
     d->current_surface = VA_INVALID_ID;
     d->current_buffers.clear();
 
-    // Release any buffers and images.
-    d->buffers.clear();
-
     for (auto& kv : d->images) {
         destroyBuffer(d, kv.second.image.buf);
     }
     d->images.clear();
+
+    // Release any remaining non-image buffers after image-owned backing
+    // storage has been dropped.
+    d->buffers.clear();
 
     d->subpictures.clear();
 
@@ -859,7 +870,14 @@ static VAStatus vaDestroyBuffer(VADriverContextP ctx,
     auto* d = toDriver(ctx);
     if (!d) return VA_STATUS_ERROR_INVALID_CONTEXT;
     auto it = d->buffers.find(buf_id);
-    if (it == d->buffers.end()) return VA_STATUS_ERROR_INVALID_BUFFER;
+    if (it == d->buffers.end()) {
+        return isImageBackingBuffer(d, buf_id) ? VA_STATUS_SUCCESS : VA_STATUS_ERROR_INVALID_BUFFER;
+    }
+
+    if (isImageBackingBuffer(d, buf_id)) {
+        return VA_STATUS_SUCCESS;
+    }
+
     d->buffers.erase(it);
     return VA_STATUS_SUCCESS;
 }
@@ -976,6 +994,8 @@ static VAStatus vaEndPicture(VADriverContextP ctx,
                         if (!d->sequence_headers_sent) {
                             d->frame_extra_data = std::move(sequence_header);
                         }
+                        auto frame_obu = bitstream::build_av1_frame_obu(av1_pic, d->frame_buffer);
+                        d->frame_buffer = std::move(frame_obu);
                     }
                     break;
                 default:

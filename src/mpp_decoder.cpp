@@ -36,6 +36,17 @@ static uint64_t steadyMicrosNow() {
         std::chrono::steady_clock::now().time_since_epoch()).count());
 }
 
+static constexpr uint64_t kDecoderFlushIdleMicros = 2'000'000ULL;
+static constexpr size_t kMaxInFlightJobs = 16;
+
+static size_t surfaceBufferSize(uint32_t width, uint32_t height, uint32_t stride, bool is_10bit) {
+    if (!is_10bit) {
+        return static_cast<size_t>(stride) * static_cast<size_t>(height) * 3 / 2;
+    }
+
+    return static_cast<size_t>(stride) * static_cast<size_t>(alignUp(height, 8)) * 3;
+}
+
 static void* mapBufferFd(int fd, size_t size) {
     if (fd < 0 || size == 0) return nullptr;
     return mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
@@ -43,6 +54,33 @@ static void* mapBufferFd(int fd, size_t size) {
 
 static void unmapBufferFd(void* ptr, size_t size) {
     if (ptr && size > 0) munmap(ptr, size);
+}
+
+static bool submitDecoderEos(MppCtx ctx, MppApi* api, const std::atomic<bool>& running) {
+    if (!ctx || !api) return false;
+
+    MppPacket eos_pkt = nullptr;
+    if (mpp_packet_init(&eos_pkt, nullptr, 0) != MPP_OK || !eos_pkt) {
+        return false;
+    }
+
+    mpp_packet_set_eos(eos_pkt);
+    bool submitted = false;
+    for (int i = 0; i < 200 && running.load(std::memory_order_relaxed); ++i) {
+        int ret = api->decode_put_packet(ctx, eos_pkt);
+        if (ret == MPP_OK) {
+            submitted = true;
+            break;
+        }
+        if (ret == MPP_ERR_BUFFER_FULL) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            continue;
+        }
+        break;
+    }
+
+    mpp_packet_deinit(&eos_pkt);
+    return submitted;
 }
 
 static bool readExact(FILE* fp, uint8_t* data, size_t size) {
@@ -244,11 +282,39 @@ bool MppDecoder::allocateSurface(VASurfaceID id, DecodedSurface& out, int width,
     ds.stride = stride;
     ds.is_10bit = (profile_ == CodecProfile::AV1);
     ds.dmabuf_fd = createFallbackSurfaceFd(ds.width, ds.height, ds.is_10bit);
+    if (ds.dmabuf_fd < 0) {
+        return false;
+    }
+
+    MppBuffer buffer = nullptr;
+    MppBufferInfo buffer_info = {};
+    buffer_info.type = MPP_BUFFER_TYPE_ION;
+    buffer_info.fd = ds.dmabuf_fd;
+    buffer_info.size = surfaceBufferSize(ds.width, ds.height, ds.stride, ds.is_10bit);
+    if (mpp_buffer_import(&buffer, &buffer_info) != MPP_OK || !buffer) {
+        close(ds.dmabuf_fd);
+        return false;
+    }
+
+    MppFrame frame = nullptr;
+    if (mpp_frame_init(&frame) != MPP_OK || !frame) {
+        mpp_buffer_put(buffer);
+        close(ds.dmabuf_fd);
+        return false;
+    }
+
+    mpp_frame_set_width(frame, ds.width);
+    mpp_frame_set_height(frame, ds.height);
+    mpp_frame_set_hor_stride(frame, ds.stride);
+    mpp_frame_set_ver_stride(frame, ds.is_10bit ? alignUp(ds.height, 8) : ds.height);
+    mpp_frame_set_fmt(frame, ds.is_10bit ? MPP_FMT_YUV420SP_10BIT : MPP_FMT_YUV420SP);
+    mpp_frame_set_buffer(frame, buffer);
 
     std::lock_guard<std::mutex> lock(surface_mutex_);
     auto& entry = surfaces_[id];
     entry.surface = ds;
-    entry.buffer = nullptr;
+    entry.buffer = buffer;
+    entry.frame = frame;
     entry.ready.store(true);
     entry.failed.store(false);
     out = ds;
@@ -264,6 +330,14 @@ bool MppDecoder::updateSurfaceResolution(VASurfaceID id, int width, int height) 
     it->second.surface.width = static_cast<uint32_t>(width);
     it->second.surface.height = static_cast<uint32_t>(height);
     it->second.surface.stride = stride;
+    if (it->second.frame) {
+        mpp_frame_set_width(it->second.frame, static_cast<uint32_t>(width));
+        mpp_frame_set_height(it->second.frame, static_cast<uint32_t>(height));
+        mpp_frame_set_hor_stride(it->second.frame, stride);
+        mpp_frame_set_ver_stride(it->second.frame,
+                                 it->second.surface.is_10bit ? alignUp(static_cast<uint32_t>(height), 8)
+                                                             : static_cast<uint32_t>(height));
+    }
     return true;
 }
 
@@ -295,6 +369,9 @@ bool MppDecoder::enqueueJob(DecodeJob job) {
 
     bool expected = false;
     if (running_.compare_exchange_strong(expected, true)) {
+        eos_sent_.store(false, std::memory_order_relaxed);
+        eos_seen_.store(false, std::memory_order_relaxed);
+        last_progress_us_.store(steadyMicrosNow(), std::memory_order_relaxed);
         input_thread_ = std::jthread([this](std::stop_token st){ inputThreadMain(st); });
         output_thread_ = std::jthread([this](std::stop_token st){ outputThreadMain(st); });
     }
@@ -307,7 +384,7 @@ bool MppDecoder::enqueueJob(DecodeJob job) {
         }
 
         std::unique_lock<std::mutex> lock(pending_mutex_);
-        const size_t max_in_flight = std::max<size_t>(1, std::min<size_t>(surface_count == 0 ? 1 : surface_count, 4));
+        const size_t max_in_flight = std::max<size_t>(1, std::min<size_t>(surface_count == 0 ? kMaxInFlightJobs : surface_count, kMaxInFlightJobs));
         static std::atomic<int> enqueue_wait_log_count{0};
         while (pending_count_ >= max_in_flight && running_.load()) {
             if (enqueue_wait_log_count.fetch_add(1, std::memory_order_relaxed) < 5) {
@@ -335,6 +412,54 @@ bool MppDecoder::enqueueJob(DecodeJob job) {
     input_queue_.push(std::move(job));
     last_enqueue_us_.store(steadyMicrosNow(), std::memory_order_relaxed);
     return true;
+}
+
+void MppDecoder::setSurfaceState(VASurfaceID surface, bool ready, bool failed) {
+    std::lock_guard<std::mutex> lock(surface_mutex_);
+    auto it = surfaces_.find(surface);
+    if (it == surfaces_.end()) return;
+    it->second.ready.store(ready, std::memory_order_release);
+    it->second.failed.store(failed, std::memory_order_release);
+    std::lock_guard<std::mutex> lock2(cv_mutex_);
+    cv_.notify_all();
+}
+
+bool MppDecoder::dropPendingSurfaceLocked(VASurfaceID surface) {
+    bool removed = false;
+    auto queue_it = std::find(pending_surfaces_.begin(), pending_surfaces_.end(), surface);
+    if (queue_it != pending_surfaces_.end()) {
+        pending_surfaces_.erase(queue_it);
+        removed = true;
+    }
+
+    for (auto it = pending_surface_pts_.begin(); it != pending_surface_pts_.end();) {
+        if (it->second == surface) {
+            it = pending_surface_pts_.erase(it);
+            removed = true;
+        } else {
+            ++it;
+        }
+    }
+
+    if (removed && pending_count_ > 0) {
+        --pending_count_;
+    }
+
+    if (removed && !pending_payloads_.empty()) {
+        pending_payloads_.pop_front();
+    }
+
+    if (removed) {
+        pending_cv_.notify_all();
+    }
+    return removed;
+}
+
+VASurfaceID MppDecoder::dropOldestPendingSurfaceLocked() {
+    if (pending_surfaces_.empty()) return VA_INVALID_ID;
+    const VASurfaceID surface = pending_surfaces_.front();
+    dropPendingSurfaceLocked(surface);
+    return surface;
 }
 
 bool MppDecoder::waitSurfaceReady(VASurfaceID surface, uint32_t timeout_ms) {
@@ -414,6 +539,10 @@ void MppDecoder::destroySurface(VASurfaceID surface) {
         std::lock_guard<std::mutex> lock(surface_mutex_);
         auto it = surfaces_.find(surface);
         if (it != surfaces_.end()) {
+            if (it->second.frame) {
+                mpp_frame_deinit(&it->second.frame);
+                it->second.frame = nullptr;
+            }
             if (it->second.buffer) {
                 mpp_buffer_put(it->second.buffer);
                 it->second.buffer = nullptr;
@@ -430,11 +559,7 @@ void MppDecoder::destroySurface(VASurfaceID surface) {
 
     {
         std::lock_guard<std::mutex> lock(pending_mutex_);
-        pending_surfaces_.erase(
-            std::remove(pending_surfaces_.begin(), pending_surfaces_.end(), surface),
-            pending_surfaces_.end());
-        pending_count_ = pending_surfaces_.size();
-        pending_cv_.notify_all();
+        dropPendingSurfaceLocked(surface);
     }
 }
 
@@ -482,6 +607,10 @@ void MppDecoder::shutdown() {
     {
         std::lock_guard<std::mutex> lock(surface_mutex_);
         for (auto& kv : surfaces_) {
+            if (kv.second.frame) {
+                mpp_frame_deinit(&kv.second.frame);
+                kv.second.frame = nullptr;
+            }
             if (kv.second.buffer) {
                 mpp_buffer_put(kv.second.buffer);
                 kv.second.buffer = nullptr;
@@ -520,24 +649,12 @@ void MppDecoder::inputThreadMain(std::stop_token st) {
         size_t payload_size = 0;
 
         if (job.eos) {
-            MppPacket pkt = nullptr;
-            mpp_packet_init(&pkt, nullptr, 0);
-            mpp_packet_set_eos(pkt);
-            for (int i = 0; i < 200 && running_; ++i) {
-                int ret = api_->decode_put_packet(ctx_, pkt);
-                if (ret == MPP_OK) break;
-                if (ret == MPP_ERR_BUFFER_FULL) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
-                    continue;
-                }
-                break;
-            }
+            const bool submitted = submitDecoderEos(ctx_, api_, running_);
             static std::atomic<int> eos_log_count{0};
             if (eos_log_count.fetch_add(1, std::memory_order_relaxed) < 1) {
                 util::log(util::stderr_sink, util::LogLevel::Info,
-                          "mpp: inputThread EOS submitted");
+                          "mpp: inputThread EOS submitted={}", submitted ? 1 : 0);
             }
-            mpp_packet_deinit(&pkt);
             eos_sent_ = true;
             continue;
         }
@@ -563,6 +680,24 @@ void MppDecoder::inputThreadMain(std::stop_token st) {
         MppPacket pkt = nullptr;
         if (mpp_packet_init(&pkt, const_cast<uint8_t*>(payload_ptr), payload_size) != MPP_OK) {
             continue;
+        }
+
+        if (job.target_surface != VA_INVALID_ID) {
+            std::lock_guard<std::mutex> lock(surface_mutex_);
+            auto surface_it = surfaces_.find(job.target_surface);
+            if (surface_it != surfaces_.end() && surface_it->second.frame) {
+                mpp_frame_set_width(surface_it->second.frame, surface_it->second.surface.width);
+                mpp_frame_set_height(surface_it->second.frame, surface_it->second.surface.height);
+                mpp_frame_set_hor_stride(surface_it->second.frame, surface_it->second.surface.stride);
+                mpp_frame_set_ver_stride(surface_it->second.frame,
+                                         surface_it->second.surface.is_10bit ? alignUp(surface_it->second.surface.height, 8)
+                                                                           : surface_it->second.surface.height);
+
+                MppMeta meta = mpp_packet_get_meta(pkt);
+                if (meta) {
+                    mpp_meta_set_frame(meta, KEY_OUTPUT_FRAME, surface_it->second.frame);
+                }
+            }
         }
 
         if (job.job_id > 0) {
@@ -601,25 +736,20 @@ void MppDecoder::inputThreadMain(std::stop_token st) {
 void MppDecoder::outputThreadMain(std::stop_token st) {
     while (!st.stop_requested() && (running_ || !eos_seen_)) {
         MppFrame frame = nullptr;
-        if (running_ && !eos_sent_.load(std::memory_order_relaxed)) {
+        if (running_ && profile_ != CodecProfile::AV1 && !eos_sent_.load(std::memory_order_relaxed)) {
             const uint64_t now_us = steadyMicrosNow();
             const uint64_t last_us = last_enqueue_us_.load(std::memory_order_relaxed);
             const size_t pending_surfaces = pending_count_;
-            if (last_us != 0 && pending_surfaces == 0 && now_us > last_us + 2'000'000ULL) {
-                MppPacket eos_pkt = nullptr;
-                mpp_packet_init(&eos_pkt, nullptr, 0);
-                mpp_packet_set_eos(eos_pkt);
-                for (int i = 0; i < 200 && running_; ++i) {
-                    int ret = api_->decode_put_packet(ctx_, eos_pkt);
-                    if (ret == MPP_OK) break;
-                    if (ret == MPP_ERR_BUFFER_FULL) {
-                        std::this_thread::sleep_for(std::chrono::milliseconds(2));
-                        continue;
+            if (last_us != 0 && pending_surfaces > 0 && now_us > last_us + kDecoderFlushIdleMicros) {
+                const bool submitted = submitDecoderEos(ctx_, api_, running_);
+                if (submitted) {
+                    static std::atomic<int> idle_eos_log_count{0};
+                    if (idle_eos_log_count.fetch_add(1, std::memory_order_relaxed) < 4) {
+                        util::log(util::stderr_sink, util::LogLevel::Info,
+                                  "mpp: outputThread submitted idle EOS pending={}", pending_surfaces);
                     }
-                    break;
+                    eos_sent_ = true;
                 }
-                mpp_packet_deinit(&eos_pkt);
-                eos_sent_ = true;
             }
         }
         static std::atomic<int> get_log_count{0};
@@ -641,6 +771,29 @@ void MppDecoder::outputThreadMain(std::stop_token st) {
         }
 
         if (ret == MPP_ERR_TIMEOUT || (ret == MPP_OK && !frame)) {
+            if (profile_ != CodecProfile::AV1 && !eos_sent_.load(std::memory_order_relaxed)) {
+                const uint64_t now_us = steadyMicrosNow();
+                const uint64_t last_enqueue = last_enqueue_us_.load(std::memory_order_relaxed);
+                size_t pending_surfaces = 0;
+                {
+                    std::lock_guard<std::mutex> lock(pending_mutex_);
+                    pending_surfaces = pending_count_;
+                }
+
+                if (pending_surfaces > 0 && last_enqueue != 0 && now_us > last_enqueue + kDecoderFlushIdleMicros) {
+                    const bool submitted = submitDecoderEos(ctx_, api_, running_);
+                    if (submitted) {
+                        static std::atomic<int> timeout_eos_log_count{0};
+                        if (timeout_eos_log_count.fetch_add(1, std::memory_order_relaxed) < 4) {
+                            util::log(util::stderr_sink, util::LogLevel::Info,
+                                      "mpp: timeout path submitted idle EOS pending={}", pending_surfaces);
+                        }
+                        eos_sent_ = true;
+                        continue;
+                    }
+                }
+            }
+
             if (eos_sent_.load(std::memory_order_relaxed)) {
                 std::lock_guard<std::mutex> lock(pending_mutex_);
                 if (pending_count_ == 0 && pending_surfaces_.empty()) {
@@ -682,29 +835,33 @@ void MppDecoder::outputThreadMain(std::stop_token st) {
         bool is_error = mpp_frame_get_errinfo(frame) || mpp_frame_get_discard(frame);
         bool is_eos_frame = mpp_frame_get_eos(frame);
 
+        const MppBuffer frame_buffer = mpp_frame_get_buffer(frame);
+        const int frame_fd = frame_buffer ? mpp_buffer_get_fd(frame_buffer) : -1;
         VASurfaceID surface_id = VA_INVALID_ID;
+        if (frame_fd >= 0) {
+            std::lock_guard<std::mutex> surface_lock(surface_mutex_);
+            for (const auto& item : surfaces_) {
+                if (item.second.buffer && mpp_buffer_get_fd(item.second.buffer) == frame_fd) {
+                    surface_id = item.first;
+                    break;
+                }
+            }
+        }
+
         {
             std::lock_guard<std::mutex> lock(pending_mutex_);
-            RK_S64 frame_pts = mpp_frame_get_pts(frame);
-            if (frame_pts > 0) {
-                auto it = pending_surface_pts_.find(static_cast<uint64_t>(frame_pts));
-                if (it != pending_surface_pts_.end()) {
-                    surface_id = it->second;
-                    pending_surface_pts_.erase(it);
-                    auto queue_it = std::find(pending_surfaces_.begin(), pending_surfaces_.end(), surface_id);
-                    if (queue_it != pending_surfaces_.end())
-                        pending_surfaces_.erase(queue_it);
+            if (surface_id == VA_INVALID_ID) {
+                RK_S64 frame_pts = mpp_frame_get_pts(frame);
+                if (frame_pts > 0) {
+                    auto it = pending_surface_pts_.find(static_cast<uint64_t>(frame_pts));
+                    if (it != pending_surface_pts_.end()) {
+                        surface_id = it->second;
+                    }
                 }
             }
 
-            if (surface_id == VA_INVALID_ID && !pending_surfaces_.empty()) {
-                surface_id = pending_surfaces_.front();
-                pending_surfaces_.pop_front();
-            }
-
-            if (surface_id != VA_INVALID_ID && pending_count_ > 0) {
-                --pending_count_;
-                pending_cv_.notify_all();
+            if (surface_id != VA_INVALID_ID) {
+                dropPendingSurfaceLocked(surface_id);
             }
         }
 
@@ -797,6 +954,8 @@ void MppDecoder::outputThreadMain(std::stop_token st) {
                 }
             }
         }
+
+        last_progress_us_.store(steadyMicrosNow(), std::memory_order_relaxed);
 
         {
             std::lock_guard<std::mutex> lock(pending_mutex_);

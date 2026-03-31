@@ -512,7 +512,7 @@ inline std::vector<uint8_t> build_av1_sequence_header(const VADecPictureParamete
     payload.put_bits(pic.seq_info_fields.fields.enable_intra_edge_filter ? 1u : 0u, 1);
     payload.put_bits(pic.seq_info_fields.fields.enable_interintra_compound ? 1u : 0u, 1);
     payload.put_bits(pic.seq_info_fields.fields.enable_masked_compound ? 1u : 0u, 1);
-    payload.put_bits(0, 1);
+    payload.put_bits(pic.pic_info_fields.bits.allow_warped_motion ? 1u : 0u, 1);
     payload.put_bits(pic.seq_info_fields.fields.enable_dual_filter ? 1u : 0u, 1);
     payload.put_bits(pic.seq_info_fields.fields.enable_order_hint, 1);
     if (pic.seq_info_fields.fields.enable_order_hint) {
@@ -662,7 +662,6 @@ inline std::vector<uint8_t> build_av1_frame_obu(const VADecPictureParameterBuffe
     }
 
     if (frame_is_intra) {
-        write_av1_frame_size(payload, pic);
         payload.put_bits(0, 1);  // render_and_frame_size_different
         if (allow_screen_content_tools) {
             payload.put_bits(pic.pic_info_fields.bits.allow_intrabc ? 1u : 0u, 1);
@@ -676,7 +675,6 @@ inline std::vector<uint8_t> build_av1_frame_obu(const VADecPictureParameterBuffe
             payload.put_bits(pic.ref_frame_idx[i] & 0x7, 3);
         }
 
-        write_av1_frame_size(payload, pic);
         payload.put_bits(0, 1);  // render_and_frame_size_different
 
         if (!force_integer_mv) {
@@ -690,7 +688,7 @@ inline std::vector<uint8_t> build_av1_frame_obu(const VADecPictureParameterBuffe
         }
 
         payload.put_bits(is_motion_mode_switchable ? 1u : 0u, 1);
-        if (!(error_resilient_mode || !use_ref_frame_mvs)) {
+        if (!error_resilient_mode && pic.seq_info_fields.fields.enable_order_hint) {
             payload.put_bits(use_ref_frame_mvs ? 1u : 0u, 1);
         }
     }
@@ -821,32 +819,28 @@ inline std::vector<uint8_t> build_av1_frame_obu(const VADecPictureParameterBuffe
     if (!frame_is_intra) {
         payload.put_bits(pic.mode_control_fields.bits.reference_select ? 1u : 0u, 1);
 
-        const bool skip_mode_allowed = pic.seq_info_fields.fields.enable_order_hint &&
-                                       pic.mode_control_fields.bits.reference_select &&
-                                       !error_resilient_mode;
-        if (skip_mode_allowed) {
-            payload.put_bits(pic.mode_control_fields.bits.skip_mode_present ? 1u : 0u, 1);
-        }
-
         if (!error_resilient_mode) {
             payload.put_bits(pic.pic_info_fields.bits.allow_warped_motion ? 1u : 0u, 1);
         }
-
-        for (uint32_t i = 0; i < 7; ++i) {
-            payload.put_bits(0, 1);
-        }
-
     }
 
     payload.put_bits(pic.mode_control_fields.bits.reduced_tx_set_used ? 1u : 0u, 1);
 
-    payload.put_bits(0, 1);  // film_grain_params_present default 0
+    if (!frame_is_intra) {
+        for (uint32_t i = 0; i < 7; ++i) {
+            payload.put_bits(0, 1);
+        }
+    }
+
+    if (pic.seq_info_fields.fields.film_grain_params_present) {
+        payload.put_bits(0, 1);
+    }
     payload.zero_align();
 
     std::vector<uint8_t> obu;
     BitWriter obu_header;
     obu_header.put_bits(0, 1);
-    obu_header.put_bits(6, 4);
+    obu_header.put_bits(6, 4); // OBU_FRAME
     obu_header.put_bits(0, 1);
     obu_header.put_bits(1, 1);
     obu_header.put_bits(0, 1);
@@ -855,6 +849,7 @@ inline std::vector<uint8_t> build_av1_frame_obu(const VADecPictureParameterBuffe
     obu.insert(obu.end(), outer_header_bytes.begin(), outer_header_bytes.end());
     append_leb128(obu, payload.bytes().size() + tile_payload.size());
     obu.insert(obu.end(), payload.bytes().begin(), payload.bytes().end());
+    obu.insert(obu.end(), tile_payload.begin(), tile_payload.end());
     return obu;
 }
 

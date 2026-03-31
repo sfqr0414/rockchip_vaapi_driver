@@ -1,23 +1,24 @@
 #pragma once
 
-#include <atomic>
-#include <condition_variable>
-#include <cstdint>
-#include <memory>
-#include <string>
-#include <thread>
-#include <stop_token>
-#include <unordered_map>
-#include <vector>
-#include <deque>
-#include <mutex>
-
+#include <rockchip/mpp_buffer.h>
+#include <rockchip/mpp_frame.h>
+#include <rockchip/mpp_meta.h>
+#include <rockchip/mpp_packet.h>
+#include <rockchip/rk_mpi.h>
 #include <va/va.h>
 #include <va/va_drmcommon.h>
 
-#include <rockchip/rk_mpi.h>
-#include <rockchip/mpp_frame.h>
-#include <rockchip/mpp_packet.h>
+#include <atomic>
+#include <condition_variable>
+#include <cstdint>
+#include <deque>
+#include <memory>
+#include <mutex>
+#include <stop_token>
+#include <string>
+#include <thread>
+#include <unordered_map>
+#include <vector>
 
 #include "util/atomic_sync_queue.h"
 #include "util/log.h"
@@ -44,6 +45,7 @@ struct DecodedSurface {
 struct SurfaceInfo {
     DecodedSurface surface;
     MppBuffer buffer = nullptr;
+    MppFrame frame = nullptr;
     std::atomic<bool> ready{false};
     std::atomic<bool> failed{false};
 };
@@ -57,7 +59,7 @@ struct DecodeJob {
 };
 
 class MppDecoder {
-public:
+   public:
     MppDecoder();
     ~MppDecoder();
 
@@ -69,16 +71,19 @@ public:
     bool updateSurfaceResolution(VASurfaceID id, int width, int height);
     bool getSurfaceInfo(VASurfaceID id, uint32_t& width, uint32_t& height, uint32_t& stride, int& dmabuf_fd, bool& failed);
     bool getSurfaceState(VASurfaceID id, bool& ready, bool& failed);
-    bool waitSurfaceReady(VASurfaceID surface, uint32_t timeout_ms = 120000);
+    bool waitSurfaceReady(VASurfaceID surface, uint32_t timeout_ms = 15000);
     void forceSurfaceReady(VASurfaceID surface);
     void resetSurface(VASurfaceID surface);
     void releaseSurface(VASurfaceID surface);
     void destroySurface(VASurfaceID surface);
     void shutdown();
 
-private:
+   private:
     void inputThreadMain(std::stop_token st);
     void outputThreadMain(std::stop_token st);
+    void setSurfaceState(VASurfaceID surface, bool ready, bool failed);
+    bool dropPendingSurfaceLocked(VASurfaceID surface);
+    VASurfaceID dropOldestPendingSurfaceLocked();
 
     CodecProfile profile_{CodecProfile::Unknown};
     MppCtx ctx_ = nullptr;
@@ -99,6 +104,7 @@ private:
     std::deque<std::shared_ptr<std::vector<uint8_t>>> pending_payloads_;
     size_t pending_count_ = 0;
     std::atomic<uint64_t> last_enqueue_us_{0};
+    std::atomic<uint64_t> last_progress_us_{0};
     std::atomic<uint64_t> next_job_id_{1};
 
     std::mutex surface_mutex_;
@@ -111,4 +117,4 @@ private:
 
 CodecProfile vaProfileToCodec(VAProfile profile);
 
-} // namespace rockchip
+}  // namespace rockchip
