@@ -5,7 +5,8 @@ This repository contains a minimal VA-API driver (`librockchip_drv_video.so`) th
 ## What is included
 
 - **`src/driver.cpp`**: VA-API DDI driver implementing the basic VA-API function table.
-- **`src/mpp_decoder.*`**: Minimal decoder wrapper to talk to the Rockchip MPP API.
+- **`src/mpp_decoder.*`**: MPP decoder bridge class and its decoder-owned nested state types.
+- **`src/mpp_common.hpp`**: Shared MPP/VA helper utilities, RAII wrappers, codec/profile helpers, and low-level buffer/mapping routines used by both the driver and decoder.
 - **`src/util/*`**: Utilities including a `util::log` formatter and a lock-free `AtomicSyncQueue`.
 - **`tools/`**: Test harness applications (`test_mpp_decode`, `vaapi_decode_test`) for validating the MPP and VA-API path.
 - **`mpp/`**: Stub headers for Rockchip MPP API (used when system `rockchip-mpp` headers/libraries are not available).
@@ -43,3 +44,11 @@ In `src/driver.cpp`, `namespace rockchip_vaapi` is split into two implementation
 - `namespace api`: only VA-API driver callbacks (VADriverVTable functions) such as `vaCreateSurfaces`, `vaDestroySurfaces`, `vaBeginPicture`, `vaRenderPicture`, `vaEndPicture`, `vaSyncSurface`, etc.
 
 This separation keeps the VA-API entry points clean and keeps core logic testable and reusable without VA function table dependencies.
+
+## Contribution rules
+
+- Keep decoder-owned state inside `MppDecoder`. If a type is only meaningful as part of decoder lifecycle or queueing, define it as a nested `MppDecoder` type instead of exporting it globally.
+- Put cross-file MPP helpers in `src/mpp_common.hpp`. RAII wrappers, codec/profile conversion helpers, buffer mapping helpers, and small low-level utilities belong there.
+- Prefer RAII and STL containers. New code should use `unique_fd`, handle wrappers, `std::vector`, `std::span`, and standard synchronization primitives instead of ad-hoc ownership or raw resource cleanup.
+- Keep interfaces narrow. Public headers should expose behavior and ownership boundaries, not unrelated helper functions or free-standing state structs.
+- Preserve the validation bar. Any change to decode, surface export, or bitstream reconstruction should be rechecked with the real FFmpeg VAAPI samples under `videos/`.

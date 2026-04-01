@@ -1,13 +1,5 @@
 #pragma once
 
-#include <rockchip/mpp_buffer.h>
-#include <rockchip/mpp_frame.h>
-#include <rockchip/mpp_meta.h>
-#include <rockchip/mpp_packet.h>
-#include <rockchip/rk_mpi.h>
-#include <va/va.h>
-#include <va/va_drmcommon.h>
-
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
@@ -15,51 +7,42 @@
 #include <memory>
 #include <mutex>
 #include <stop_token>
-#include <string>
 #include <thread>
 #include <unordered_map>
-#include <vector>
 
+#include "mpp_common.hpp"
 #include "util/atomic_sync_queue.h"
-#include "util/log.h"
 
 namespace rockchip {
 
-enum class CodecProfile {
-    H264,
-    HEVC,
-    VP9,
-    AV1,
-    Unknown,
-};
-
-struct DecodedSurface {
-    VASurfaceID va_id = VA_INVALID_ID;
-    int dmabuf_fd = -1;
-    uint32_t width = 0;
-    uint32_t height = 0;
-    uint32_t stride = 0;
-    bool is_10bit = false;
-};
-
-struct SurfaceInfo {
-    DecodedSurface surface;
-    MppBuffer buffer = nullptr;
-    MppFrame frame = nullptr;
-    std::atomic<bool> ready{false};
-    std::atomic<bool> failed{false};
-};
-
-struct DecodeJob {
-    VASurfaceID target_surface = VA_INVALID_ID;
-    std::vector<uint8_t> bitstream;
-    std::vector<uint8_t> extra_data;
-    bool eos = false;
-    uint64_t job_id = 0;
-};
-
 class MppDecoder {
    public:
+    struct DecodedSurface {
+        VASurfaceID va_id = VA_INVALID_ID;
+        int dmabuf_fd = -1;
+        uint32_t width = 0;
+        uint32_t height = 0;
+        uint32_t stride = 0;
+        bool is_10bit = false;
+    };
+
+    struct SurfaceInfo {
+        DecodedSurface surface;
+        unique_fd dmabuf;
+        MppBufferHandle buffer;
+        MppFrameHandle frame;
+        std::atomic<bool> ready{false};
+        std::atomic<bool> failed{false};
+    };
+
+    struct DecodeJob {
+        VASurfaceID target_surface = VA_INVALID_ID;
+        std::vector<uint8_t> bitstream;
+        std::vector<uint8_t> extra_data;
+        bool eos = false;
+        uint64_t job_id = 0;
+    };
+
     MppDecoder();
     ~MppDecoder();
 
@@ -71,7 +54,7 @@ class MppDecoder {
     bool updateSurfaceResolution(VASurfaceID id, int width, int height);
     bool getSurfaceInfo(VASurfaceID id, uint32_t& width, uint32_t& height, uint32_t& stride, int& dmabuf_fd, bool& failed);
     bool getSurfaceState(VASurfaceID id, bool& ready, bool& failed);
-    bool waitSurfaceReady(VASurfaceID surface, uint32_t timeout_ms = 15000);
+    bool waitSurfaceReady(VASurfaceID surface, uint32_t timeout_ms = 60000);
     void forceSurfaceReady(VASurfaceID surface);
     void resetSurface(VASurfaceID surface);
     void releaseSurface(VASurfaceID surface);
@@ -88,6 +71,7 @@ class MppDecoder {
     CodecProfile profile_{CodecProfile::Unknown};
     MppCtx ctx_ = nullptr;
     MppApi* api_ = nullptr;
+    bool session_initialized_ = false;
     MppBufferGroup group_ = nullptr;
     util::AtomicSyncQueue<DecodeJob, 16> input_queue_;
     std::atomic<bool> running_{false};
@@ -109,12 +93,10 @@ class MppDecoder {
 
     std::mutex surface_mutex_;
     std::mutex pending_mutex_;
-    std::condition_variable pending_cv_;
+    std::condition_variable_any pending_cv_;
 
     std::mutex cv_mutex_;
-    std::condition_variable cv_;
+    std::condition_variable_any cv_;
 };
-
-CodecProfile vaProfileToCodec(VAProfile profile);
 
 }  // namespace rockchip

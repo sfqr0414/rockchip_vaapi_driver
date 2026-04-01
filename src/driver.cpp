@@ -10,11 +10,9 @@
 #include <algorithm>
 #include <atomic>
 #include <cassert>
-#include <cstdarg>
 #include <cstddef>
 #include <cstring>
 #include <span>
-#include <sys/stat.h>
 #include <mutex>
 #include <memory>
 #include <array>
@@ -33,8 +31,13 @@ namespace rockchip_vaapi {
 namespace impl {
 
 struct SurfaceState {
-    DecodedSurface surface;
-    MppBuffer buffer = nullptr;
+    MppDecoder::DecodedSurface surface;
+    unique_fd dmabuf;
+
+    void set_dmabuf(unique_fd fd) {
+        dmabuf = std::move(fd);
+        surface.dmabuf_fd = dmabuf.get();
+    }
 };
 
 struct VABuffer {
@@ -78,7 +81,10 @@ struct DecodeState {
 };
 
 struct DriverState {
-    MppDecoder decoder;
+    DriverState() : decoder(std::make_unique<MppDecoder>()) {}
+
+    std::unique_ptr<MppDecoder> decoder;
+    std::mutex resource_mutex;
     std::unordered_map<VASurfaceID, std::unique_ptr<SurfaceState>> surfaces;
     std::unordered_map<VABufferID, std::unique_ptr<VABuffer>> buffers;
     DecodeState decode_state;
@@ -147,14 +153,48 @@ struct DriverState {
     bool config_created = false;
 };
 
-static void* mapDmabuf(int fd, size_t size) {
-    if (fd < 0 || size == 0) return nullptr;
-    return mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-}
+class MappedDmabuf {
+   public:
+    MappedDmabuf() = default;
+    MappedDmabuf(void* address, size_t size) noexcept : address_(address), size_(size) {}
+    ~MappedDmabuf() { reset(); }
 
-static void unmapDmabuf(void* ptr, size_t size) {
-    if (ptr && size > 0) munmap(ptr, size);
-}
+    MappedDmabuf(const MappedDmabuf&) = delete;
+    MappedDmabuf& operator=(const MappedDmabuf&) = delete;
+
+    MappedDmabuf(MappedDmabuf&& other) noexcept
+        : address_(std::exchange(other.address_, nullptr)), size_(std::exchange(other.size_, 0)) {}
+
+    MappedDmabuf& operator=(MappedDmabuf&& other) noexcept {
+        if (this != &other) {
+            reset();
+            address_ = std::exchange(other.address_, nullptr);
+            size_ = std::exchange(other.size_, 0);
+        }
+        return *this;
+    }
+
+    [[nodiscard]] static MappedDmabuf map(int fd, size_t size, int prot) noexcept {
+        if (fd < 0 || size == 0) return {};
+        void* address = mmap(nullptr, size, prot, MAP_SHARED, fd, 0);
+        return address == MAP_FAILED ? MappedDmabuf{} : MappedDmabuf{address, size};
+    }
+
+    [[nodiscard]] void* data() const noexcept { return address_; }
+    [[nodiscard]] explicit operator bool() const noexcept { return address_ != nullptr; }
+
+    void reset() noexcept {
+        if (address_ != nullptr && size_ != 0) {
+            munmap(address_, size_);
+        }
+        address_ = nullptr;
+        size_ = 0;
+    }
+
+   private:
+    void* address_ = nullptr;
+    size_t size_ = 0;
+};
 
 static constexpr uint32_t alignTo(uint32_t value, uint32_t align) {
     assert(align && (align & (align - 1)) == 0);
@@ -217,39 +257,9 @@ struct ScopedPictureStateReset {
     ~ScopedPictureStateReset() { resetPictureState(d); }
 };
 
-static int createFallbackSurfaceFd(uint32_t width, uint32_t height, bool is_10bit) {
-    uint64_t total_size = 0;
-    uint32_t stride = alignTo(width, 64);
-    if (!is_10bit) {
-        total_size = static_cast<uint64_t>(stride) * height * 3 / 2;
-    } else {
-        uint32_t aligned_h = ((height + 7) / 8) * 8;
-        uint64_t size = static_cast<uint64_t>(stride) * aligned_h;
-        size = ((size + 127) / 128) * 128;
-        total_size = size * 2;
-    }
-
-    char shm_name[64];
-    std::snprintf(shm_name, sizeof(shm_name), "/rockchip-vaapi-%d-%u-%u", getpid(), width, height);
-    int fd = shm_open(shm_name, O_RDWR | O_CREAT | O_EXCL, 0600);
-    if (fd < 0) return -1;
-    shm_unlink(shm_name);
-    if (ftruncate(fd, static_cast<off_t>(total_size)) != 0) {
-        close(fd);
-        return -1;
-    }
-
-    void* ptr = mmap(nullptr, static_cast<size_t>(total_size), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if (ptr != MAP_FAILED) {
-        memset(ptr, 0, static_cast<size_t>(total_size));
-        munmap(ptr, static_cast<size_t>(total_size));
-    }
-
-    return fd;
-}
-
 static void destroyBuffer(DriverState* d, VABufferID buf_id) {
     if (!d) return;
+    std::lock_guard<std::mutex> lock(d->resource_mutex);
     auto it = d->buffers.find(buf_id);
     if (it == d->buffers.end()) return;
     d->buffers.erase(it);
@@ -387,13 +397,13 @@ static VAStatus vaCreateSurfaces1(VADriverContextP ctx,
     {
         static std::atomic<int> create_surface_log_count{0};
         if (create_surface_log_count.fetch_add(1, std::memory_order_relaxed) < 1) {
-            int initialized = d->decoder.isInitialized() ? 1 : 0;
+            int initialized = d->decoder && d->decoder->isInitialized() ? 1 : 0;
             util::log(util::stderr_sink, util::LogLevel::Info,
                       "vaCreateSurfaces1: decoder isInitialized={}", initialized);
         }
     }
 
-    if (!d->decoder.isInitialized()) {
+    if (!d->decoder || !d->decoder->isInitialized()) {
         static std::atomic<int> init_log_count{0};
         if (init_log_count.fetch_add(1, std::memory_order_relaxed) < 1) {
             int profile_int = static_cast<int>(d->profile);
@@ -401,7 +411,7 @@ static VAStatus vaCreateSurfaces1(VADriverContextP ctx,
                       "Initializing decoder for profile={} width={} height={}",
                       profile_int, width, height);
         }
-        if (!d->decoder.initialize(vaProfileToCodec(d->profile), width, height)) {
+        if (!d->decoder->initialize(vaProfileToCodec(d->profile), width, height)) {
             util::log(util::stderr_sink, util::LogLevel::Error,
                       "Failed to initialize decoder for surface allocation");
             return VA_STATUS_ERROR_ALLOCATION_FAILED;
@@ -417,11 +427,13 @@ static VAStatus vaCreateSurfaces1(VADriverContextP ctx,
         state->surface.stride = alignTo(state->surface.width, 64);
         state->surface.is_10bit = (d->profile == VAProfileAV1Profile0);
 
-        if (!d->decoder.allocateSurface(id, state->surface, width, height)) {
+        if (!d->decoder->allocateSurface(id, state->surface, width, height)) {
             util::log(util::stderr_sink, util::LogLevel::Error,
                       "Failed to allocate MPP surface for VA surface {}", id);
             return VA_STATUS_ERROR_ALLOCATION_FAILED;
         }
+
+        state->surface.dmabuf_fd = -1;
 
         d->surfaces[id] = std::move(state);
         surfaces[i] = id;
@@ -445,13 +457,10 @@ static VAStatus vaDestroySurfaces(VADriverContextP ctx,
     if (!d) return VA_STATUS_ERROR_INVALID_CONTEXT;
     std::lock_guard<std::mutex> lock(d->lock);
     for (int i = 0; i < num_surfaces; i++) {
-        d->decoder.destroySurface(surfaces[i]);
+        d->decoder->destroySurface(surfaces[i]);
         auto it = d->surfaces.find(surfaces[i]);
         if (it != d->surfaces.end()) {
-            if (it->second->surface.dmabuf_fd >= 0) {
-                close(it->second->surface.dmabuf_fd);
-                it->second->surface.dmabuf_fd = -1;
-            }
+            it->second->set_dmabuf({});
             d->surfaces.erase(it);
         }
     }
@@ -473,12 +482,12 @@ static VAStatus vaSyncSurface(VADriverContextP ctx, VASurfaceID surface) {
 
     // Wait for MPP to report either completion or failure. Avoid an extra
     // ready-only wait path so failed frames do not deadlock callers.
-    bool ready = d->decoder.waitSurfaceReady(surface);
+    bool ready = d->decoder->waitSurfaceReady(surface);
 
     uint32_t width = 0, height = 0, stride = 0;
     int fd = -1;
     bool failed = false;
-    if (d->decoder.getSurfaceInfo(surface, width, height, stride, fd, failed)) {
+    if (d->decoder->getSurfaceInfo(surface, width, height, stride, fd, failed)) {
         if (!ready && failed) {
             util::log(util::stderr_sink, util::LogLevel::Warn,
                       "vaSyncSurface: surface={} completed with decode failure", surface);
@@ -510,26 +519,21 @@ static VAStatus vaSyncSurface(VADriverContextP ctx, VASurfaceID surface) {
                 return VA_STATUS_ERROR_INVALID_SURFACE;
             }
 
-            if (it->second->surface.dmabuf_fd >= 0 && it->second->surface.dmabuf_fd != fd) {
-                close(it->second->surface.dmabuf_fd);
-                it->second->surface.dmabuf_fd = -1;
-            }
-
-            int driver_fd = dup(fd);
-            if (driver_fd < 0) {
+            unique_fd driver_fd{dup(fd)};
+            if (!driver_fd) {
                 return VA_STATUS_ERROR_ALLOCATION_FAILED;
             }
 
             it->second->surface.width = width;
             it->second->surface.height = height;
             it->second->surface.stride = stride;
-            it->second->surface.dmabuf_fd = driver_fd;
+            it->second->set_dmabuf(std::move(driver_fd));
 
             static std::atomic<int> sync_ready_log_count{0};
             if (sync_ready_log_count.fetch_add(1, std::memory_order_relaxed) < 1) {
                 util::log(util::stderr_sink, util::LogLevel::Info,
                           "vaSyncSurface: surface={} ready w={} h={} stride={} fd={}",
-                          surface, width, height, stride, driver_fd);
+                          surface, width, height, stride, it->second->surface.dmabuf_fd);
             }
         }
     }
@@ -779,7 +783,8 @@ static VAStatus vaCreateContext(VADriverContextP ctx,
                                 int num_render_targets,
                                 VAContextID* context) {
     if (!ctx || !context) {
-        util::log(util::stderr_sink, util::LogLevel::Warn, "vaCreateContext: invalid pointer ctx={} context={}", (void*)ctx, (void*)context);
+        util::log(util::stderr_sink, util::LogLevel::Warn, "vaCreateContext: invalid pointer ctx={} context={}",
+              static_cast<const void*>(ctx), static_cast<const void*>(context));
         return VA_STATUS_ERROR_INVALID_PARAMETER;
     }
     auto* d = toDriver(ctx);
@@ -792,7 +797,8 @@ static VAStatus vaCreateContext(VADriverContextP ctx,
         return VA_STATUS_ERROR_INVALID_CONFIG;
     }
     if (num_render_targets <= 0 || !render_targets) {
-        util::log(util::stderr_sink, util::LogLevel::Warn, "vaCreateContext: invalid render targets count={} ptr={}", num_render_targets, (void*)render_targets);
+        util::log(util::stderr_sink, util::LogLevel::Warn, "vaCreateContext: invalid render targets count={} ptr={}",
+              num_render_targets, static_cast<const void*>(render_targets));
         return VA_STATUS_ERROR_INVALID_PARAMETER;
     }
     if (flag != 0 && flag != VA_PROGRESSIVE) {
@@ -820,7 +826,7 @@ static VAStatus vaCreateContext(VADriverContextP ctx,
     d->av1_ref_frame_map_valid = false;
 
     // Initialize decoder with the requested size; it may adjust later.
-    if (!d->decoder.initialize(vaProfileToCodec(d->profile), picture_width, picture_height)) {
+    if (!d->decoder || !d->decoder->initialize(vaProfileToCodec(d->profile), picture_width, picture_height)) {
         return VA_STATUS_ERROR_ALLOCATION_FAILED;
     }
 
@@ -838,14 +844,11 @@ static VAStatus vaDestroyContext(VADriverContextP ctx, VAContextID context) {
     std::lock_guard<std::mutex> lock(d->lock);
 
     // Stop any decoding activity.
-    d->decoder.shutdown();
+    d->decoder->shutdown();
 
     // Release driver-owned surface handles after MPP has fully stopped.
     for (auto& kv : d->surfaces) {
-        if (kv.second->surface.dmabuf_fd >= 0) {
-            close(kv.second->surface.dmabuf_fd);
-            kv.second->surface.dmabuf_fd = -1;
-        }
+        kv.second->set_dmabuf({});
     }
 
     d->surfaces.clear();
@@ -879,6 +882,8 @@ static VAStatus vaCreateBuffer(VADriverContextP ctx,
     auto* d = toDriver(ctx);
     if (!d || !buf_id) return VA_STATUS_ERROR_INVALID_CONTEXT;
 
+    std::lock_guard<std::mutex> lock(d->resource_mutex);
+
     size_t total_size = size * (size_t)num_elements;
     VABufferID id = d->next_buffer_id++;
     try {
@@ -909,6 +914,8 @@ static VAStatus vaMapBuffer(VADriverContextP ctx,
     if (!pbuf) return VA_STATUS_ERROR_INVALID_PARAMETER;
     auto* d = toDriver(ctx);
     if (!d) return VA_STATUS_ERROR_INVALID_CONTEXT;
+
+    std::lock_guard<std::mutex> lock(d->resource_mutex);
     auto it = d->buffers.find(buf_id);
     if (it == d->buffers.end()) return VA_STATUS_ERROR_INVALID_BUFFER;
 
@@ -921,6 +928,8 @@ static VAStatus vaUnmapBuffer(VADriverContextP ctx,
                               VABufferID buf_id) {
     auto* d = toDriver(ctx);
     if (!d) return VA_STATUS_ERROR_INVALID_CONTEXT;
+
+    std::lock_guard<std::mutex> lock(d->resource_mutex);
     if (d->buffers.find(buf_id) == d->buffers.end()) return VA_STATUS_ERROR_INVALID_BUFFER;
     return VA_STATUS_SUCCESS;
 }
@@ -929,6 +938,8 @@ static VAStatus vaDestroyBuffer(VADriverContextP ctx,
                                 VABufferID buf_id) {
     auto* d = toDriver(ctx);
     if (!d) return VA_STATUS_ERROR_INVALID_CONTEXT;
+
+    std::lock_guard<std::mutex> lock(d->resource_mutex);
     auto it = d->buffers.find(buf_id);
     if (it == d->buffers.end()) {
         return isImageBackingBuffer(d, buf_id) ? VA_STATUS_SUCCESS : VA_STATUS_ERROR_INVALID_BUFFER;
@@ -1017,7 +1028,7 @@ static VAStatus vaEndPicture(VADriverContextP ctx,
                                 true,
                                 d->pending_av1_frame.surface);
                             if (resolved_refresh_frame_flags != d->pending_av1_frame.provisional_refresh_frame_flags) {
-                                DecodeJob correction_job;
+                                MppDecoder::DecodeJob correction_job;
                                 correction_job.target_surface = d->pending_av1_frame.surface;
                                 correction_job.bitstream = bitstream::build_av1_frame_obu(
                                     d->pending_av1_frame.pic,
@@ -1025,7 +1036,7 @@ static VAStatus vaEndPicture(VADriverContextP ctx,
                                     resolved_refresh_frame_flags,
                                     d->pending_av1_frame.sequence_enable_restoration);
                                 correction_job.eos = false;
-                                if (!d->decoder.enqueueJob(std::move(correction_job))) {
+                                if (!d->decoder->enqueueJob(std::move(correction_job))) {
                                     util::log(util::stderr_sink, util::LogLevel::Error,
                                               "vaEndPicture: enqueue AV1 correction failed for surface={}",
                                               d->pending_av1_frame.surface);
@@ -1149,7 +1160,7 @@ static VAStatus vaEndPicture(VADriverContextP ctx,
 
     // Before submitting, reset ready/failed flags so vaSyncSurface will block
     // until MPP reports the frame is decoded and attached.
-    d->decoder.resetSurface(d->current_surface);
+    d->decoder->resetSurface(d->current_surface);
 
     static std::atomic<int> end_log_count{0};
     if (end_log_count.fetch_add(1, std::memory_order_relaxed) < 1) {
@@ -1163,7 +1174,7 @@ static VAStatus vaEndPicture(VADriverContextP ctx,
                   d->current_surface, d->frame_buffer.size(), d->frame_extra_data.size(), prefix);
     }
 
-    DecodeJob job;
+    MppDecoder::DecodeJob job;
     job.target_surface = d->current_surface;
     job.bitstream = std::move(d->frame_buffer);
     job.extra_data = std::move(d->frame_extra_data);
@@ -1172,7 +1183,7 @@ static VAStatus vaEndPicture(VADriverContextP ctx,
     job.eos = false;
 
     // Submit the complete frame to the decoder thread (which will feed MPP).
-    if (!d->decoder.enqueueJob(std::move(job))) {
+    if (!d->decoder->enqueueJob(std::move(job))) {
         util::log(util::stderr_sink, util::LogLevel::Error,
                   "vaEndPicture: enqueueJob failed for surface={}", d->current_surface);
         return VA_STATUS_ERROR_ALLOCATION_FAILED;
@@ -1190,7 +1201,7 @@ static VAStatus vaQuerySurfaceStatus(VADriverContextP ctx,
 
     bool ready = false;
     bool failed = false;
-    if (!d->decoder.getSurfaceState(surface, ready, failed)) {
+    if (!d->decoder->getSurfaceState(surface, ready, failed)) {
         *status = VASurfaceReady;
         return VA_STATUS_SUCCESS;
     }
@@ -1266,10 +1277,11 @@ static VAStatus vaExportSurfaceHandle(VADriverContextP ctx,
     desc->width = surf.width;
     desc->height = surf.height;
     desc->num_objects = 1;
-    desc->objects[0].fd = dup(surf.dmabuf_fd);
-    if (desc->objects[0].fd < 0) {
+    unique_fd exported_fd{dup(surf.dmabuf_fd)};
+    if (!exported_fd) {
         return VA_STATUS_ERROR_ALLOCATION_FAILED;
     }
+    desc->objects[0].fd = exported_fd.release();
     desc->objects[0].size = static_cast<uint32_t>(total_size);
     desc->objects[0].drm_format_modifier = 0;
 
@@ -1286,7 +1298,7 @@ static VAStatus vaExportSurfaceHandle(VADriverContextP ctx,
     return VA_STATUS_SUCCESS;
 }
 
-static bool copySurfaceToImageBuffer(const DecodedSurface& surf,
+static bool copySurfaceToImageBuffer(const MppDecoder::DecodedSurface& surf,
                                      const VADRMPRIMESurfaceDescriptor& src_desc,
                                      void* dst_ptr,
                                      const VAImage& image) {
@@ -1303,11 +1315,11 @@ static bool copySurfaceToImageBuffer(const DecodedSurface& surf,
     const uint32_t uv_copy_row_bytes = std::min(dst_uv_pitch, surf.width * bytes_per_sample);
 
     const uint32_t src_plane_size = src_desc.objects[0].size;
-    void* src_ptr = mmap(nullptr, src_plane_size, PROT_READ, MAP_SHARED, src_desc.objects[0].fd, 0);
-    if (src_ptr == MAP_FAILED) return false;
+    auto src_mapping = MappedDmabuf::map(src_desc.objects[0].fd, src_plane_size, PROT_READ);
+    if (!src_mapping) return false;
 
     uint8_t* dst = static_cast<uint8_t*>(dst_ptr);
-    const uint8_t* src = static_cast<const uint8_t*>(src_ptr);
+    const uint8_t* src = static_cast<const uint8_t*>(src_mapping.data());
     const uint32_t height = surf.height;
     const uint32_t uv_height = height / 2;
 
@@ -1323,7 +1335,6 @@ static bool copySurfaceToImageBuffer(const DecodedSurface& surf,
                     uv_copy_row_bytes);
     }
 
-    munmap(src_ptr, src_plane_size);
     return true;
 }
 
@@ -1402,6 +1413,7 @@ static VAStatus vaCreateImage(VADriverContextP ctx,
     memset(image->va_reserved, 0, sizeof(image->va_reserved));
 
     {
+        std::lock_guard<std::mutex> lock(d->resource_mutex);
         DriverState::ImageState state;
         state.image = *image;
         state.derived_surface = VA_INVALID_ID;
@@ -1476,25 +1488,24 @@ static VAStatus vaDeriveImage(VADriverContextP ctx,
         destroyBuffer(d, buf_id);
         return VA_STATUS_ERROR_UNKNOWN;
     }
+    unique_fd exported_fd{src_desc.objects[0].fd};
 
     void* image_ptr = nullptr;
     if (vaMapBuffer(ctx, buf_id, &image_ptr) != VA_STATUS_SUCCESS) {
-        if (src_desc.objects[0].fd >= 0) close(src_desc.objects[0].fd);
         destroyBuffer(d, buf_id);
         return VA_STATUS_ERROR_UNKNOWN;
     }
 
     if (!copySurfaceToImageBuffer(surf, src_desc, image_ptr, *image)) {
         vaUnmapBuffer(ctx, buf_id);
-        if (src_desc.objects[0].fd >= 0) close(src_desc.objects[0].fd);
         destroyBuffer(d, buf_id);
         return VA_STATUS_ERROR_UNKNOWN;
     }
 
     vaUnmapBuffer(ctx, buf_id);
-    if (src_desc.objects[0].fd >= 0) close(src_desc.objects[0].fd);
 
     {
+        std::lock_guard<std::mutex> lock(d->resource_mutex);
         DriverState::ImageState state;
         state.image = *image;
         state.derived_surface = surface;
@@ -1509,9 +1520,11 @@ static VAStatus vaDestroyImage(VADriverContextP ctx,
     auto* d = toDriver(ctx);
     if (!d) return VA_STATUS_ERROR_INVALID_CONTEXT;
 
+    std::lock_guard<std::mutex> lock(d->resource_mutex);
     auto it = d->images.find(image);
     if (it == d->images.end()) return VA_STATUS_ERROR_INVALID_IMAGE;
 
+    d->buffers.erase(it->second.image.buf);
     d->images.erase(it);
     return VA_STATUS_SUCCESS;
 }
@@ -1553,8 +1566,17 @@ static VAStatus vaGetImage(VADriverContextP ctx,
     auto surf_it = d->surfaces.find(surface);
     if (surf_it == d->surfaces.end()) return VA_STATUS_ERROR_INVALID_SURFACE;
 
-    auto img_it = d->images.find(image);
-    if (img_it == d->images.end()) return VA_STATUS_ERROR_INVALID_IMAGE;
+    VAImage image_state = {};
+    void* img_buf = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(d->resource_mutex);
+        auto img_it = d->images.find(image);
+        if (img_it == d->images.end()) return VA_STATUS_ERROR_INVALID_IMAGE;
+        auto buffer_it = d->buffers.find(img_it->second.image.buf);
+        if (buffer_it == d->buffers.end()) return VA_STATUS_ERROR_INVALID_BUFFER;
+        image_state = img_it->second.image;
+        img_buf = buffer_it->second->map().data();
+    }
 
     static std::atomic<int> get_image_state_log_count{0};
     if (get_image_state_log_count.fetch_add(1, std::memory_order_relaxed) < 1) {
@@ -1562,16 +1584,16 @@ static VAStatus vaGetImage(VADriverContextP ctx,
         util::log(util::stderr_sink, util::LogLevel::Info,
                   "vaGetImage state: surface={} surf_w={} surf_h={} stride={} fd={} img_w={} img_h={} img_pitch={} img_uv_pitch={}",
                   surface, surf.width, surf.height, surf.stride, surf.dmabuf_fd,
-                  img_it->second.image.width, img_it->second.image.height,
-                  img_it->second.image.pitches[0], img_it->second.image.pitches[1]);
+                  image_state.width, image_state.height,
+                  image_state.pitches[0], image_state.pitches[1]);
     }
 
     const bool surf_is_10bit = surf_it->second->surface.is_10bit;
     const uint32_t expected_fourcc = surf_is_10bit ? VA_FOURCC_P010 : VA_FOURCC_NV12;
 
     // Enforce matching image format for the current surface bit depth.
-    if (img_it->second.image.format.fourcc != expected_fourcc ||
-        img_it->second.image.format.depth != 12) {
+    if (image_state.format.fourcc != expected_fourcc ||
+        image_state.format.depth != 12) {
         return VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT;
     }
 
@@ -1591,22 +1613,19 @@ static VAStatus vaGetImage(VADriverContextP ctx,
     max_w &= ~1u;
     max_h &= ~1u;
 
-    void* img_buf = nullptr;
     static std::atomic<int> get_image_mapbuf_log_count{0};
     if (get_image_mapbuf_log_count.fetch_add(1, std::memory_order_relaxed) < 1) {
         util::log(util::stderr_sink, util::LogLevel::Info,
-                  "vaGetImage: mapping image buffer={}", img_it->second.image.buf);
+                  "vaGetImage: mapping image buffer={}", image_state.buf);
     }
-    VAStatus st = vaMapBuffer(ctx, img_it->second.image.buf, &img_buf);
-    if (st != VA_STATUS_SUCCESS) return st;
     static std::atomic<int> get_image_mapbuf_done_log_count{0};
     if (get_image_mapbuf_done_log_count.fetch_add(1, std::memory_order_relaxed) < 1) {
         util::log(util::stderr_sink, util::LogLevel::Info,
-                  "vaGetImage: mapped image buffer={}", img_it->second.image.buf);
+                  "vaGetImage: mapped image buffer={}", image_state.buf);
     }
 
-    uint32_t img_pitch = img_it->second.image.pitches[0];
-    uint32_t img_uv_pitch = img_it->second.image.pitches[1];
+    uint32_t img_pitch = image_state.pitches[0];
+    uint32_t img_uv_pitch = image_state.pitches[1];
 
     // Map surface DMABUF and copy the requested region into the image buffer.
     uint32_t surf_pitch = surf.is_10bit ? surf.stride * 2 : surf.stride;
@@ -1618,9 +1637,8 @@ static VAStatus vaGetImage(VADriverContextP ctx,
         util::log(util::stderr_sink, util::LogLevel::Info,
                   "vaGetImage: mapping surface fd={} size={}", surf.dmabuf_fd, surf_total_size);
     }
-    void* surf_ptr = mapDmabuf(surf.dmabuf_fd, surf_total_size);
-    if (!surf_ptr) {
-        vaUnmapBuffer(ctx, img_it->second.image.buf);
+    auto surface_mapping = MappedDmabuf::map(surf.dmabuf_fd, surf_total_size, PROT_READ | PROT_WRITE);
+    if (!surface_mapping) {
         return VA_STATUS_ERROR_UNKNOWN;
     }
     static std::atomic<int> get_image_mapdmabuf_done_log_count{0};
@@ -1631,7 +1649,7 @@ static VAStatus vaGetImage(VADriverContextP ctx,
 
     // Copy Y plane
     uint8_t* dst_y = static_cast<uint8_t*>(img_buf);
-    uint8_t* src_y = static_cast<uint8_t*>(surf_ptr);
+    uint8_t* src_y = static_cast<uint8_t*>(surface_mapping.data());
     const uint32_t y_copy_bytes = max_w * (surf.is_10bit ? 2u : 1u);
     for (uint32_t row = 0; row < max_h; row++) {
         uint8_t* dst_row = dst_y + row * img_pitch;
@@ -1643,8 +1661,8 @@ static VAStatus vaGetImage(VADriverContextP ctx,
     uint32_t uv_height = (max_h + 1) / 2;
     uint32_t uv_x = x_coord & ~1u;
     uint32_t uv_w = surf.is_10bit ? max_w * 2 : ((max_w + 1) / 2 * 2);
-    uint8_t* dst_uv = static_cast<uint8_t*>(img_buf) + img_it->second.image.offsets[1];
-    uint8_t* src_uv = static_cast<uint8_t*>(surf_ptr) + surf_y_size;
+    uint8_t* dst_uv = static_cast<uint8_t*>(img_buf) + image_state.offsets[1];
+    uint8_t* src_uv = static_cast<uint8_t*>(surface_mapping.data()) + surf_y_size;
     for (uint32_t row = 0; row < uv_height; row++) {
         uint8_t* dst_row = dst_uv + row * img_uv_pitch;
         uint8_t* src_row = src_uv + ((static_cast<uint32_t>(y) / 2 + row) * surf_pitch) + uv_x;
@@ -1657,8 +1675,6 @@ static VAStatus vaGetImage(VADriverContextP ctx,
                   "vaGetImage: copy complete surface={} image={}", surface, image);
     }
 
-    unmapDmabuf(surf_ptr, surf_total_size);
-    vaUnmapBuffer(ctx, img_it->second.image.buf);
     return VA_STATUS_SUCCESS;
 }
 
@@ -1679,12 +1695,21 @@ static VAStatus vaPutImage(VADriverContextP ctx,
 
     auto surf_it = d->surfaces.find(surface);
     if (surf_it == d->surfaces.end()) return VA_STATUS_ERROR_INVALID_SURFACE;
-    auto img_it = d->images.find(image);
-    if (img_it == d->images.end()) return VA_STATUS_ERROR_INVALID_IMAGE;
+    VAImage image_state = {};
+    void* img_buf = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(d->resource_mutex);
+        auto img_it = d->images.find(image);
+        if (img_it == d->images.end()) return VA_STATUS_ERROR_INVALID_IMAGE;
+        auto buffer_it = d->buffers.find(img_it->second.image.buf);
+        if (buffer_it == d->buffers.end()) return VA_STATUS_ERROR_INVALID_BUFFER;
+        image_state = img_it->second.image;
+        img_buf = buffer_it->second->map().data();
+    }
 
     // Enforce NV12 images only.
-    if (img_it->second.image.format.fourcc != VA_FOURCC_NV12 ||
-        img_it->second.image.format.depth != 12) {
+    if (image_state.format.fourcc != VA_FOURCC_NV12 ||
+        image_state.format.depth != 12) {
         return VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT;
     }
 
@@ -1703,8 +1728,8 @@ static VAStatus vaPutImage(VADriverContextP ctx,
         return VA_STATUS_ERROR_INVALID_PARAMETER;
     }
 
-    uint32_t src_w = std::min<uint32_t>(srcw, img_it->second.image.width - src_x_coord);
-    uint32_t src_h = std::min<uint32_t>(srch, img_it->second.image.height - src_y_coord);
+    uint32_t src_w = std::min<uint32_t>(srcw, image_state.width - src_x_coord);
+    uint32_t src_h = std::min<uint32_t>(srch, image_state.height - src_y_coord);
     uint32_t dst_w = std::min<uint32_t>(destw, surf.width - dst_x_coord);
     uint32_t dst_h = std::min<uint32_t>(desth, surf.height - dst_y_coord);
 
@@ -1718,24 +1743,19 @@ static VAStatus vaPutImage(VADriverContextP ctx,
     uint32_t copy_h = std::min(src_h, dst_h);
     if (copy_w == 0 || copy_h == 0) return VA_STATUS_ERROR_INVALID_PARAMETER;
 
-    void* img_buf = nullptr;
-    VAStatus st = vaMapBuffer(ctx, img_it->second.image.buf, &img_buf);
-    if (st != VA_STATUS_SUCCESS) return st;
-
-    uint32_t img_pitch = img_it->second.image.pitches[0];
-    uint32_t img_uv_pitch = img_it->second.image.pitches[1];
+    uint32_t img_pitch = image_state.pitches[0];
+    uint32_t img_uv_pitch = image_state.pitches[1];
 
     uint32_t surf_pitch = surf.stride;
     uint32_t surf_y_size = surf_pitch * surf.height;
     uint32_t surf_total_size = surf_y_size + surf_pitch * ((surf.height + 1) / 2);
 
-    void* surf_ptr = mapDmabuf(surf.dmabuf_fd, surf_total_size);
-    if (!surf_ptr) {
-        vaUnmapBuffer(ctx, img_it->second.image.buf);
+    auto surface_mapping = MappedDmabuf::map(surf.dmabuf_fd, surf_total_size, PROT_READ | PROT_WRITE);
+    if (!surface_mapping) {
         return VA_STATUS_ERROR_UNKNOWN;
     }
 
-    uint8_t* dst_y = static_cast<uint8_t*>(surf_ptr);
+    uint8_t* dst_y = static_cast<uint8_t*>(surface_mapping.data());
     uint8_t* src_y = static_cast<uint8_t*>(img_buf);
     for (uint32_t row = 0; row < copy_h; row++) {
         uint8_t* dst_row = dst_y + (dst_y_coord + row) * surf_pitch + dst_x_coord;
@@ -1747,16 +1767,14 @@ static VAStatus vaPutImage(VADriverContextP ctx,
     uint32_t uv_src_x = (src_x_coord & ~1u);
     uint32_t uv_dst_x = (dst_x_coord & ~1u);
     uint32_t uv_w = (copy_w + 1) / 2 * 2;
-    uint8_t* dst_uv = static_cast<uint8_t*>(surf_ptr) + surf_y_size;
-    uint8_t* src_uv = static_cast<uint8_t*>(img_buf) + img_it->second.image.offsets[1];
+    uint8_t* dst_uv = static_cast<uint8_t*>(surface_mapping.data()) + surf_y_size;
+    uint8_t* src_uv = static_cast<uint8_t*>(img_buf) + image_state.offsets[1];
     for (uint32_t row = 0; row < uv_height; row++) {
         uint8_t* dst_row = dst_uv + ((dst_y_coord / 2 + row) * surf_pitch) + uv_dst_x;
         uint8_t* src_row = src_uv + ((src_y_coord / 2 + row) * img_uv_pitch) + uv_src_x;
         memcpy(dst_row, src_row, uv_w);
     }
 
-    unmapDmabuf(surf_ptr, surf_total_size);
-    vaUnmapBuffer(ctx, img_it->second.image.buf);
     return VA_STATUS_SUCCESS;
 }
 
@@ -2113,16 +2131,8 @@ static VAStatus vaTerminate(VADriverContextP ctx) {
         {
             std::lock_guard<std::mutex> lock(d->lock);
             for (auto& kv : d->surfaces) {
-                d->decoder.destroySurface(kv.first);
-                if (kv.second->surface.dmabuf_fd >= 0) {
-                    close(kv.second->surface.dmabuf_fd);
-                    kv.second->surface.dmabuf_fd = -1;
-                }
-                if (kv.second->buffer) {
-                    // Ensure any remaining MPP buffers are released.
-                    mpp_buffer_put(kv.second->buffer);
-                    kv.second->buffer = nullptr;
-                }
+                d->decoder->destroySurface(kv.first);
+                kv.second->set_dmabuf({});
             }
             d->surfaces.clear();
             for (auto& kv : d->images) {
@@ -2136,11 +2146,18 @@ static VAStatus vaTerminate(VADriverContextP ctx) {
         }
 
         // Stop any decoding activity after surface resources have been dropped.
-        d->decoder.shutdown();
+        d->decoder->shutdown();
 
-        // Destroy the driver state but do not free the memory; libva may manage it.
-        d->~DriverState();
+        delete d;
         ctx->pDriverData = nullptr;
+    }
+    if (ctx && ctx->vtable) {
+        free(ctx->vtable);
+        ctx->vtable = nullptr;
+    }
+    if (ctx && ctx->str_vendor) {
+        free(const_cast<char*>(ctx->str_vendor));
+        ctx->str_vendor = nullptr;
     }
     return VA_STATUS_SUCCESS;
 }
@@ -2220,12 +2237,13 @@ static VAStatus vaDriverInit(VADriverContextP ctx) {
         entries);
 
     ctx->vtable = vt;
-    void* data = malloc(sizeof(DriverState));
-    ctx->pDriverData = data;
-    if (data) {
-        auto* driver_state = new (data) DriverState();
-        driver_state->vtable = vt;
+    auto* driver_state = new (std::nothrow) DriverState();
+    if (!driver_state) {
+        free(vt);
+        return VA_STATUS_ERROR_ALLOCATION_FAILED;
     }
+    driver_state->vtable = vt;
+    ctx->pDriverData = driver_state;
 
     // Pretend to be VA-API 1.2+ to satisfy modern clients.
     ctx->version_major = 1;

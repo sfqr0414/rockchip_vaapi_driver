@@ -1,252 +1,48 @@
 #include "mpp_decoder.h"
 
 #include <chrono>
-#include <fcntl.h>
-#include <cstring>
-#include <cerrno>
-#include <sys/mman.h>
-#include <sys/syscall.h>
-#include <unistd.h>
-#include <sys/stat.h>
+
 #include <mutex>
 #include <thread>
-#include <vector>
-#include <cassert>
 
 #include <rockchip/mpp_log.h>
 
 namespace rockchip {
 
-static constexpr bool kAv1ExportAsP010 = false;
-
-static MppCodingType codecProfileToMpp(CodecProfile profile) {
-    switch (profile) {
-        case CodecProfile::H264: return MPP_VIDEO_CodingAVC;
-        case CodecProfile::HEVC: return MPP_VIDEO_CodingHEVC;
-        case CodecProfile::VP9: return MPP_VIDEO_CodingVP9;
-        case CodecProfile::AV1: return MPP_VIDEO_CodingAV1;
-        default: return MPP_VIDEO_CodingUnused;
+MppDecoder::MppDecoder() {
+    mpp_set_log_level(MPP_LOG_ERROR);
+    if (mpp_create(&ctx_, &api_) != MPP_OK) {
+        ctx_ = nullptr;
+        api_ = nullptr;
     }
 }
 
-static uint32_t alignUp(uint32_t value, uint32_t align) {
-    return (value + align - 1) / align * align;
+MppDecoder::~MppDecoder() {
+    shutdown();
+    if (ctx_) {
+        mpp_destroy(ctx_);
+        ctx_ = nullptr;
+    }
+    api_ = nullptr;
 }
-
-static uint64_t steadyMicrosNow() {
-    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
-        std::chrono::steady_clock::now().time_since_epoch()).count());
-}
-
-static constexpr uint64_t kDecoderFlushIdleMicros = 2'000'000ULL;
-static constexpr size_t kMaxInFlightJobs = 16;
-
-static size_t surfaceBufferSize(uint32_t width, uint32_t height, uint32_t stride, bool is_10bit) {
-    if (!is_10bit) {
-        return static_cast<size_t>(stride) * static_cast<size_t>(height) * 3 / 2;
-    }
-
-    return static_cast<size_t>(stride) * static_cast<size_t>(alignUp(height, 8)) * 3;
-}
-
-static void* mapBufferFd(int fd, size_t size) {
-    if (fd < 0 || size == 0) return nullptr;
-    return mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-}
-
-static void unmapBufferFd(void* ptr, size_t size) {
-    if (ptr && size > 0) munmap(ptr, size);
-}
-
-static bool submitDecoderEos(MppCtx ctx, MppApi* api, const std::atomic<bool>& running) {
-    if (!ctx || !api) return false;
-
-    MppPacket eos_pkt = nullptr;
-    if (mpp_packet_init(&eos_pkt, nullptr, 0) != MPP_OK || !eos_pkt) {
-        return false;
-    }
-
-    mpp_packet_set_eos(eos_pkt);
-    bool submitted = false;
-    for (int i = 0; i < 200 && running.load(std::memory_order_relaxed); ++i) {
-        int ret = api->decode_put_packet(ctx, eos_pkt);
-        if (ret == MPP_OK) {
-            submitted = true;
-            break;
-        }
-        if (ret == MPP_ERR_BUFFER_FULL) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(2));
-            continue;
-        }
-        break;
-    }
-
-    mpp_packet_deinit(&eos_pkt);
-    return submitted;
-}
-
-static bool readExact(FILE* fp, uint8_t* data, size_t size) {
-    size_t offset = 0;
-    while (offset < size) {
-        size_t bytes = fread(data + offset, 1, size - offset, fp);
-        if (bytes == 0) return false;
-        offset += bytes;
-    }
-    return true;
-}
-
-static void unpackPacked10RowLE(const uint8_t* src,
-                                size_t src_bytes,
-                                uint16_t* dst,
-                                size_t sample_count) {
-    for (size_t sample = 0; sample < sample_count; ++sample) {
-        const size_t src_index = (sample * 10) / 8;
-        const uint8_t bit_offset = static_cast<uint8_t>((sample * 2) & 7u);
-        if (src_index + 1 >= src_bytes) {
-            dst[sample] = 0;
-            continue;
-        }
-
-        const uint16_t packed = static_cast<uint16_t>((src[src_index] >> bit_offset) |
-                                                       (src[src_index + 1] << (8 - bit_offset)));
-        const uint16_t value8 = static_cast<uint16_t>((packed & 0x03FFu) >> 2);
-        dst[sample] = static_cast<uint16_t>(value8 << 8);
-    }
-}
-
-static bool writeSurfaceP010(int fd,
-                             uint32_t width,
-                             uint32_t height,
-                             uint32_t dst_stride,
-                             uint32_t src_stride_bytes,
-                             uint32_t src_ver_stride,
-                             const uint8_t* src,
-                             size_t src_size) {
-    const size_t src_row_bytes = static_cast<size_t>(src_stride_bytes);
-    const size_t packed_row_bytes = ((static_cast<size_t>(width) + 3) / 4) * 5;
-    if (src_size < src_row_bytes * static_cast<size_t>(src_ver_stride)) return false;
-
-    const size_t dst_row_bytes = static_cast<size_t>(dst_stride) * 2;
-    const size_t aligned_h = ((height + 7) / 8) * 8;
-    const size_t dst_size = dst_row_bytes * aligned_h * 3 / 2;
-    std::vector<uint8_t> dst(dst_size, 0);
-
-    const uint8_t* src_y = src;
-    const uint8_t* src_uv = src + src_row_bytes * src_ver_stride;
-    uint8_t* dst_y = dst.data();
-    uint8_t* dst_uv = dst.data() + dst_row_bytes * aligned_h;
-
-    for (uint32_t row = 0; row < height; ++row) {
-        auto* dst_row = reinterpret_cast<uint16_t*>(dst_y + static_cast<size_t>(row) * dst_row_bytes);
-        const uint8_t* src_row = src_y + static_cast<size_t>(row) * src_row_bytes;
-        unpackPacked10RowLE(src_row, std::min(src_row_bytes, packed_row_bytes), dst_row, width);
-    }
-
-    for (uint32_t row = 0; row < height / 2; ++row) {
-        auto* dst_row = reinterpret_cast<uint16_t*>(dst_uv + static_cast<size_t>(row) * dst_row_bytes);
-        const uint8_t* src_row = src_uv + static_cast<size_t>(row) * src_row_bytes;
-        unpackPacked10RowLE(src_row, std::min(src_row_bytes, packed_row_bytes), dst_row, width);
-    }
-
-    return pwrite(fd, dst.data(), dst.size(), 0) == static_cast<ssize_t>(dst.size());
-}
-
-static bool writeSurfaceNV12(int fd,
-                             uint32_t width,
-                             uint32_t height,
-                             uint32_t dst_stride,
-                             uint32_t src_stride_bytes,
-                             uint32_t src_ver_stride,
-                             const uint8_t* src,
-                             size_t src_size) {
-    const size_t src_row_bytes = static_cast<size_t>(src_stride_bytes);
-    const size_t expected_size = src_row_bytes * static_cast<size_t>(src_ver_stride) * 3 / 2;
-    if (src_size < expected_size) return false;
-
-    const size_t dst_row_bytes = static_cast<size_t>(dst_stride);
-    const size_t copy_row_bytes = static_cast<size_t>(width);
-    const size_t aligned_h = height;
-    const size_t dst_size = dst_row_bytes * aligned_h * 3 / 2;
-    std::vector<uint8_t> dst(dst_size, 0);
-
-    const uint8_t* src_y = src;
-    const uint8_t* src_uv = src + src_row_bytes * src_ver_stride;
-    uint8_t* dst_y = dst.data();
-    uint8_t* dst_uv = dst.data() + dst_row_bytes * aligned_h;
-
-    for (uint32_t row = 0; row < height; ++row) {
-        std::memcpy(dst_y + static_cast<size_t>(row) * dst_row_bytes,
-                    src_y + static_cast<size_t>(row) * src_row_bytes,
-                    copy_row_bytes);
-    }
-
-    for (uint32_t row = 0; row < height / 2; ++row) {
-        std::memcpy(dst_uv + static_cast<size_t>(row) * dst_row_bytes,
-                    src_uv + static_cast<size_t>(row) * src_row_bytes,
-                    copy_row_bytes);
-    }
-
-    return pwrite(fd, dst.data(), dst.size(), 0) == static_cast<ssize_t>(dst.size());
-}
-
-static int createFallbackSurfaceFd(uint32_t width, uint32_t height, bool is_10bit) {
-    uint64_t total_size = 0;
-    uint32_t stride = ((width + 63) / 64) * 64;
-    if (!is_10bit) {
-        total_size = static_cast<uint64_t>(stride) * height * 3 / 2;
-    } else {
-        uint32_t aligned_h = ((height + 7) / 8) * 8;
-        total_size = static_cast<uint64_t>(stride) * aligned_h * 3;
-    }
-
-    char path_template[] = "/tmp/rockchip-vaapi-XXXXXX";
-    int fd = mkstemp(path_template);
-    if (fd < 0) {
-        util::log(util::stderr_sink, util::LogLevel::Error,
-                  "mpp: createFallbackSurfaceFd mkstemp failed errno={} ({})", errno, std::strerror(errno));
-        return -1;
-    }
-    unlink(path_template);
-    if (ftruncate(fd, static_cast<off_t>(total_size)) != 0) {
-        util::log(util::stderr_sink, util::LogLevel::Error,
-                  "mpp: createFallbackSurfaceFd ftruncate failed errno={} ({})", errno, std::strerror(errno));
-        close(fd);
-        return -1;
-    }
-
-    void* ptr = mmap(nullptr, static_cast<size_t>(total_size), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if (ptr != MAP_FAILED) {
-        memset(ptr, 0, static_cast<size_t>(total_size));
-        munmap(ptr, static_cast<size_t>(total_size));
-    }
-
-    return fd;
-}
-
-MppDecoder::MppDecoder() = default;
-MppDecoder::~MppDecoder() { shutdown(); }
 
 bool MppDecoder::initialize(CodecProfile profile, int width, int height) {
     profile_ = profile;
-    if (ctx_ && api_) return true;
+    if (!ctx_ || !api_) return false;
+    if (session_initialized_) return true;
 
-    mpp_set_log_level(MPP_LOG_ERROR);
-
-    if (mpp_create(&ctx_, &api_) != MPP_OK) return false;
     if (mpp_init(ctx_, MPP_CTX_DEC, codecProfileToMpp(profile_)) != MPP_OK) {
-        mpp_destroy(ctx_);
-        ctx_ = nullptr;
         return false;
     }
 
     MppFrameFormat output_format = MPP_FMT_YUV420SP;
     api_->control(ctx_, MPP_DEC_SET_OUTPUT_FORMAT, &output_format);
 
-    MppDecCfg cfg = nullptr;
-    if (mpp_dec_cfg_init(&cfg) == MPP_OK && cfg) {
-        mpp_dec_cfg_set_u32(cfg, "base:split_parse", 1);
-        api_->control(ctx_, MPP_DEC_SET_CFG, cfg);
-        mpp_dec_cfg_deinit(cfg);
+    MppDecCfg raw_cfg = nullptr;
+    if (mpp_dec_cfg_init(&raw_cfg) == MPP_OK && raw_cfg) {
+        MppDecCfgHandle cfg{raw_cfg};
+        mpp_dec_cfg_set_u32(cfg.get(), "base:split_parse", 1);
+        api_->control(ctx_, MPP_DEC_SET_CFG, cfg.get());
     }
 
     uint32_t split_parse = 1;
@@ -254,6 +50,7 @@ bool MppDecoder::initialize(CodecProfile profile, int width, int height) {
 
     MppPollType nonblock = MPP_POLL_NON_BLOCK;
     api_->control(ctx_, MPP_SET_OUTPUT_TIMEOUT, &nonblock);
+    session_initialized_ = true;
     return true;
 }
 
@@ -271,43 +68,45 @@ bool MppDecoder::allocateSurface(VASurfaceID id, DecodedSurface& out, int width,
     ds.height = static_cast<uint32_t>(height);
     ds.stride = stride;
     ds.is_10bit = (profile_ == CodecProfile::AV1) && kAv1ExportAsP010;
-    ds.dmabuf_fd = createFallbackSurfaceFd(ds.width, ds.height, ds.is_10bit);
-    if (ds.dmabuf_fd < 0) {
+    auto dmabuf = createFallbackSurfaceFd(ds.width, ds.height, ds.is_10bit);
+    if (!dmabuf) {
         return false;
     }
+    ds.dmabuf_fd = dmabuf.value().get();
 
-    MppBuffer buffer = nullptr;
     MppBufferInfo buffer_info = {};
     buffer_info.type = MPP_BUFFER_TYPE_ION;
     buffer_info.fd = ds.dmabuf_fd;
     buffer_info.size = surfaceBufferSize(ds.width, ds.height, ds.stride, ds.is_10bit);
-    if (mpp_buffer_import(&buffer, &buffer_info) != MPP_OK || !buffer) {
-        close(ds.dmabuf_fd);
+    MppBuffer raw_buffer = nullptr;
+    if (mpp_buffer_import(&raw_buffer, &buffer_info) != MPP_OK || !raw_buffer) {
         return false;
     }
+    MppBufferHandle buffer{raw_buffer};
 
-    MppFrame frame = nullptr;
-    if (mpp_frame_init(&frame) != MPP_OK || !frame) {
-        mpp_buffer_put(buffer);
-        close(ds.dmabuf_fd);
+    MppFrame raw_frame = nullptr;
+    if (mpp_frame_init(&raw_frame) != MPP_OK || !raw_frame) {
         return false;
     }
+    MppFrameHandle frame{raw_frame};
 
-    mpp_frame_set_width(frame, ds.width);
-    mpp_frame_set_height(frame, ds.height);
-    mpp_frame_set_hor_stride(frame, ds.stride);
-    mpp_frame_set_ver_stride(frame, ds.is_10bit ? alignUp(ds.height, 8) : ds.height);
-    mpp_frame_set_fmt(frame, ds.is_10bit ? MPP_FMT_YUV420SP_10BIT : MPP_FMT_YUV420SP);
-    mpp_frame_set_buffer(frame, buffer);
+    mpp_frame_set_width(frame.get(), ds.width);
+    mpp_frame_set_height(frame.get(), ds.height);
+    mpp_frame_set_hor_stride(frame.get(), ds.stride);
+    mpp_frame_set_ver_stride(frame.get(), ds.is_10bit ? alignUp(ds.height, 8) : ds.height);
+    mpp_frame_set_fmt(frame.get(), ds.is_10bit ? MPP_FMT_YUV420SP_10BIT : MPP_FMT_YUV420SP);
+    mpp_frame_set_buffer(frame.get(), buffer.get());
 
     std::lock_guard<std::mutex> lock(surface_mutex_);
     auto& entry = surfaces_[id];
     entry.surface = ds;
-    entry.buffer = buffer;
-    entry.frame = frame;
+    entry.dmabuf = std::move(dmabuf.value());
+    entry.surface.dmabuf_fd = entry.dmabuf.get();
+    entry.buffer = std::move(buffer);
+    entry.frame = std::move(frame);
     entry.ready.store(true);
     entry.failed.store(false);
-    out = ds;
+    out = entry.surface;
     return true;
 }
 
@@ -321,10 +120,10 @@ bool MppDecoder::updateSurfaceResolution(VASurfaceID id, int width, int height) 
     it->second.surface.height = static_cast<uint32_t>(height);
     it->second.surface.stride = stride;
     if (it->second.frame) {
-        mpp_frame_set_width(it->second.frame, static_cast<uint32_t>(width));
-        mpp_frame_set_height(it->second.frame, static_cast<uint32_t>(height));
-        mpp_frame_set_hor_stride(it->second.frame, stride);
-        mpp_frame_set_ver_stride(it->second.frame,
+        mpp_frame_set_width(it->second.frame.get(), static_cast<uint32_t>(width));
+        mpp_frame_set_height(it->second.frame.get(), static_cast<uint32_t>(height));
+        mpp_frame_set_hor_stride(it->second.frame.get(), stride);
+        mpp_frame_set_ver_stride(it->second.frame.get(),
                                  it->second.surface.is_10bit ? alignUp(static_cast<uint32_t>(height), 8)
                                                              : static_cast<uint32_t>(height));
     }
@@ -338,7 +137,7 @@ bool MppDecoder::getSurfaceInfo(VASurfaceID id, uint32_t& width, uint32_t& heigh
     width = it->second.surface.width;
     height = it->second.surface.height;
     stride = it->second.surface.stride;
-    dmabuf_fd = it->second.surface.dmabuf_fd;
+    dmabuf_fd = it->second.dmabuf.get();
     failed = it->second.failed.load();
     return true;
 }
@@ -472,11 +271,10 @@ bool MppDecoder::waitSurfaceReady(VASurfaceID surface, uint32_t timeout_ms) {
     }
 
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
-    while (!ready_flag->load(std::memory_order_acquire) &&
-           !failed_flag->load(std::memory_order_acquire) &&
-           std::chrono::steady_clock::now() < deadline) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
+    std::unique_lock<std::mutex> lock(cv_mutex_);
+    cv_.wait_until(lock, deadline, [&] {
+        return ready_flag->load(std::memory_order_acquire) || failed_flag->load(std::memory_order_acquire);
+    });
 
     const bool failed = failed_flag->load(std::memory_order_acquire);
     const bool ready = ready_flag->load(std::memory_order_acquire);
@@ -515,10 +313,8 @@ void MppDecoder::releaseSurface(VASurfaceID surface) {
     auto it = surfaces_.find(surface);
     if (it == surfaces_.end()) return;
 
-    if (it->second.surface.dmabuf_fd >= 0) {
-        close(it->second.surface.dmabuf_fd);
-        it->second.surface.dmabuf_fd = -1;
-    }
+    it->second.dmabuf.reset();
+    it->second.surface.dmabuf_fd = -1;
 
     it->second.ready.store(false);
     it->second.failed.store(false);
@@ -529,19 +325,10 @@ void MppDecoder::destroySurface(VASurfaceID surface) {
         std::lock_guard<std::mutex> lock(surface_mutex_);
         auto it = surfaces_.find(surface);
         if (it != surfaces_.end()) {
-            if (it->second.frame) {
-                mpp_frame_deinit(&it->second.frame);
-                it->second.frame = nullptr;
-            }
-            if (it->second.buffer) {
-                mpp_buffer_put(it->second.buffer);
-                it->second.buffer = nullptr;
-            }
-
-            if (it->second.surface.dmabuf_fd >= 0) {
-                close(it->second.surface.dmabuf_fd);
-                it->second.surface.dmabuf_fd = -1;
-            }
+            it->second.frame.reset();
+            it->second.buffer.reset();
+            it->second.dmabuf.reset();
+            it->second.surface.dmabuf_fd = -1;
 
             surfaces_.erase(it);
         }
@@ -574,7 +361,9 @@ void MppDecoder::shutdown() {
 
     if (input_thread_.joinable()) {
         input_thread_.request_stop();
-        util::log(util::stderr_sink, util::LogLevel::Info, "joining input thread"); input_thread_.join(); util::log(util::stderr_sink, util::LogLevel::Info, "joined input thread");
+        util::log(util::stderr_sink, util::LogLevel::Info, "joining input thread");
+        input_thread_.join();
+        util::log(util::stderr_sink, util::LogLevel::Info, "joined input thread");
     }
 
     // Give the output thread a short window to drain any in-flight frames and
@@ -591,24 +380,18 @@ void MppDecoder::shutdown() {
 
     if (output_thread_.joinable()) {
         output_thread_.request_stop();
-        util::log(util::stderr_sink, util::LogLevel::Info, "joining output thread"); output_thread_.join(); util::log(util::stderr_sink, util::LogLevel::Info, "joined output thread");
+        util::log(util::stderr_sink, util::LogLevel::Info, "joining output thread");
+        output_thread_.join();
+        util::log(util::stderr_sink, util::LogLevel::Info, "joined output thread");
     }
 
     {
         std::lock_guard<std::mutex> lock(surface_mutex_);
         for (auto& kv : surfaces_) {
-            if (kv.second.frame) {
-                mpp_frame_deinit(&kv.second.frame);
-                kv.second.frame = nullptr;
-            }
-            if (kv.second.buffer) {
-                mpp_buffer_put(kv.second.buffer);
-                kv.second.buffer = nullptr;
-            }
-            if (kv.second.surface.dmabuf_fd >= 0) {
-                close(kv.second.surface.dmabuf_fd);
-                kv.second.surface.dmabuf_fd = -1;
-            }
+            kv.second.frame.reset();
+            kv.second.buffer.reset();
+            kv.second.dmabuf.reset();
+            kv.second.surface.dmabuf_fd = -1;
         }
         surfaces_.clear();
     }
@@ -621,11 +404,7 @@ void MppDecoder::shutdown() {
         pending_cv_.notify_all();
     }
 
-    if (ctx_) {
-        mpp_destroy(ctx_);
-        ctx_ = nullptr;
-    }
-
+    session_initialized_ = false;
 }
 
 void MppDecoder::inputThreadMain(std::stop_token st) {
@@ -667,36 +446,37 @@ void MppDecoder::inputThreadMain(std::stop_token st) {
 
         if (payload_size == 0) continue;
 
-        MppPacket pkt = nullptr;
-        if (mpp_packet_init(&pkt, const_cast<uint8_t*>(payload_ptr), payload_size) != MPP_OK) {
+        MppPacket raw_packet = nullptr;
+        if (mpp_packet_init(&raw_packet, const_cast<uint8_t*>(payload_ptr), payload_size) != MPP_OK) {
             continue;
         }
+        MppPacketHandle packet{raw_packet};
 
         if (job.target_surface != VA_INVALID_ID) {
             std::lock_guard<std::mutex> lock(surface_mutex_);
             auto surface_it = surfaces_.find(job.target_surface);
             if (surface_it != surfaces_.end() && surface_it->second.frame) {
-                mpp_frame_set_width(surface_it->second.frame, surface_it->second.surface.width);
-                mpp_frame_set_height(surface_it->second.frame, surface_it->second.surface.height);
-                mpp_frame_set_hor_stride(surface_it->second.frame, surface_it->second.surface.stride);
-                mpp_frame_set_ver_stride(surface_it->second.frame,
+                mpp_frame_set_width(surface_it->second.frame.get(), surface_it->second.surface.width);
+                mpp_frame_set_height(surface_it->second.frame.get(), surface_it->second.surface.height);
+                mpp_frame_set_hor_stride(surface_it->second.frame.get(), surface_it->second.surface.stride);
+                mpp_frame_set_ver_stride(surface_it->second.frame.get(),
                                          surface_it->second.surface.is_10bit ? alignUp(surface_it->second.surface.height, 8)
                                                                            : surface_it->second.surface.height);
 
-                MppMeta meta = mpp_packet_get_meta(pkt);
+                MppMeta meta = mpp_packet_get_meta(packet.get());
                 if (meta) {
-                    mpp_meta_set_frame(meta, KEY_OUTPUT_FRAME, surface_it->second.frame);
+                    mpp_meta_set_frame(meta, KEY_OUTPUT_FRAME, surface_it->second.frame.get());
                 }
             }
         }
 
         if (job.job_id > 0) {
-            mpp_packet_set_pts(pkt, static_cast<RK_S64>(job.job_id));
-            mpp_packet_set_dts(pkt, static_cast<RK_S64>(job.job_id));
+            mpp_packet_set_pts(packet.get(), static_cast<RK_S64>(job.job_id));
+            mpp_packet_set_dts(packet.get(), static_cast<RK_S64>(job.job_id));
         }
 
         while (running_) {
-            int ret = api_->decode_put_packet(ctx_, pkt);
+            int ret = api_->decode_put_packet(ctx_, packet.get());
             if (ret == MPP_OK) break;
             if (ret == MPP_ERR_BUFFER_FULL) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(2));
@@ -711,8 +491,6 @@ void MppDecoder::inputThreadMain(std::stop_token st) {
             std::lock_guard<std::mutex> lock(pending_mutex_);
             pending_payloads_.push_back(std::make_shared<std::vector<uint8_t>>(std::move(payload)));
         }
-
-        mpp_packet_deinit(&pkt);
 
         static std::atomic<int> input_log_count{0};
         if (input_log_count.fetch_add(1, std::memory_order_relaxed) < 5) {
@@ -752,7 +530,7 @@ void MppDecoder::outputThreadMain(std::stop_token st) {
 
         if (get_log_count.load(std::memory_order_relaxed) <= 5) {
             util::log(util::stderr_sink, util::LogLevel::Info,
-                      "mpp: outputThread decode_get_frame ret={} frame={}", ret, (void*)frame);
+                      "mpp: outputThread decode_get_frame ret={} frame={}", ret, static_cast<const void*>(frame));
         }
 
         if (ret == MPP_ERR_DISPLAY_FULL) {
@@ -798,6 +576,7 @@ void MppDecoder::outputThreadMain(std::stop_token st) {
         if (ret != MPP_OK || !frame) {
             continue;
         }
+        MppFrameHandle frame_handle{frame};
 
         static std::atomic<int> output_log_count{0};
         if (output_log_count.fetch_add(1, std::memory_order_relaxed) < 5) {
@@ -818,7 +597,6 @@ void MppDecoder::outputThreadMain(std::stop_token st) {
                 item.second.surface.height = new_h;
             }
             api_->control(ctx_, MPP_DEC_SET_INFO_CHANGE_READY, nullptr);
-            mpp_frame_deinit(&frame);
             continue;
         }
 
@@ -831,7 +609,7 @@ void MppDecoder::outputThreadMain(std::stop_token st) {
         if (frame_fd >= 0) {
             std::lock_guard<std::mutex> surface_lock(surface_mutex_);
             for (const auto& item : surfaces_) {
-                if (item.second.buffer && mpp_buffer_get_fd(item.second.buffer) == frame_fd) {
+                if (item.second.buffer && mpp_buffer_get_fd(item.second.buffer.get()) == frame_fd) {
                     surface_id = item.first;
                     break;
                 }
@@ -884,12 +662,11 @@ void MppDecoder::outputThreadMain(std::stop_token st) {
                     if (!src_ptr) {
                         int src_fd = mpp_buffer_get_fd(mpp_buf);
                         if (src_fd >= 0 && src_size > 0) {
-                            void* mapped = mapBufferFd(src_fd, src_size);
+                            auto mapped = MappedRegion::map(src_fd, src_size, PROT_READ | PROT_WRITE);
                             if (mapped) {
-                                src_ptr = static_cast<const uint8_t*>(mapped);
+                                src_ptr = static_cast<const uint8_t*>(mapped.data());
                                 mapped_copy.assign(src_size, 0);
                                 std::memcpy(mapped_copy.data(), src_ptr, src_size);
-                                unmapBufferFd(mapped, src_size);
                                 src_ptr = mapped_copy.data();
                             }
                         }
@@ -897,23 +674,21 @@ void MppDecoder::outputThreadMain(std::stop_token st) {
 
                     if (src_ptr) {
                         if (it->second.surface.is_10bit) {
-                            copy_ok = writeSurfaceP010(it->second.surface.dmabuf_fd,
+                            copy_ok = writeSurfaceP010(it->second.dmabuf.get(),
                                                        output_width,
                                                        output_height,
                                                        dst_stride,
                                                        src_stride_bytes,
                                                        src_ver_stride,
-                                                       src_ptr,
-                                                       src_size);
+                                                       std::span<const uint8_t>(src_ptr, src_size));
                         } else {
-                            copy_ok = writeSurfaceNV12(it->second.surface.dmabuf_fd,
+                            copy_ok = writeSurfaceNV12(it->second.dmabuf.get(),
                                                        output_width,
                                                        output_height,
                                                        dst_stride,
                                                        src_stride_bytes,
                                                        src_ver_stride,
-                                                       src_ptr,
-                                                       src_size);
+                                                       std::span<const uint8_t>(src_ptr, src_size));
                         }
                     }
                 }
@@ -957,16 +732,7 @@ void MppDecoder::outputThreadMain(std::stop_token st) {
         if (is_eos_frame) {
             eos_seen_ = true;
         }
-
-        mpp_frame_deinit(&frame);
     }
-}
-
-CodecProfile vaProfileToCodec(VAProfile profile) {
-    if (profile == VAProfileH264High) return CodecProfile::H264;
-    if (profile == VAProfileHEVCMain) return CodecProfile::HEVC;
-    if (profile == VAProfileAV1Profile0) return CodecProfile::AV1;
-    return CodecProfile::Unknown;
 }
 
 } // namespace rockchip
