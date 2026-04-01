@@ -1419,20 +1419,9 @@ inline std::vector<std::uint8_t> build_av1_frame_obu(const VADecPictureParameter
     const bool is_switch_frame = (pic.pic_info_fields.bits.frame_type & 0x3u) == 3;
     const bool is_key_show_frame = (pic.pic_info_fields.bits.frame_type & 0x3u) == 0 && show_frame;
 
-    std::uint8_t y_restoration_type = pic.loop_restoration_fields.bits.yframe_restoration_type & 0x3u;
-    std::uint8_t u_restoration_type = pic.loop_restoration_fields.bits.cbframe_restoration_type & 0x3u;
-    std::uint8_t v_restoration_type = pic.loop_restoration_fields.bits.crframe_restoration_type & 0x3u;
-    const bool likely_no_restoration = !frame_is_intra &&
-                                       pic.filter_level[0] == 0 &&
-                                       pic.filter_level[1] == 0 &&
-                                       pic.filter_level_u == 0 &&
-                                       pic.filter_level_v == 0 &&
-                                       pic.cdef_bits == 0;
-    if (likely_no_restoration) {
-        y_restoration_type = 0;
-        u_restoration_type = 0;
-        v_restoration_type = 0;
-    }
+    const std::uint8_t y_restoration_type = pic.loop_restoration_fields.bits.yframe_restoration_type & 0x3u;
+    const std::uint8_t u_restoration_type = pic.loop_restoration_fields.bits.cbframe_restoration_type & 0x3u;
+    const std::uint8_t v_restoration_type = pic.loop_restoration_fields.bits.crframe_restoration_type & 0x3u;
 
     syntax::Av1FrameHeaderSyntax syntax{};
     syntax.frame_type = pic.pic_info_fields.bits.frame_type & 0x3u;
