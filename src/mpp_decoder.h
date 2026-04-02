@@ -46,7 +46,7 @@ class MppDecoder {
     MppDecoder();
     ~MppDecoder();
 
-    bool initialize(CodecProfile profile, int width, int height);
+    bool initialize(CodecProfile profile, int width, int height, int drm_fd);
     bool isInitialized() const;
     bool enqueueJob(DecodeJob job);
 
@@ -65,12 +65,12 @@ class MppDecoder {
     void inputThreadMain(std::stop_token st);
     void outputThreadMain(std::stop_token st);
     void setSurfaceState(VASurfaceID surface, bool ready, bool failed);
+    std::vector<VASurfaceID> failPendingSurfaces(VASurfaceID preferred_surface = VA_INVALID_ID);
     bool dropPendingSurfaceLocked(VASurfaceID surface);
     VASurfaceID dropOldestPendingSurfaceLocked();
 
     CodecProfile profile_{CodecProfile::Unknown};
-    MppCtx ctx_ = nullptr;
-    MppApi* api_ = nullptr;
+    std::shared_ptr<MppSession> session_;
     bool session_initialized_ = false;
     MppBufferGroup group_ = nullptr;
     util::AtomicSyncQueue<DecodeJob, 16> input_queue_;
@@ -94,6 +94,7 @@ class MppDecoder {
     std::mutex surface_mutex_;
     std::mutex pending_mutex_;
     std::condition_variable_any pending_cv_;
+    std::mutex init_mutex_;
 
     std::mutex cv_mutex_;
     std::condition_variable_any cv_;

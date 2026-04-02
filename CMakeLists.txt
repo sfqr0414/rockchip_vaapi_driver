@@ -9,6 +9,7 @@ find_package(PkgConfig REQUIRED)
 
 pkg_check_modules(LIBVA REQUIRED libva)
 pkg_check_modules(LIBVA_DRM REQUIRED libva-drm)
+pkg_check_modules(LIBDRM REQUIRED libdrm)
 
 # Ensure we build shared library for the VAAPI driver
 add_library(rockchip_drv_video SHARED
@@ -39,6 +40,7 @@ target_include_directories(test_mpp_decode PRIVATE
 target_include_directories(vaapi_decode_test PRIVATE
     ${LIBVA_INCLUDE_DIRS}
     ${LIBVA_DRM_INCLUDE_DIRS}
+    ${LIBDRM_INCLUDE_DIRS}
     src
 )
 
@@ -55,6 +57,7 @@ find_package(PkgConfig REQUIRED)
 
 pkg_check_modules(LIBVA REQUIRED libva)
 pkg_check_modules(LIBVA_DRM REQUIRED libva-drm)
+pkg_check_modules(LIBDRM REQUIRED libdrm)
 
 # Prefer installed rockchip-mpp (RK3588) if available.
 find_library(ROCKCHIP_MPP_LIB NAMES rockchip_mpp)
@@ -74,12 +77,14 @@ endif()
 target_include_directories(rockchip_drv_video PRIVATE
     ${MPP_INCLUDE_DIR}
     ${LIBVA_INCLUDE_DIRS}
+    ${LIBDRM_INCLUDE_DIRS}
     ${CMAKE_SOURCE_DIR}
     src
 )
 
 target_link_libraries(rockchip_drv_video PRIVATE
     ${LIBVA_LIBRARIES}
+    ${LIBDRM_LIBRARIES}
     dl
     pthread
 )

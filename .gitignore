@@ -8,4 +8,5 @@ output/
 
 .vscode/
 
+tools/firefox_headless_video_test.html
 mesa_ref

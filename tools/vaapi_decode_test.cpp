@@ -188,8 +188,10 @@ int main(int argc, char** argv) {
     else if (codec_cat == "av1")
         profile = VAProfileAV1Profile0;
 
-    const char* drm_path = "/dev/dri/renderD128";
-    int drm_fd = open(drm_path, O_RDWR);
+    const char* drm_path_env = std::getenv("LIBVA_DRM_DEVICE");
+    const std::filesystem::path default_drm_path = std::filesystem::path("/dev") / "dri" / "renderD128";
+    const std::string drm_path = drm_path_env ? drm_path_env : default_drm_path.string();
+    int drm_fd = open(drm_path.c_str(), O_RDWR);
     if (drm_fd < 0) {
         util::console(std::cerr, "Failed to open DRM device {}: {}\n", drm_path, strerror(errno));
         return 1;

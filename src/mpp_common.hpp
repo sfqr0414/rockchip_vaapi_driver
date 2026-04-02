@@ -17,6 +17,7 @@
 #include <span>
 #include <thread>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include <sys/mman.h>
@@ -59,6 +60,72 @@ class unique_fd {
 
    private:
     int fd_ = -1;
+};
+
+template <typename T, typename E>
+class Expected {
+   public:
+    Expected(T value) : storage_(std::move(value)) {}
+    Expected(E error) : storage_(error) {}
+
+    [[nodiscard]] bool has_value() const noexcept { return std::holds_alternative<T>(storage_); }
+    [[nodiscard]] explicit operator bool() const noexcept { return has_value(); }
+    [[nodiscard]] T& value() { return std::get<T>(storage_); }
+    [[nodiscard]] const T& value() const { return std::get<T>(storage_); }
+    [[nodiscard]] E error() const { return std::get<E>(storage_); }
+
+   private:
+    std::variant<T, E> storage_;
+};
+
+template <typename E>
+class Expected<void, E> {
+   public:
+    Expected() = default;
+    Expected(E error) : error_(error) {}
+
+    [[nodiscard]] bool has_value() const noexcept { return !error_.has_value(); }
+    [[nodiscard]] explicit operator bool() const noexcept { return has_value(); }
+    [[nodiscard]] E error() const { return *error_; }
+
+   private:
+    std::optional<E> error_;
+};
+
+class MppSession {
+   public:
+    MppSession(const MppSession&) = delete;
+    MppSession& operator=(const MppSession&) = delete;
+
+    ~MppSession() {
+        if (ctx_) {
+            mpp_destroy(ctx_);
+            ctx_ = nullptr;
+            api_ = nullptr;
+        }
+    }
+
+    [[nodiscard]] static std::shared_ptr<MppSession> create() noexcept {
+        MppCtx ctx = nullptr;
+        MppApi* api = nullptr;
+        if (mpp_create(&ctx, &api) != MPP_OK || !ctx || !api) {
+            if (ctx) {
+                mpp_destroy(ctx);
+            }
+            return {};
+        }
+
+        return std::shared_ptr<MppSession>(new MppSession(ctx, api));
+    }
+
+    [[nodiscard]] MppCtx ctx() const noexcept { return ctx_; }
+    [[nodiscard]] MppApi* api() const noexcept { return api_; }
+
+   private:
+    MppSession(MppCtx ctx, MppApi* api) noexcept : ctx_(ctx), api_(api) {}
+
+    MppCtx ctx_ = nullptr;
+    MppApi* api_ = nullptr;
 };
 
 class MppBufferHandle {
@@ -262,7 +329,7 @@ class MppDecCfgHandle {
     MppDecCfg cfg_ = nullptr;
 };
 
-inline constexpr bool kAv1ExportAsP010 = false;
+inline constexpr bool kAv1ExportAsP010 = true;
 inline constexpr uint64_t kDecoderFlushIdleMicros = 2'000'000ULL;
 inline constexpr size_t kMaxInFlightJobs = 16;
 
@@ -449,6 +516,7 @@ inline void unpackPacked10RowLE(std::span<const uint8_t> src,
 
 [[nodiscard]] inline CodecProfile vaProfileToCodec(VAProfile profile) {
     switch (profile) {
+        case VAProfileH264ConstrainedBaseline:
         case VAProfileH264Baseline:
         case VAProfileH264Main:
         case VAProfileH264High: return CodecProfile::H264;

@@ -1,6 +1,9 @@
 #include <drm/drm_fourcc.h>
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
+#include <unistd.h>
 #include <va/va.h>
 #include <va/va_backend.h>
 #include <va/va_dec_av1.h>
@@ -12,13 +15,22 @@
 #include <cassert>
 #include <cstddef>
 #include <cstring>
+#include <filesystem>
+#include <optional>
 #include <span>
 #include <mutex>
 #include <memory>
 #include <array>
 #include <fstream>
+#include <limits>
+#include <string>
+#include <string_view>
 #include <unordered_map>
+#include <unordered_set>
+#include <variant>
 #include <vector>
+
+#include <xf86drm.h>
 
 #include "mpp_decoder.h"
 #include "util/bitstream.hpp"
@@ -95,6 +107,14 @@ struct DriverState {
     VADriverVTable* vtable = nullptr;
     std::mutex lock;
     VAProfile profile = VAProfileNone;
+    std::unordered_set<VAContextID> active_contexts;
+    VAContextID next_context_id = 1;
+    std::vector<VADisplayAttribute> display_attributes;
+    unique_fd resolved_drm_fd;
+    int drm_fd = -1;
+    dev_t drm_rdev = 0;
+    std::string drm_device_path;
+    std::string drm_driver_name;
 
     // Current expected decoding resolution (from vaCreateContext or MPP feedback).
     uint32_t picture_width = 0;
@@ -120,6 +140,9 @@ struct DriverState {
     struct ImageState {
         VAImage image;
         VASurfaceID derived_surface = VA_INVALID_ID;
+        unique_fd direct_dmabuf;
+        void* direct_map = nullptr;
+        size_t direct_map_size = 0;
         std::vector<uint8_t> palette;
     };
 
@@ -181,7 +204,15 @@ class MappedDmabuf {
     }
 
     [[nodiscard]] void* data() const noexcept { return address_; }
+    [[nodiscard]] size_t size() const noexcept { return size_; }
     [[nodiscard]] explicit operator bool() const noexcept { return address_ != nullptr; }
+
+    [[nodiscard]] void* release() noexcept {
+        void* address = address_;
+        address_ = nullptr;
+        size_ = 0;
+        return address;
+    }
 
     void reset() noexcept {
         if (address_ != nullptr && size_ != 0) {
@@ -275,12 +306,224 @@ static bool isImageBackingBuffer(const DriverState* d, VABufferID buf_id) {
     return false;
 }
 
-// Display attributes (vaQueryDisplayAttributes / vaGetDisplayAttributes / vaSetDisplayAttributes)
-// are global in this driver (no per-display state tracked).
-static std::vector<VADisplayAttribute> g_display_attributes;
+static uint64_t surfaceTotalSizeBytes(const MppDecoder::DecodedSurface& surf) {
+    const uint32_t stride = surf.stride ? surf.stride : alignTo(surf.width, 64);
+    if (!surf.is_10bit) {
+        return static_cast<uint64_t>(stride) * surf.height * 3 / 2;
+    }
 
-static void ensureDisplayAttributesInitialized() {
-    if (!g_display_attributes.empty()) return;
+    const uint32_t aligned_h = alignTo(surf.height, 8);
+    return static_cast<uint64_t>(stride) * aligned_h * 3;
+}
+
+static bool imageLayoutMatchesSurface(const DriverState::ImageState& image_state,
+                                      const MppDecoder::DecodedSurface& surf) {
+    const uint32_t bytes_per_row = surf.stride * (surf.is_10bit ? 2u : 1u);
+    const uint32_t aligned_h = surf.is_10bit ? alignTo(surf.height, 8) : surf.height;
+    const uint32_t y_size = bytes_per_row * aligned_h;
+    const uint32_t expected_fourcc = surf.is_10bit ? VA_FOURCC_P010 : VA_FOURCC_NV12;
+
+    return image_state.image.width == surf.width &&
+           image_state.image.height == surf.height &&
+           image_state.image.format.fourcc == expected_fourcc &&
+           image_state.image.format.depth == 12 &&
+           image_state.image.num_planes == 2 &&
+           image_state.image.pitches[0] == bytes_per_row &&
+           image_state.image.pitches[1] == bytes_per_row &&
+           image_state.image.offsets[0] == 0 &&
+           image_state.image.offsets[1] == y_size &&
+           image_state.image.data_size == surfaceTotalSizeBytes(surf);
+}
+
+static void releaseDirectImageMap(DriverState::ImageState& image_state) {
+    if (image_state.direct_map != nullptr && image_state.direct_map_size != 0) {
+        munmap(image_state.direct_map, image_state.direct_map_size);
+    }
+    image_state.direct_map = nullptr;
+    image_state.direct_map_size = 0;
+}
+
+static void releaseDirectImageAlias(DriverState::ImageState& image_state) {
+    releaseDirectImageMap(image_state);
+    image_state.direct_dmabuf.reset();
+    image_state.derived_surface = VA_INVALID_ID;
+}
+
+static bool attachImageToSurfaceDmabuf(DriverState::ImageState& image_state,
+                                       VASurfaceID surface,
+                                       const MppDecoder::DecodedSurface& surf) {
+    if (surf.dmabuf_fd < 0 || !imageLayoutMatchesSurface(image_state, surf)) {
+        return false;
+    }
+
+    unique_fd exported_fd{dup(surf.dmabuf_fd)};
+    if (!exported_fd) {
+        return false;
+    }
+
+    releaseDirectImageAlias(image_state);
+    image_state.direct_dmabuf = std::move(exported_fd);
+    image_state.derived_surface = surface;
+    return true;
+}
+
+static void* mapDirectImageBuffer(DriverState::ImageState& image_state) {
+    if (image_state.direct_map != nullptr) {
+        return image_state.direct_map;
+    }
+    if (!image_state.direct_dmabuf) {
+        return nullptr;
+    }
+
+    auto mapping = MappedDmabuf::map(image_state.direct_dmabuf.get(), image_state.image.data_size, PROT_READ | PROT_WRITE);
+    if (!mapping) {
+        return nullptr;
+    }
+
+    image_state.direct_map_size = mapping.size();
+    image_state.direct_map = mapping.release();
+    return image_state.direct_map;
+}
+
+static constexpr uint32_t supportedRtFormats() {
+    return VA_RT_FORMAT_YUV420 | VA_RT_FORMAT_YUV420_10BPP;
+}
+
+struct ResolvedDrmDevice {
+    unique_fd owned_fd;
+    int fd = -1;
+    dev_t rdev = 0;
+    std::string path;
+    std::string driver_name;
+};
+
+static constexpr unsigned int kDrmRenderMajor = 226;
+
+static bool isRenderNodeDevice(const struct stat& stat_buf) {
+    return S_ISCHR(stat_buf.st_mode) && major(stat_buf.st_rdev) == kDrmRenderMajor && minor(stat_buf.st_rdev) >= 128;
+}
+
+static bool isAcceptedDrmDriverName(std::string_view driver_name) {
+    return driver_name.find("rockchip") != std::string_view::npos || driver_name.find("panthor") != std::string_view::npos;
+}
+
+static Expected<void, VAStatus> validateResolvedDrmFd(int fd,
+                                                      bool require_supported_driver,
+                                                      dev_t* out_rdev,
+                                                      std::string* out_path,
+                                                      std::string* out_driver_name) {
+    if (fd < 0) return VA_STATUS_ERROR_INVALID_DISPLAY;
+
+    struct stat stat_buf = {};
+    if (fstat(fd, &stat_buf) != 0 || !isRenderNodeDevice(stat_buf)) {
+        return VA_STATUS_ERROR_INVALID_DISPLAY;
+    }
+
+    drmVersionPtr version = drmGetVersion(fd);
+    if (!version) {
+        return VA_STATUS_ERROR_OPERATION_FAILED;
+    }
+
+    const std::string driver_name = version->name ? version->name : "";
+    drmFreeVersion(version);
+    if (require_supported_driver && !isAcceptedDrmDriverName(driver_name)) {
+        return VA_STATUS_ERROR_INVALID_DISPLAY;
+    }
+
+    char* device_name = drmGetRenderDeviceNameFromFd(fd);
+    if (device_name) {
+        if (out_path) *out_path = device_name;
+        free(device_name);
+    } else if (out_path) {
+        *out_path = (std::filesystem::path("/proc") / "self" / "fd" / std::to_string(fd)).string();
+    }
+    if (out_driver_name) *out_driver_name = driver_name;
+    if (out_rdev) *out_rdev = stat_buf.st_rdev;
+    return {};
+}
+
+static std::optional<int> drmFdFromContext(VADriverContextP ctx) {
+    if (!ctx) return std::nullopt;
+    if ((ctx->display_type & VA_DISPLAY_DRM) != 0) {
+        if (ctx->drm_state) {
+            auto* drm = static_cast<drm_state*>(ctx->drm_state);
+            if (drm->fd >= 0) return drm->fd;
+        }
+
+        const intptr_t native_value = reinterpret_cast<intptr_t>(ctx->native_dpy);
+        if (native_value >= 0 && native_value <= std::numeric_limits<int>::max()) {
+            return static_cast<int>(native_value);
+        }
+    }
+    return std::nullopt;
+}
+
+static Expected<ResolvedDrmDevice, VAStatus> resolveDrmDeviceFromLibdrmScan() {
+    std::array<drmDevicePtr, 64> devices{};
+    const int device_count = drmGetDevices2(0, devices.data(), static_cast<int>(devices.size()));
+    if (device_count < 0) {
+        return VA_STATUS_ERROR_OPERATION_FAILED;
+    }
+
+    for (int index = 0; index < device_count; ++index) {
+        drmDevicePtr device_info = devices[index];
+        if (!device_info) {
+            continue;
+        }
+        if ((device_info->available_nodes & (1 << DRM_NODE_RENDER)) == 0) {
+            continue;
+        }
+
+        const char* render_node = device_info->nodes[DRM_NODE_RENDER];
+        if (!render_node) {
+            continue;
+        }
+
+        unique_fd fd{open(render_node, O_RDWR | O_CLOEXEC)};
+        if (!fd) {
+            continue;
+        }
+
+        ResolvedDrmDevice device;
+        device.owned_fd = std::move(fd);
+        device.fd = device.owned_fd.get();
+        auto status = validateResolvedDrmFd(device.fd, true, &device.rdev, &device.path, &device.driver_name);
+        if (!status) {
+            continue;
+        }
+
+        drmFreeDevices(devices.data(), device_count);
+        return device;
+    }
+
+    drmFreeDevices(devices.data(), device_count);
+    return VA_STATUS_ERROR_INVALID_DISPLAY;
+}
+
+static Expected<ResolvedDrmDevice, VAStatus> resolveDrmDevice(VADriverContextP ctx) {
+    if (auto inherited_fd = drmFdFromContext(ctx)) {
+        ResolvedDrmDevice device;
+        device.fd = *inherited_fd;
+        auto status = validateResolvedDrmFd(device.fd, true, &device.rdev, &device.path, &device.driver_name);
+        if (!status) return status.error();
+        return device;
+    }
+
+    return resolveDrmDeviceFromLibdrmScan();
+}
+
+static bool profileSupports10BitOutput(VAProfile profile) {
+    switch (profile) {
+        case VAProfileHEVCMain10:
+        case VAProfileAV1Profile0:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static void ensureDisplayAttributesInitialized(DriverState& driver) {
+    if (!driver.display_attributes.empty()) return;
 
     auto add = [&](VADisplayAttribType type, int32_t min_v, int32_t max_v, int32_t default_v, uint32_t flags) {
         VADisplayAttribute attr = {};
@@ -289,7 +532,7 @@ static void ensureDisplayAttributesInitialized() {
         attr.max_value = max_v;
         attr.value = default_v;
         attr.flags = flags;
-        g_display_attributes.push_back(attr);
+        driver.display_attributes.push_back(attr);
     };
 
     // Basic video color controls.
@@ -308,8 +551,11 @@ static DriverState* toDriver(VADriverContextP ctx) {
 
 static bool isSupportedProfile(VAProfile profile) {
     switch (profile) {
+        case VAProfileH264ConstrainedBaseline:
+        case VAProfileH264Main:
         case VAProfileH264High:
         case VAProfileHEVCMain:
+        case VAProfileHEVCMain10:
         case VAProfileVP9Profile0:
         case VAProfileAV1Profile0:
             return true;
@@ -347,14 +593,17 @@ static VAStatus vaCreateSurfaces1(VADriverContextP ctx,
     if (width <= 0 || height <= 0 || num_surfaces <= 0 || !surfaces)
         return VA_STATUS_ERROR_INVALID_PARAMETER;
 
-    const bool av1_10bit = false;
     const bool format_supported = (format == static_cast<int>(VA_RT_FORMAT_YUV420) ||
-                                   format == static_cast<int>(VA_RT_FORMAT_YUV420_10));
+                                   format == static_cast<int>(VA_RT_FORMAT_YUV420_10) ||
+                                   format == static_cast<int>(supportedRtFormats()));
     if (!format_supported) {
         util::log(util::stderr_sink, util::LogLevel::Error,
                   "vaCreateSurfaces1: unsupported format={}", format);
         return VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT;
     }
+
+    const bool wants_10bit = (static_cast<uint32_t>(format) & VA_RT_FORMAT_YUV420_10BPP) != 0;
+    const uint32_t expected_fourcc = wants_10bit ? VA_FOURCC_P010 : VA_FOURCC_NV12;
 
     for (int i = 0; i < num_attribs; i++) {
         const auto& attr = attrib_list[i];
@@ -372,7 +621,6 @@ static VAStatus vaCreateSurfaces1(VADriverContextP ctx,
                     }
                 }
                 if (attr.type == VASurfaceAttribPixelFormat) {
-                    const uint32_t expected_fourcc = av1_10bit ? VA_FOURCC_P010 : VA_FOURCC_NV12;
                     if (static_cast<uint32_t>(attr.value.value.i) != expected_fourcc) {
                         util::log(util::stderr_sink, util::LogLevel::Error,
                                   "vaCreateSurfaces1: unsupported pixel format {}", attr.value.value.i);
@@ -394,6 +642,11 @@ static VAStatus vaCreateSurfaces1(VADriverContextP ctx,
     }
 
     std::lock_guard<std::mutex> lock(d->lock);
+    if (wants_10bit && !profileSupports10BitOutput(d->profile)) {
+        util::log(util::stderr_sink, util::LogLevel::Error,
+                  "vaCreateSurfaces1: profile {} does not support 10-bit surfaces", static_cast<int>(d->profile));
+        return VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT;
+    }
     {
         static std::atomic<int> create_surface_log_count{0};
         if (create_surface_log_count.fetch_add(1, std::memory_order_relaxed) < 1) {
@@ -411,7 +664,7 @@ static VAStatus vaCreateSurfaces1(VADriverContextP ctx,
                       "Initializing decoder for profile={} width={} height={}",
                       profile_int, width, height);
         }
-        if (!d->decoder->initialize(vaProfileToCodec(d->profile), width, height)) {
+        if (!d->decoder->initialize(vaProfileToCodec(d->profile), width, height, d->drm_fd)) {
             util::log(util::stderr_sink, util::LogLevel::Error,
                       "Failed to initialize decoder for surface allocation");
             return VA_STATUS_ERROR_ALLOCATION_FAILED;
@@ -425,7 +678,7 @@ static VAStatus vaCreateSurfaces1(VADriverContextP ctx,
         state->surface.width = static_cast<uint32_t>(width);
         state->surface.height = static_cast<uint32_t>(height);
         state->surface.stride = alignTo(state->surface.width, 64);
-        state->surface.is_10bit = (d->profile == VAProfileAV1Profile0);
+        state->surface.is_10bit = wants_10bit;
 
         if (!d->decoder->allocateSurface(id, state->surface, width, height)) {
             util::log(util::stderr_sink, util::LogLevel::Error,
@@ -551,11 +804,14 @@ static VAStatus vaQueryConfigProfiles(VADriverContextP ctx,
                   "vaQueryConfigProfiles: profile_list={} num_profiles={}",
                   static_cast<void*>(profile_list), num_profiles ? *num_profiles : -1);
     }
-    static const VAProfile supported[] = {
+    constexpr VAProfile supported[] = {
+        VAProfileH264ConstrainedBaseline,
+        VAProfileH264Main,
         VAProfileH264High,
         VAProfileHEVCMain,
-        VAProfileVP9Profile0,
+        VAProfileHEVCMain10,
         VAProfileAV1Profile0,
+        VAProfileVP9Profile0,
     };
     const int supported_count = static_cast<int>(std::size(supported));
 
@@ -620,7 +876,7 @@ static VAStatus vaGetConfigAttributes(VADriverContextP ctx,
 
     for (int i = 0; i < num_attribs; i++) {
         if (attrib_list[i].type == VAConfigAttribRTFormat) {
-            attrib_list[i].value = VA_RT_FORMAT_YUV420;
+            attrib_list[i].value = supportedRtFormats();
         } else {
             attrib_list[i].value = 0;
         }
@@ -646,11 +902,16 @@ static VAStatus vaCreateConfig(VADriverContextP ctx,
     if (entrypoint != VAEntrypointVLD) return VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT;
     if (!config_id) return VA_STATUS_ERROR_INVALID_PARAMETER;
 
+    std::lock_guard<std::mutex> lock(d->lock);
+
     // We support only minimal config and ignore per-config attributes here.
     if (attrib_list && num_attribs > 0) {
         for (int i = 0; i < num_attribs; i++) {
             if (attrib_list[i].type == VAConfigAttribRTFormat) {
-                attrib_list[i].value = VA_RT_FORMAT_YUV420;
+                if ((attrib_list[i].value & supportedRtFormats()) == 0) {
+                    return VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT;
+                }
+                attrib_list[i].value = supportedRtFormats();
             }
         }
     }
@@ -664,6 +925,7 @@ static VAStatus vaCreateConfig(VADriverContextP ctx,
 static VAStatus vaDestroyConfig(VADriverContextP ctx, VAConfigID config_id) {
     auto* d = toDriver(ctx);
     if (!d) return VA_STATUS_ERROR_INVALID_CONTEXT;
+    std::lock_guard<std::mutex> lock(d->lock);
 
     // This driver only has a single config
     if (!d->config_created || config_id != 1) {
@@ -690,20 +952,26 @@ static VAStatus vaQueryConfigAttributes(VADriverContextP ctx,
     if (!num_attribs) return VA_STATUS_ERROR_INVALID_PARAMETER;
     auto* d = toDriver(ctx);
     if (!d) return VA_STATUS_ERROR_INVALID_CONTEXT;
+    std::lock_guard<std::mutex> lock(d->lock);
     if (!d->config_created || config_id != 1) return VA_STATUS_ERROR_INVALID_CONFIG;
 
     if (profile) *profile = d->profile;
     if (entrypoint) *entrypoint = VAEntrypointVLD;
 
-    // This driver does not expose additional config-level attributes.
-    if (attrib_list) {
-        for (int i = 0; i < *num_attribs; i++) {
-            attrib_list[i].value = 0;
-        }
+    constexpr int kConfigAttribCount = 1;
+    if (!attrib_list) {
+        *num_attribs = kConfigAttribCount;
+        return VA_STATUS_SUCCESS;
     }
 
-    // Indicate no extra attributes provided.
-    *num_attribs = 0;
+    if (*num_attribs < kConfigAttribCount) {
+        *num_attribs = kConfigAttribCount;
+        return VA_STATUS_ERROR_MAX_NUM_EXCEEDED;
+    }
+
+    attrib_list[0].type = VAConfigAttribRTFormat;
+    attrib_list[0].value = supportedRtFormats();
+    *num_attribs = kConfigAttribCount;
     return VA_STATUS_SUCCESS;
 }
 
@@ -720,9 +988,10 @@ static VAStatus vaQuerySurfaceAttributes(VADriverContextP ctx,
     }
     auto* d = toDriver(ctx);
     if (!d) return VA_STATUS_ERROR_INVALID_CONTEXT;
+    std::lock_guard<std::mutex> lock(d->lock);
     if (config_id != VA_INVALID_ID && config_id != 1) return VA_STATUS_ERROR_INVALID_CONFIG;
 
-    const bool av1_10bit = false;
+    const bool uses_10bit_output = profileSupports10BitOutput(d->profile);
     constexpr unsigned int kSupportedCount = 2;
     if (!attrib_list) {
         *num_attribs = kSupportedCount;
@@ -737,7 +1006,7 @@ static VAStatus vaQuerySurfaceAttributes(VADriverContextP ctx,
     attrib_list[0].type = VASurfaceAttribPixelFormat;
     attrib_list[0].flags = VA_SURFACE_ATTRIB_GETTABLE | VA_SURFACE_ATTRIB_SETTABLE;
     attrib_list[0].value.type = VAGenericValueTypeInteger;
-    attrib_list[0].value.value.i = av1_10bit ? VA_FOURCC_P010 : VA_FOURCC_NV12;
+    attrib_list[0].value.value.i = uses_10bit_output ? VA_FOURCC_P010 : VA_FOURCC_NV12;
 
     attrib_list[1].type = VASurfaceAttribMemoryType;
     attrib_list[1].flags = VA_SURFACE_ATTRIB_GETTABLE | VA_SURFACE_ATTRIB_SETTABLE;
@@ -792,6 +1061,7 @@ static VAStatus vaCreateContext(VADriverContextP ctx,
         util::log(util::stderr_sink, util::LogLevel::Warn, "vaCreateContext: invalid driver state");
         return VA_STATUS_ERROR_INVALID_CONTEXT;
     }
+    std::lock_guard<std::mutex> lock(d->lock);
     if (!d->config_created || config_id != 1) {
         util::log(util::stderr_sink, util::LogLevel::Warn, "vaCreateContext: config not ready config_created={} config_id={}", d->config_created, config_id);
         return VA_STATUS_ERROR_INVALID_CONFIG;
@@ -819,29 +1089,35 @@ static VAStatus vaCreateContext(VADriverContextP ctx,
         return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;
     }
 
-    // Remember the dimensions requested by the client.
-    d->picture_width = static_cast<uint32_t>(picture_width);
-    d->picture_height = static_cast<uint32_t>(picture_height);
-    d->av1_ref_frame_map.fill(VA_INVALID_SURFACE);
-    d->av1_ref_frame_map_valid = false;
+    if (d->active_contexts.empty()) {
+        d->picture_width = static_cast<uint32_t>(picture_width);
+        d->picture_height = static_cast<uint32_t>(picture_height);
+        d->av1_ref_frame_map.fill(VA_INVALID_SURFACE);
+        d->av1_ref_frame_map_valid = false;
+    }
 
     // Initialize decoder with the requested size; it may adjust later.
-    if (!d->decoder || !d->decoder->initialize(vaProfileToCodec(d->profile), picture_width, picture_height)) {
+    if (!d->decoder || (!d->decoder->isInitialized() &&
+                        !d->decoder->initialize(vaProfileToCodec(d->profile), picture_width, picture_height, d->drm_fd))) {
         return VA_STATUS_ERROR_ALLOCATION_FAILED;
     }
 
-    // Minimal context ID.
-    *context = 1;
+    const VAContextID new_context = d->next_context_id++;
+    d->active_contexts.insert(new_context);
+    *context = new_context;
     return VA_STATUS_SUCCESS;
 }
 
 static VAStatus vaDestroyContext(VADriverContextP ctx, VAContextID context) {
     if (!ctx) return VA_STATUS_ERROR_INVALID_CONTEXT;
-    if (context != 1) return VA_STATUS_ERROR_INVALID_CONTEXT;
     auto* d = toDriver(ctx);
     if (!d) return VA_STATUS_ERROR_INVALID_CONTEXT;
 
     std::lock_guard<std::mutex> lock(d->lock);
+    auto context_it = d->active_contexts.find(context);
+    if (context_it == d->active_contexts.end()) return VA_STATUS_ERROR_INVALID_CONTEXT;
+    d->active_contexts.erase(context_it);
+    if (!d->active_contexts.empty()) return VA_STATUS_SUCCESS;
 
     // Stop any decoding activity.
     d->decoder->shutdown();
@@ -859,6 +1135,7 @@ static VAStatus vaDestroyContext(VADriverContextP ctx, VAContextID context) {
     d->av1_ref_frame_map_valid = false;
 
     for (auto& kv : d->images) {
+        releaseDirectImageAlias(kv.second);
         destroyBuffer(d, kv.second.image.buf);
     }
     d->images.clear();
@@ -917,7 +1194,24 @@ static VAStatus vaMapBuffer(VADriverContextP ctx,
 
     std::lock_guard<std::mutex> lock(d->resource_mutex);
     auto it = d->buffers.find(buf_id);
-    if (it == d->buffers.end()) return VA_STATUS_ERROR_INVALID_BUFFER;
+    if (it == d->buffers.end()) {
+        for (auto& kv : d->images) {
+            auto& image_state = kv.second;
+            if (image_state.image.buf != buf_id) {
+                continue;
+            }
+
+            void* mapped = mapDirectImageBuffer(image_state);
+            if (!mapped) {
+                return VA_STATUS_ERROR_INVALID_BUFFER;
+            }
+
+            *pbuf = mapped;
+            return VA_STATUS_SUCCESS;
+        }
+
+        return VA_STATUS_ERROR_INVALID_BUFFER;
+    }
 
     std::span<uint8_t> span = it->second->map();
     *pbuf = span.data();
@@ -930,7 +1224,19 @@ static VAStatus vaUnmapBuffer(VADriverContextP ctx,
     if (!d) return VA_STATUS_ERROR_INVALID_CONTEXT;
 
     std::lock_guard<std::mutex> lock(d->resource_mutex);
-    if (d->buffers.find(buf_id) == d->buffers.end()) return VA_STATUS_ERROR_INVALID_BUFFER;
+    if (d->buffers.find(buf_id) == d->buffers.end()) {
+        for (auto& kv : d->images) {
+            auto& image_state = kv.second;
+            if (image_state.image.buf != buf_id) {
+                continue;
+            }
+
+            releaseDirectImageMap(image_state);
+            return VA_STATUS_SUCCESS;
+        }
+
+        return VA_STATUS_ERROR_INVALID_BUFFER;
+    }
     return VA_STATUS_SUCCESS;
 }
 
@@ -1240,12 +1546,20 @@ static VAStatus vaExportSurfaceHandle(VADriverContextP ctx,
     auto* d = toDriver(ctx);
     if (!d) return VA_STATUS_ERROR_INVALID_CONTEXT;
 
-    // Accept no flags or the defined export flags. In this simple driver,
-    // flags are currently ignored but validated to be within supported set.
-    if ((flags & ~VA_SURFACE_ATTRIB_MEM_TYPE_VA) != 0) {
+    VAStatus sync_status = vaSyncSurface(ctx, surface);
+    if (sync_status != VA_STATUS_SUCCESS) {
+        return sync_status;
+    }
+
+    std::lock_guard<std::mutex> lock(d->lock);
+
+    constexpr uint32_t supported_flags = VA_EXPORT_SURFACE_READ_ONLY |
+                                         VA_EXPORT_SURFACE_WRITE_ONLY |
+                                         VA_EXPORT_SURFACE_SEPARATE_LAYERS |
+                                         VA_EXPORT_SURFACE_COMPOSED_LAYERS;
+    if ((flags & ~supported_flags) != 0) {
         return VA_STATUS_ERROR_INVALID_PARAMETER;
     }
-    if (!d) return VA_STATUS_ERROR_INVALID_DISPLAY;
     auto it = d->surfaces.find(surface);
     if (it == d->surfaces.end()) return VA_STATUS_ERROR_INVALID_SURFACE;
     if (!descriptor) return VA_STATUS_ERROR_INVALID_PARAMETER;
@@ -1256,9 +1570,12 @@ static VAStatus vaExportSurfaceHandle(VADriverContextP ctx,
     }
 
     auto* desc = static_cast<VADRMPRIMESurfaceDescriptor*>(descriptor);
-    memset(desc, 0, sizeof(*desc));
+    std::memset(desc, 0, sizeof(*desc));
 
     const auto& surf = it->second->surface;
+    if (surf.dmabuf_fd < 0) {
+        return VA_STATUS_ERROR_INVALID_SURFACE;
+    }
     const uint32_t stride = surf.stride ? surf.stride : alignTo(surf.width, 64);
     const uint32_t aligned_h = surf.is_10bit ? alignTo(surf.height, 8) : surf.height;
     const uint32_t bytes_per_row = stride * (surf.is_10bit ? 2u : 1u);
@@ -1283,7 +1600,7 @@ static VAStatus vaExportSurfaceHandle(VADriverContextP ctx,
     }
     desc->objects[0].fd = exported_fd.release();
     desc->objects[0].size = static_cast<uint32_t>(total_size);
-    desc->objects[0].drm_format_modifier = 0;
+    desc->objects[0].drm_format_modifier = DRM_FORMAT_MOD_LINEAR;
 
     desc->num_layers = 1;
     desc->layers[0].drm_format = surf.is_10bit ? DRM_FORMAT_P010 : DRM_FORMAT_NV12;
@@ -1296,46 +1613,6 @@ static VAStatus vaExportSurfaceHandle(VADriverContextP ctx,
     desc->layers[0].pitch[1] = bytes_per_row;
 
     return VA_STATUS_SUCCESS;
-}
-
-static bool copySurfaceToImageBuffer(const MppDecoder::DecodedSurface& surf,
-                                     const VADRMPRIMESurfaceDescriptor& src_desc,
-                                     void* dst_ptr,
-                                     const VAImage& image) {
-    if (!dst_ptr || src_desc.num_objects == 0 || src_desc.objects[0].fd < 0) return false;
-
-    const bool is_10bit = surf.is_10bit;
-    const uint32_t bytes_per_sample = is_10bit ? 2u : 1u;
-    const uint32_t src_pitch = src_desc.layers[0].pitch[0];
-    const uint32_t src_y_offset = src_desc.layers[0].offset[0];
-    const uint32_t src_uv_offset = src_desc.layers[0].offset[1];
-    const uint32_t dst_pitch = image.pitches[0];
-    const uint32_t dst_uv_pitch = image.pitches[1];
-    const uint32_t copy_row_bytes = std::min(dst_pitch, surf.width * bytes_per_sample);
-    const uint32_t uv_copy_row_bytes = std::min(dst_uv_pitch, surf.width * bytes_per_sample);
-
-    const uint32_t src_plane_size = src_desc.objects[0].size;
-    auto src_mapping = MappedDmabuf::map(src_desc.objects[0].fd, src_plane_size, PROT_READ);
-    if (!src_mapping) return false;
-
-    uint8_t* dst = static_cast<uint8_t*>(dst_ptr);
-    const uint8_t* src = static_cast<const uint8_t*>(src_mapping.data());
-    const uint32_t height = surf.height;
-    const uint32_t uv_height = height / 2;
-
-    for (uint32_t row = 0; row < height; ++row) {
-        std::memcpy(dst + image.offsets[0] + static_cast<size_t>(row) * dst_pitch,
-                    src + src_y_offset + static_cast<size_t>(row) * src_pitch,
-                    copy_row_bytes);
-    }
-
-    for (uint32_t row = 0; row < uv_height; ++row) {
-        std::memcpy(dst + image.offsets[1] + static_cast<size_t>(row) * dst_uv_pitch,
-                    src + src_uv_offset + static_cast<size_t>(row) * src_pitch,
-                    uv_copy_row_bytes);
-    }
-
-    return true;
 }
 
 static VAStatus vaQueryImageFormats(VADriverContextP ctx,
@@ -1438,6 +1715,11 @@ static VAStatus vaDeriveImage(VADriverContextP ctx,
     auto it = d->surfaces.find(surface);
     if (it == d->surfaces.end()) return VA_STATUS_ERROR_INVALID_SURFACE;
 
+    VAStatus sync_status = vaSyncSurface(ctx, surface);
+    if (sync_status != VA_STATUS_SUCCESS) {
+        return sync_status;
+    }
+
     const auto& surf = it->second->surface;
     if (surf.dmabuf_fd < 0) return VA_STATUS_ERROR_INVALID_SURFACE;
 
@@ -1451,13 +1733,12 @@ static VAStatus vaDeriveImage(VADriverContextP ctx,
     fmt.alpha_mask = 0;
 
     uint32_t pitch = ((surf.width + 63) / 64) * 64 * (is_10bit ? 2u : 1u);
-    uint32_t y_size = pitch * surf.height;
-    uint32_t uv_height = (surf.height + 1) / 2;
+    uint32_t aligned_h = is_10bit ? alignTo(surf.height, 8) : surf.height;
+    uint32_t y_size = pitch * aligned_h;
+    uint32_t uv_height = aligned_h / 2;
     uint32_t total_size = y_size + pitch * uv_height;
 
-    VABufferID buf_id = 0;
-    VAStatus status = vaCreateBuffer(ctx, 0, VAImageBufferType, total_size, 1, nullptr, &buf_id);
-    if (status != VA_STATUS_SUCCESS) return status;
+    VABufferID buf_id = d->next_buffer_id++;
 
     VAImageID image_id = d->next_image_id++;
     image->image_id = image_id;
@@ -1479,36 +1760,15 @@ static VAStatus vaDeriveImage(VADriverContextP ctx,
     image->component_order[1] = 0;
     image->component_order[2] = 0;
     image->component_order[3] = 0;
-    memset(image->va_reserved, 0, sizeof(image->va_reserved));
-
-    VADRMPRIMESurfaceDescriptor src_desc = {};
-    if (vaExportSurfaceHandle(ctx, surface,
-                              VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
-                              VA_EXPORT_SURFACE_READ_ONLY, &src_desc) != VA_STATUS_SUCCESS) {
-        destroyBuffer(d, buf_id);
-        return VA_STATUS_ERROR_UNKNOWN;
-    }
-    unique_fd exported_fd{src_desc.objects[0].fd};
-
-    void* image_ptr = nullptr;
-    if (vaMapBuffer(ctx, buf_id, &image_ptr) != VA_STATUS_SUCCESS) {
-        destroyBuffer(d, buf_id);
-        return VA_STATUS_ERROR_UNKNOWN;
-    }
-
-    if (!copySurfaceToImageBuffer(surf, src_desc, image_ptr, *image)) {
-        vaUnmapBuffer(ctx, buf_id);
-        destroyBuffer(d, buf_id);
-        return VA_STATUS_ERROR_UNKNOWN;
-    }
-
-    vaUnmapBuffer(ctx, buf_id);
+    std::memset(image->va_reserved, 0, sizeof(image->va_reserved));
 
     {
         std::lock_guard<std::mutex> lock(d->resource_mutex);
         DriverState::ImageState state;
         state.image = *image;
-        state.derived_surface = surface;
+        if (!attachImageToSurfaceDmabuf(state, surface, surf)) {
+            return VA_STATUS_ERROR_ALLOCATION_FAILED;
+        }
         d->images[image_id] = std::move(state);
     }
     return VA_STATUS_SUCCESS;
@@ -1524,6 +1784,7 @@ static VAStatus vaDestroyImage(VADriverContextP ctx,
     auto it = d->images.find(image);
     if (it == d->images.end()) return VA_STATUS_ERROR_INVALID_IMAGE;
 
+    releaseDirectImageAlias(it->second);
     d->buffers.erase(it->second.image.buf);
     d->images.erase(it);
     return VA_STATUS_SUCCESS;
@@ -1566,16 +1827,18 @@ static VAStatus vaGetImage(VADriverContextP ctx,
     auto surf_it = d->surfaces.find(surface);
     if (surf_it == d->surfaces.end()) return VA_STATUS_ERROR_INVALID_SURFACE;
 
+    VAStatus sync_status = vaSyncSurface(ctx, surface);
+    if (sync_status != VA_STATUS_SUCCESS) {
+        return sync_status;
+    }
+
     VAImage image_state = {};
     void* img_buf = nullptr;
     {
         std::lock_guard<std::mutex> lock(d->resource_mutex);
         auto img_it = d->images.find(image);
         if (img_it == d->images.end()) return VA_STATUS_ERROR_INVALID_IMAGE;
-        auto buffer_it = d->buffers.find(img_it->second.image.buf);
-        if (buffer_it == d->buffers.end()) return VA_STATUS_ERROR_INVALID_BUFFER;
         image_state = img_it->second.image;
-        img_buf = buffer_it->second->map().data();
     }
 
     static std::atomic<int> get_image_state_log_count{0};
@@ -1613,6 +1876,38 @@ static VAStatus vaGetImage(VADriverContextP ctx,
     max_w &= ~1u;
     max_h &= ~1u;
 
+    const bool full_surface_request = x_coord == 0 && y_coord == 0 && max_w == surf.width && max_h == surf.height;
+    if (full_surface_request) {
+        std::lock_guard<std::mutex> lock(d->resource_mutex);
+        auto img_it = d->images.find(image);
+        if (img_it == d->images.end()) return VA_STATUS_ERROR_INVALID_IMAGE;
+        if (attachImageToSurfaceDmabuf(img_it->second, surface, surf)) {
+            d->buffers.erase(img_it->second.image.buf);
+            return VA_STATUS_SUCCESS;
+        }
+
+        auto buffer_it = d->buffers.find(img_it->second.image.buf);
+        if (buffer_it != d->buffers.end()) {
+            img_buf = buffer_it->second->map().data();
+        } else {
+            img_buf = mapDirectImageBuffer(img_it->second);
+        }
+    } else {
+        std::lock_guard<std::mutex> lock(d->resource_mutex);
+        auto img_it = d->images.find(image);
+        if (img_it == d->images.end()) return VA_STATUS_ERROR_INVALID_IMAGE;
+        auto buffer_it = d->buffers.find(img_it->second.image.buf);
+        if (buffer_it == d->buffers.end()) {
+            img_buf = mapDirectImageBuffer(img_it->second);
+        } else {
+            img_buf = buffer_it->second->map().data();
+        }
+    }
+
+    if (!img_buf) {
+        return VA_STATUS_ERROR_INVALID_BUFFER;
+    }
+
     static std::atomic<int> get_image_mapbuf_log_count{0};
     if (get_image_mapbuf_log_count.fetch_add(1, std::memory_order_relaxed) < 1) {
         util::log(util::stderr_sink, util::LogLevel::Info,
@@ -1627,7 +1922,7 @@ static VAStatus vaGetImage(VADriverContextP ctx,
     uint32_t img_pitch = image_state.pitches[0];
     uint32_t img_uv_pitch = image_state.pitches[1];
 
-    // Map surface DMABUF and copy the requested region into the image buffer.
+    // Fallback path for cropped or layout-mismatched reads.
     uint32_t surf_pitch = surf.is_10bit ? surf.stride * 2 : surf.stride;
     uint32_t surf_y_size = surf_pitch * surf.height;
     uint32_t surf_total_size = surf_y_size + surf_pitch * ((surf.height + 1) / 2);
@@ -1952,13 +2247,16 @@ static VAStatus vaDeassociateSubpicture(VADriverContextP ctx,
     return VA_STATUS_SUCCESS;
 }
 
-static VAStatus vaQueryDisplayAttributes(VADriverContextP /*ctx*/,
+static VAStatus vaQueryDisplayAttributes(VADriverContextP ctx,
                                          VADisplayAttribute* attr_list,
                                          int* num_attributes) {
     if (!num_attributes) return VA_STATUS_ERROR_INVALID_PARAMETER;
+    auto* d = toDriver(ctx);
+    if (!d) return VA_STATUS_ERROR_INVALID_CONTEXT;
 
-    ensureDisplayAttributesInitialized();
-    int total = static_cast<int>(g_display_attributes.size());
+    std::lock_guard<std::mutex> lock(d->lock);
+    ensureDisplayAttributesInitialized(*d);
+    int total = static_cast<int>(d->display_attributes.size());
     if (!attr_list) {
         *num_attributes = total;
         return VA_STATUS_SUCCESS;
@@ -1966,23 +2264,26 @@ static VAStatus vaQueryDisplayAttributes(VADriverContextP /*ctx*/,
 
     int fill = std::min(*num_attributes, total);
     for (int i = 0; i < fill; i++) {
-        attr_list[i] = g_display_attributes[i];
+        attr_list[i] = d->display_attributes[i];
     }
     *num_attributes = total;
     return VA_STATUS_SUCCESS;
 }
 
-static VAStatus vaGetDisplayAttributes(VADriverContextP /*ctx*/,
+static VAStatus vaGetDisplayAttributes(VADriverContextP ctx,
                                        VADisplayAttribute* attr_list,
                                        int num_attributes) {
     if (!attr_list || num_attributes <= 0) return VA_STATUS_ERROR_INVALID_PARAMETER;
+    auto* d = toDriver(ctx);
+    if (!d) return VA_STATUS_ERROR_INVALID_CONTEXT;
 
-    ensureDisplayAttributesInitialized();
+    std::lock_guard<std::mutex> lock(d->lock);
+    ensureDisplayAttributesInitialized(*d);
     for (int i = 0; i < num_attributes; i++) {
         auto* req = &attr_list[i];
-        auto it = std::find_if(g_display_attributes.begin(), g_display_attributes.end(),
+        auto it = std::find_if(d->display_attributes.begin(), d->display_attributes.end(),
                                [&](const VADisplayAttribute& a) { return a.type == req->type; });
-        if (it == g_display_attributes.end()) return VA_STATUS_ERROR_INVALID_PARAMETER;
+        if (it == d->display_attributes.end()) return VA_STATUS_ERROR_INVALID_PARAMETER;
         if (!(it->flags & VA_DISPLAY_ATTRIB_GETTABLE)) return VA_STATUS_ERROR_INVALID_PARAMETER;
 
         // Preserve caller-provided range info, but always return the current value.
@@ -1994,17 +2295,20 @@ static VAStatus vaGetDisplayAttributes(VADriverContextP /*ctx*/,
     return VA_STATUS_SUCCESS;
 }
 
-static VAStatus vaSetDisplayAttributes(VADriverContextP /*ctx*/,
+static VAStatus vaSetDisplayAttributes(VADriverContextP ctx,
                                        VADisplayAttribute* attr_list,
                                        int num_attributes) {
     if (!attr_list || num_attributes <= 0) return VA_STATUS_ERROR_INVALID_PARAMETER;
+    auto* d = toDriver(ctx);
+    if (!d) return VA_STATUS_ERROR_INVALID_CONTEXT;
 
-    ensureDisplayAttributesInitialized();
+    std::lock_guard<std::mutex> lock(d->lock);
+    ensureDisplayAttributesInitialized(*d);
     for (int i = 0; i < num_attributes; i++) {
         const auto& req = attr_list[i];
-        auto it = std::find_if(g_display_attributes.begin(), g_display_attributes.end(),
+        auto it = std::find_if(d->display_attributes.begin(), d->display_attributes.end(),
                                [&](const VADisplayAttribute& a) { return a.type == req.type; });
-        if (it == g_display_attributes.end()) return VA_STATUS_ERROR_INVALID_PARAMETER;
+        if (it == d->display_attributes.end()) return VA_STATUS_ERROR_INVALID_PARAMETER;
         if (!(it->flags & VA_DISPLAY_ATTRIB_SETTABLE)) return VA_STATUS_ERROR_INVALID_PARAMETER;
         if (req.value < it->min_value || req.value > it->max_value) return VA_STATUS_ERROR_INVALID_PARAMETER;
         it->value = req.value;
@@ -2129,13 +2433,14 @@ static VAStatus vaTerminate(VADriverContextP ctx) {
     if (d) {
         // Clean up remaining surfaces before decoder teardown so held MPP buffers are released.
         {
-            std::lock_guard<std::mutex> lock(d->lock);
+            std::scoped_lock lock(d->lock);
             for (auto& kv : d->surfaces) {
                 d->decoder->destroySurface(kv.first);
                 kv.second->set_dmabuf({});
             }
             d->surfaces.clear();
             for (auto& kv : d->images) {
+                releaseDirectImageAlias(kv.second);
                 destroyBuffer(d, kv.second.image.buf);
             }
             d->images.clear();
@@ -2143,6 +2448,8 @@ static VAStatus vaTerminate(VADriverContextP ctx) {
             d->buffers.clear();
             d->subpictures.clear();
             d->ready_flags.clear();
+            d->active_contexts.clear();
+            d->display_attributes.clear();
         }
 
         // Stop any decoding activity after surface resources have been dropped.
@@ -2218,6 +2525,11 @@ static VAStatus vaDriverInit(VADriverContextP ctx) {
     util::set_log_source_location(true);
     if (!ctx) return VA_STATUS_ERROR_INVALID_CONTEXT;
 
+    auto device_result = resolveDrmDevice(ctx);
+    if (!device_result) {
+        return device_result.error();
+    }
+
     // Populate the VA-API function table. libva may free this structure, so
     // allocate it dynamically.
     auto* vt = static_cast<VADriverVTable*>(calloc(1, sizeof(VADriverVTable)));
@@ -2244,6 +2556,12 @@ static VAStatus vaDriverInit(VADriverContextP ctx) {
     }
     driver_state->vtable = vt;
     ctx->pDriverData = driver_state;
+    driver_state->resolved_drm_fd = std::move(device_result.value().owned_fd);
+    driver_state->drm_fd = device_result.value().fd;
+    driver_state->drm_rdev = device_result.value().rdev;
+    driver_state->drm_device_path = std::move(device_result.value().path);
+    driver_state->drm_driver_name = std::move(device_result.value().driver_name);
+    ensureDisplayAttributesInitialized(*driver_state);
 
     // Pretend to be VA-API 1.2+ to satisfy modern clients.
     ctx->version_major = 1;
@@ -2255,13 +2573,14 @@ static VAStatus vaDriverInit(VADriverContextP ctx) {
     ctx->max_attributes = 16;
     ctx->max_image_formats = 2;
     ctx->max_subpic_formats = 2;
-    ctx->max_display_attributes = 4;
+    ctx->max_display_attributes = static_cast<int>(driver_state->display_attributes.size());
     // libva may free this string, so allocate it.
     ctx->str_vendor = strdup("rockchip-mpp");
 
     util::log(util::stdout_sink, util::LogLevel::Info,
-              "Rockchip VA-API driver initialized (libva {}.{})",
-              ctx->version_major, ctx->version_minor);
+              "Rockchip VA-API driver initialized (libva {}.{}, fd={}, driver={}, device={})",
+              ctx->version_major, ctx->version_minor, driver_state->drm_fd,
+              driver_state->drm_driver_name, driver_state->drm_device_path);
     return VA_STATUS_SUCCESS;
 }
 
