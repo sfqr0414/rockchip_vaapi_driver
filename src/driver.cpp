@@ -656,21 +656,6 @@ static VAStatus vaCreateSurfaces1(VADriverContextP ctx,
         }
     }
 
-    if (!d->decoder || !d->decoder->isInitialized()) {
-        static std::atomic<int> init_log_count{0};
-        if (init_log_count.fetch_add(1, std::memory_order_relaxed) < 1) {
-            int profile_int = static_cast<int>(d->profile);
-            util::log(util::stderr_sink, util::LogLevel::Info,
-                      "Initializing decoder for profile={} width={} height={}",
-                      profile_int, width, height);
-        }
-        if (!d->decoder->initialize(vaProfileToCodec(d->profile), width, height, d->drm_fd)) {
-            util::log(util::stderr_sink, util::LogLevel::Error,
-                      "Failed to initialize decoder for surface allocation");
-            return VA_STATUS_ERROR_ALLOCATION_FAILED;
-        }
-    }
-
     for (int i = 0; i < num_surfaces; i++) {
         VASurfaceID id = d->next_surface_id++;
         auto state = std::make_unique<SurfaceState>();
@@ -992,7 +977,12 @@ static VAStatus vaQuerySurfaceAttributes(VADriverContextP ctx,
     if (config_id != VA_INVALID_ID && config_id != 1) return VA_STATUS_ERROR_INVALID_CONFIG;
 
     const bool uses_10bit_output = profileSupports10BitOutput(d->profile);
-    constexpr unsigned int kSupportedCount = 2;
+    static uint64_t linear_modifier = DRM_FORMAT_MOD_LINEAR;
+    static VADRMFormatModifierList linear_modifier_list = {
+        .num_modifiers = 1,
+        .modifiers = &linear_modifier,
+    };
+    constexpr unsigned int kSupportedCount = 3;
     if (!attrib_list) {
         *num_attribs = kSupportedCount;
         return VA_STATUS_SUCCESS;
@@ -1011,7 +1001,12 @@ static VAStatus vaQuerySurfaceAttributes(VADriverContextP ctx,
     attrib_list[1].type = VASurfaceAttribMemoryType;
     attrib_list[1].flags = VA_SURFACE_ATTRIB_GETTABLE | VA_SURFACE_ATTRIB_SETTABLE;
     attrib_list[1].value.type = VAGenericValueTypeInteger;
-    attrib_list[1].value.value.i = VA_SURFACE_ATTRIB_MEM_TYPE_VA;
+    attrib_list[1].value.value.i = VA_SURFACE_ATTRIB_MEM_TYPE_VA | VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2;
+
+    attrib_list[2].type = VASurfaceAttribDRMFormatModifiers;
+    attrib_list[2].flags = VA_SURFACE_ATTRIB_GETTABLE;
+    attrib_list[2].value.type = VAGenericValueTypePointer;
+    attrib_list[2].value.value.p = &linear_modifier_list;
 
     *num_attribs = kSupportedCount;
     return VA_STATUS_SUCCESS;
@@ -1602,15 +1597,32 @@ static VAStatus vaExportSurfaceHandle(VADriverContextP ctx,
     desc->objects[0].size = static_cast<uint32_t>(total_size);
     desc->objects[0].drm_format_modifier = DRM_FORMAT_MOD_LINEAR;
 
-    desc->num_layers = 1;
-    desc->layers[0].drm_format = surf.is_10bit ? DRM_FORMAT_P010 : DRM_FORMAT_NV12;
-    desc->layers[0].num_planes = 2;
-    desc->layers[0].object_index[0] = 0;
-    desc->layers[0].object_index[1] = 0;
-    desc->layers[0].offset[0] = 0;
-    desc->layers[0].offset[1] = uv_offset;
-    desc->layers[0].pitch[0] = bytes_per_row;
-    desc->layers[0].pitch[1] = bytes_per_row;
+    const bool separate_layers = (flags & VA_EXPORT_SURFACE_SEPARATE_LAYERS) != 0;
+    if (separate_layers) {
+        desc->num_layers = 2;
+
+        desc->layers[0].drm_format = surf.is_10bit ? DRM_FORMAT_R16 : DRM_FORMAT_R8;
+        desc->layers[0].num_planes = 1;
+        desc->layers[0].object_index[0] = 0;
+        desc->layers[0].offset[0] = 0;
+        desc->layers[0].pitch[0] = bytes_per_row;
+
+        desc->layers[1].drm_format = surf.is_10bit ? DRM_FORMAT_GR1616 : DRM_FORMAT_GR88;
+        desc->layers[1].num_planes = 1;
+        desc->layers[1].object_index[0] = 0;
+        desc->layers[1].offset[0] = uv_offset;
+        desc->layers[1].pitch[0] = bytes_per_row;
+    } else {
+        desc->num_layers = 1;
+        desc->layers[0].drm_format = surf.is_10bit ? DRM_FORMAT_P010 : DRM_FORMAT_NV12;
+        desc->layers[0].num_planes = 2;
+        desc->layers[0].object_index[0] = 0;
+        desc->layers[0].object_index[1] = 0;
+        desc->layers[0].offset[0] = 0;
+        desc->layers[0].offset[1] = uv_offset;
+        desc->layers[0].pitch[0] = bytes_per_row;
+        desc->layers[0].pitch[1] = bytes_per_row;
+    }
 
     return VA_STATUS_SUCCESS;
 }

@@ -63,8 +63,9 @@ bool MppDecoder::initialize(CodecProfile profile, int width, int height, int drm
 bool MppDecoder::isInitialized() const { return session_initialized_; }
 
 bool MppDecoder::allocateSurface(VASurfaceID id, DecodedSurface& out, int width, int height) {
+    const bool wants_10bit = out.is_10bit;
     uint32_t stride = alignUp(static_cast<uint32_t>(width), 64);
-    if (profile_ == CodecProfile::AV1 && kAv1ExportAsP010) {
+    if (wants_10bit) {
         stride = alignUp(static_cast<uint32_t>(width), 128);
     }
 
@@ -73,7 +74,7 @@ bool MppDecoder::allocateSurface(VASurfaceID id, DecodedSurface& out, int width,
     ds.width = static_cast<uint32_t>(width);
     ds.height = static_cast<uint32_t>(height);
     ds.stride = stride;
-    ds.is_10bit = (profile_ == CodecProfile::AV1) && kAv1ExportAsP010;
+    ds.is_10bit = wants_10bit;
     auto dmabuf = createFallbackSurfaceFd(ds.width, ds.height, ds.is_10bit);
     if (!dmabuf) {
         return false;
