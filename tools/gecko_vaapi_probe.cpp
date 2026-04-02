@@ -18,6 +18,7 @@ extern "C" {
 #include <array>
 #include <cctype>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -80,6 +81,7 @@ class UniqueFd {
 
 struct Options {
     std::string drm_device;
+    std::string input_path;
     std::string export_type = "prime2";
     std::string format = "nv12";
     int width = 1920;
@@ -119,6 +121,56 @@ struct VaScope {
 [[noreturn]] void fail(std::string_view message);
 [[noreturn]] void fail_va(std::string_view stage, VAStatus status);
 bool containsInsensitive(std::string_view haystack, std::string_view needle);
+
+struct InputStreamInfo {
+    std::string codec;
+    int width = 0;
+    int height = 0;
+};
+
+class CommandPipe {
+   public:
+    CommandPipe() = default;
+    explicit CommandPipe(const std::string& command) : pipe_(popen(command.c_str(), "r")) {}
+
+    ~CommandPipe() {
+        close();
+    }
+
+    CommandPipe(const CommandPipe&) = delete;
+    CommandPipe& operator=(const CommandPipe&) = delete;
+
+    CommandPipe(CommandPipe&& other) noexcept : pipe_(other.pipe_) {
+        other.pipe_ = nullptr;
+    }
+
+    CommandPipe& operator=(CommandPipe&& other) noexcept {
+        if (this != &other) {
+            close();
+            pipe_ = other.pipe_;
+            other.pipe_ = nullptr;
+        }
+        return *this;
+    }
+
+    bool valid() const {
+        return pipe_ != nullptr;
+    }
+
+    size_t read(void* buffer, size_t size) {
+        return pipe_ ? std::fread(buffer, 1, size, pipe_) : 0;
+    }
+
+   private:
+    void close() {
+        if (pipe_) {
+            pclose(pipe_);
+            pipe_ = nullptr;
+        }
+    }
+
+    FILE* pipe_ = nullptr;
+};
 
 uint32_t chooseExpectedLayer0Format(const Options& options);
 uint32_t chooseExpectedLayer1Format(const Options& options);
@@ -899,6 +951,132 @@ std::string readFdInfo(int fd) {
     return buffer.str();
 }
 
+std::string shellQuote(std::string_view input) {
+    std::string quoted;
+    quoted.reserve(input.size() + 2);
+    quoted.push_back('\'');
+    for (char ch : input) {
+        if (ch == '\'') {
+            quoted += "'\\''";
+        } else {
+            quoted.push_back(ch);
+        }
+    }
+    quoted.push_back('\'');
+    return quoted;
+}
+
+InputStreamInfo probeInputStream(const std::string& input_path) {
+    const std::string command = std::format(
+        "ffprobe -v error -select_streams v:0 -show_entries stream=codec_name,width,height -of default=noprint_wrappers=1:nokey=1 {}",
+        shellQuote(input_path));
+    CommandPipe pipe(command);
+    if (!pipe.valid()) {
+        fail("failed to run ffprobe for input probing");
+    }
+
+    std::array<char, 256> buffer{};
+    std::string output;
+    while (const size_t bytes = pipe.read(buffer.data(), buffer.size())) {
+        output.append(buffer.data(), bytes);
+    }
+
+    std::istringstream lines(output);
+    InputStreamInfo info;
+    if (!std::getline(lines, info.codec)) {
+        fail("ffprobe did not return a codec name");
+    }
+    std::string width_text;
+    std::string height_text;
+    if (!std::getline(lines, width_text) || !std::getline(lines, height_text)) {
+        fail("ffprobe did not return width and height");
+    }
+
+    try {
+        info.width = std::stoi(width_text);
+        info.height = std::stoi(height_text);
+    } catch (...) {
+        fail("failed to parse ffprobe dimensions");
+    }
+
+    if (info.width <= 0 || info.height <= 0) {
+        fail("ffprobe returned invalid dimensions");
+    }
+    return info;
+}
+
+std::vector<uint8_t> readDecodeChunk(const std::string& input_path) {
+    constexpr size_t kChunkSize = 1024 * 1024;
+    const std::string command = std::format(
+        "ffmpeg -hide_banner -loglevel error -i {} -vcodec copy -an -f h264 pipe:1 2>/dev/null",
+        shellQuote(input_path));
+    CommandPipe pipe(command);
+    if (!pipe.valid()) {
+        fail("failed to run ffmpeg for decode input");
+    }
+
+    std::vector<uint8_t> payload(kChunkSize);
+    const size_t bytes = pipe.read(payload.data(), payload.size());
+    if (bytes == 0) {
+        fail("ffmpeg did not produce any H.264 bitstream bytes");
+    }
+    payload.resize(bytes);
+    return payload;
+}
+
+void submitDecodeChunk(VADisplay display,
+                       VAContextID context,
+                       VASurfaceID surface,
+                       const std::vector<uint8_t>& payload) {
+    VABufferID buffer = VA_INVALID_ID;
+    VAStatus status = vaCreateBuffer(display,
+                                     context,
+                                     VASliceDataBufferType,
+                                     static_cast<unsigned int>(payload.size()),
+                                     1,
+                                     const_cast<uint8_t*>(payload.data()),
+                                     &buffer);
+    if (status != VA_STATUS_SUCCESS) {
+        fail_va("vaCreateBuffer", status);
+    }
+
+    auto cleanup = makeScopeExit([&] {
+        if (buffer != VA_INVALID_ID) {
+            vaDestroyBuffer(display, buffer);
+        }
+    });
+
+    status = vaBeginPicture(display, context, surface);
+    if (status != VA_STATUS_SUCCESS) {
+        fail_va("vaBeginPicture", status);
+    }
+
+    status = vaRenderPicture(display, context, &buffer, 1);
+    if (status != VA_STATUS_SUCCESS) {
+        fail_va("vaRenderPicture", status);
+    }
+
+    status = vaEndPicture(display, context);
+    if (status != VA_STATUS_SUCCESS) {
+        fail_va("vaEndPicture", status);
+    }
+}
+
+VAStatus syncSurfaceWithRetry(VADisplay display, VASurfaceID surface) {
+    constexpr int kMaxRetries = 50;
+    for (int attempt = 0; attempt < kMaxRetries; ++attempt) {
+        const VAStatus status = vaSyncSurface(display, surface);
+        if (status == VA_STATUS_SUCCESS) {
+            return status;
+        }
+        if (status != VA_STATUS_ERROR_SURFACE_BUSY && status != VA_STATUS_ERROR_TIMEDOUT) {
+            return status;
+        }
+        usleep(5000);
+    }
+    return VA_STATUS_ERROR_TIMEDOUT;
+}
+
 std::string readFdLinkTarget(int fd) {
     std::array<char, 512> buffer{};
     const auto path = std::format("/proc/self/fd/{}", fd);
@@ -972,6 +1150,7 @@ void printDescriptorMetadata(const VADRMPRIMESurfaceDescriptor& desc) {
 void printUsage(const char* argv0) {
     std::cout << "Usage: " << argv0 << " [options]\n"
               << "  --drm-device <path>      DRM render node to use\n"
+              << "  --input <file>           Decode one real H.264 frame before export\n"
               << "  --width <pixels>         Surface width (default 1920)\n"
               << "  --height <pixels>        Surface height (default 1080)\n"
               << "  --format <nv12|p010>     Surface pixel format (default nv12)\n"
@@ -998,6 +1177,10 @@ Options parseArgs(int argc, char** argv) {
         }
         if (arg == "--drm-device") {
             options.drm_device = require_value(arg);
+            continue;
+        }
+        if (arg == "--input") {
+            options.input_path = require_value(arg);
             continue;
         }
         if (arg == "--width") {
@@ -1036,6 +1219,9 @@ Options parseArgs(int argc, char** argv) {
     }
     if (options.format != "nv12" && options.format != "p010") {
         fail("--format must be nv12 or p010");
+    }
+    if (!options.input_path.empty() && options.format != "nv12") {
+        fail("--input currently supports only nv12 / H.264 decode validation");
     }
     return options;
 }
@@ -1290,6 +1476,20 @@ void printCompatibilityReport(const Options& options,
 
 int main(int argc, char** argv) {
     const Options options = parseArgs(argc, argv);
+    InputStreamInfo input_info;
+    std::vector<uint8_t> decode_payload;
+    int surface_width = options.width;
+    int surface_height = options.height;
+    if (!options.input_path.empty()) {
+        input_info = probeInputStream(options.input_path);
+        if (!containsInsensitive(input_info.codec, "h264") && !containsInsensitive(input_info.codec, "avc")) {
+            fail(std::format("--input requires an H.264 stream, got {}", input_info.codec));
+        }
+        surface_width = input_info.width;
+        surface_height = input_info.height;
+        decode_payload = readDecodeChunk(options.input_path);
+    }
+
     DrmDevice drm_device = resolveDrmDevice(options);
 
     std::cout << std::format("[Gecko Probe] DRM Device: path={}, driver={}, fd={}\n",
@@ -1338,8 +1538,8 @@ int main(int argc, char** argv) {
     va.surfaces.resize(1, VA_INVALID_ID);
     status = vaCreateSurfaces(display,
                               chooseRtFormat(options),
-                              options.width,
-                              options.height,
+                              surface_width,
+                              surface_height,
                               va.surfaces.data(),
                               static_cast<unsigned int>(va.surfaces.size()),
                               nullptr,
@@ -1350,8 +1550,8 @@ int main(int argc, char** argv) {
 
     status = vaCreateContext(display,
                              va.config,
-                             options.width,
-                             options.height,
+                             surface_width,
+                             surface_height,
                              VA_PROGRESSIVE,
                              va.surfaces.data(),
                              static_cast<int>(va.surfaces.size()),
@@ -1366,6 +1566,23 @@ int main(int argc, char** argv) {
                                  va.surfaces[0]);
     }
 
+    if (!options.input_path.empty()) {
+        std::cout << std::format("[Gecko Probe] Decode Input: path={} codec={} width={} height={} bytes={}\n",
+                                 options.input_path,
+                                 input_info.codec,
+                                 surface_width,
+                                 surface_height,
+                                 decode_payload.size());
+        submitDecodeChunk(display, va.context, va.surfaces[0], decode_payload);
+    } else {
+        std::cout << "[Gecko Probe] No input provided; export will reflect blank-surface behavior\n";
+    }
+
+    status = syncSurfaceWithRetry(display, va.surfaces[0]);
+    if (status != VA_STATUS_SUCCESS) {
+        fail_va("vaSyncSurface", status);
+    }
+
     VADRMPRIMESurfaceDescriptor desc{};
     const uint32_t export_flags = options.export_type == "prime2"
                                       ? VA_EXPORT_SURFACE_READ_ONLY | VA_EXPORT_SURFACE_SEPARATE_LAYERS
@@ -1377,12 +1594,6 @@ int main(int argc, char** argv) {
                                    &desc);
     if (status != VA_STATUS_SUCCESS) {
         fail_va("vaExportSurfaceHandle", status);
-    }
-
-    status = vaSyncSurface(display, va.surfaces[0]);
-    if (status != VA_STATUS_SUCCESS) {
-        closeExportedDescriptorObjects(desc);
-        fail_va("vaSyncSurface", status);
     }
 
     validateDescriptor(options, desc);
@@ -1454,8 +1665,9 @@ int main(int argc, char** argv) {
 
     printCompatibilityReport(options, drm_device, desc, egl_import_success, egl_import_failure);
 
-    std::cout << std::format("[Gecko Probe] Verdict: requested {} export path validated through descriptor export\n",
-                             options.export_type);
+    std::cout << std::format("[Gecko Probe] Verdict: requested {} export path validated through {}\n",
+                             options.export_type,
+                             options.input_path.empty() ? "surface sync + descriptor export" : "real H.264 decode + surface sync + descriptor export");
     closeExportedDescriptorObjects(desc);
     return options.import_egl && !egl_import_success ? 2 : 0;
 }
