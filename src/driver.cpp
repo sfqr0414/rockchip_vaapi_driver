@@ -823,9 +823,15 @@ static VAStatus vaQueryConfigProfiles(VADriverContextP ctx,
         return VA_STATUS_SUCCESS;
     }
 
+    // Some Firefox probes pass a preallocated buffer with the input count set
+    // to 0 and expect the driver to populate the full list anyway.
+    int requested = *num_profiles;
+    if (requested <= 0) {
+        requested = supported_count;
+    }
+
     // Always return success and report the full supported count.
-    // Firefox expects the count even if the provided buffer is smaller.
-    int fill = std::min(*num_profiles, supported_count);
+    int fill = std::min(requested, supported_count);
     for (int i = 0; i < fill; i++) {
         profile_list[i] = supported[i];
     }
@@ -846,10 +852,9 @@ static VAStatus vaQueryConfigEntrypoints(VADriverContextP ctx,
     }
     if (!isSupportedProfile(profile)) return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;
     if (!num_entrypoints) return VA_STATUS_ERROR_INVALID_PARAMETER;
-    // We only support decoding
-    if (*num_entrypoints < 1) {
+    if (!entrypoint_list) {
         *num_entrypoints = 1;
-        return VA_STATUS_ERROR_MAX_NUM_EXCEEDED;
+        return VA_STATUS_SUCCESS;
     }
     entrypoint_list[0] = VAEntrypointVLD;
     *num_entrypoints = 1;
