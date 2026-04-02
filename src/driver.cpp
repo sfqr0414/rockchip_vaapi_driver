@@ -40,6 +40,12 @@ using namespace rockchip;
 
 namespace rockchip_vaapi {
 
+namespace {
+
+constexpr bool kExposePrime2Export = true;
+
+}  // namespace
+
 namespace impl {
 
 struct SurfaceState {
@@ -725,17 +731,24 @@ static VAStatus vaSyncSurface(VADriverContextP ctx, VASurfaceID surface) {
     uint32_t width = 0, height = 0, stride = 0;
     int fd = -1;
     bool failed = false;
-    if (d->decoder->getSurfaceInfo(surface, width, height, stride, fd, failed)) {
+    bool pending = false;
+    if (d->decoder->getSurfaceInfo(surface, width, height, stride, fd, failed, pending)) {
         if (!ready && failed) {
             util::log(util::stderr_sink, util::LogLevel::Warn,
                       "vaSyncSurface: surface={} completed with decode failure", surface);
             return VA_STATUS_ERROR_DECODING_ERROR;
         }
 
-        if (!ready && !failed) {
+        if (!ready && !failed && pending) {
             util::log(util::stderr_sink, util::LogLevel::Warn,
                       "vaSyncSurface: surface={} waitSurfaceReady timed out", surface);
             return VA_STATUS_ERROR_TIMEDOUT;
+        }
+
+        if (!ready && !failed && !pending) {
+            util::log(util::stderr_sink, util::LogLevel::Warn,
+                      "vaSyncSurface: surface={} has no decoded output", surface);
+            return VA_STATUS_ERROR_INVALID_SURFACE;
         }
 
         if (failed || fd < 0) {
@@ -1001,7 +1014,10 @@ static VAStatus vaQuerySurfaceAttributes(VADriverContextP ctx,
     attrib_list[1].type = VASurfaceAttribMemoryType;
     attrib_list[1].flags = VA_SURFACE_ATTRIB_GETTABLE | VA_SURFACE_ATTRIB_SETTABLE;
     attrib_list[1].value.type = VAGenericValueTypeInteger;
-    attrib_list[1].value.value.i = VA_SURFACE_ATTRIB_MEM_TYPE_VA | VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2;
+    attrib_list[1].value.value.i = VA_SURFACE_ATTRIB_MEM_TYPE_VA | VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME;
+    if (kExposePrime2Export) {
+        attrib_list[1].value.value.i |= VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2;
+    }
 
     attrib_list[2].type = VASurfaceAttribDRMFormatModifiers;
     attrib_list[2].flags = VA_SURFACE_ATTRIB_GETTABLE;
@@ -1559,8 +1575,11 @@ static VAStatus vaExportSurfaceHandle(VADriverContextP ctx,
     if (it == d->surfaces.end()) return VA_STATUS_ERROR_INVALID_SURFACE;
     if (!descriptor) return VA_STATUS_ERROR_INVALID_PARAMETER;
 
-    if (mem_type != VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2 &&
-        mem_type != VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME) {
+    if (mem_type != VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME &&
+        mem_type != VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2) {
+        return VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE;
+    }
+    if (!kExposePrime2Export && mem_type == VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2) {
         return VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE;
     }
 
@@ -1597,7 +1616,9 @@ static VAStatus vaExportSurfaceHandle(VADriverContextP ctx,
     desc->objects[0].size = static_cast<uint32_t>(total_size);
     desc->objects[0].drm_format_modifier = DRM_FORMAT_MOD_LINEAR;
 
-    const bool separate_layers = (flags & VA_EXPORT_SURFACE_SEPARATE_LAYERS) != 0;
+    const bool separate_layers = kExposePrime2Export &&
+                                 mem_type == VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2 &&
+                                 (flags & VA_EXPORT_SURFACE_SEPARATE_LAYERS) != 0;
     if (separate_layers) {
         desc->num_layers = 2;
 

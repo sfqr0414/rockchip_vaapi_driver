@@ -481,39 +481,6 @@ inline void unpackPacked10RowLE(std::span<const uint8_t> src,
     return pwrite(fd, dst.data(), dst.size(), 0) == static_cast<ssize_t>(dst.size());
 }
 
-[[nodiscard]] inline DecoderResult<unique_fd> createFallbackSurfaceFd(uint32_t width, uint32_t height, bool is_10bit) {
-    uint64_t total_size = 0;
-    uint32_t stride = ((width + 63) / 64) * 64;
-    if (!is_10bit) {
-        total_size = static_cast<uint64_t>(stride) * static_cast<uint64_t>(height) * 3 / 2;
-    } else {
-        const uint32_t aligned_h = ((height + 7) / 8) * 8;
-        total_size = static_cast<uint64_t>(stride) * static_cast<uint64_t>(aligned_h) * 3;
-    }
-
-    char path_template[] = "/tmp/rockchip-vaapi-XXXXXX";
-    int fd = mkstemp(path_template);
-    if (fd < 0) {
-        util::log(util::stderr_sink, util::LogLevel::Error,
-                  "mpp: createFallbackSurfaceFd mkstemp failed errno={} ({})", errno, std::strerror(errno));
-        return DecoderError::IoFailure;
-    }
-    unique_fd owned_fd{fd};
-    unlink(path_template);
-    if (ftruncate(fd, static_cast<off_t>(total_size)) != 0) {
-        util::log(util::stderr_sink, util::LogLevel::Error,
-                  "mpp: createFallbackSurfaceFd ftruncate failed errno={} ({})", errno, std::strerror(errno));
-        return DecoderError::IoFailure;
-    }
-
-    auto mapping = MappedRegion::map(fd, static_cast<size_t>(total_size), PROT_READ | PROT_WRITE);
-    if (mapping) {
-        memset(mapping.data(), 0, static_cast<size_t>(total_size));
-    }
-
-    return std::move(owned_fd);
-}
-
 [[nodiscard]] inline CodecProfile vaProfileToCodec(VAProfile profile) {
     switch (profile) {
         case VAProfileH264ConstrainedBaseline:

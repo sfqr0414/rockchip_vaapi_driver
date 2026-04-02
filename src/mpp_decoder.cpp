@@ -75,18 +75,15 @@ bool MppDecoder::allocateSurface(VASurfaceID id, DecodedSurface& out, int width,
     ds.height = static_cast<uint32_t>(height);
     ds.stride = stride;
     ds.is_10bit = wants_10bit;
-    auto dmabuf = createFallbackSurfaceFd(ds.width, ds.height, ds.is_10bit);
-    if (!dmabuf) {
-        return false;
-    }
-    ds.dmabuf_fd = dmabuf.value().get();
+    ds.dmabuf_fd = -1;
 
     std::lock_guard<std::mutex> lock(surface_mutex_);
     auto& entry = surfaces_[id];
     entry.surface = ds;
-    entry.dmabuf = std::move(dmabuf.value());
-    entry.surface.dmabuf_fd = entry.dmabuf.get();
-    entry.ready.store(true);
+    entry.dmabuf.reset();
+    entry.surface.dmabuf_fd = -1;
+    entry.in_flight.store(false);
+    entry.ready.store(false);
     entry.failed.store(false);
     out = entry.surface;
     return true;
@@ -104,7 +101,7 @@ bool MppDecoder::updateSurfaceResolution(VASurfaceID id, int width, int height) 
     return true;
 }
 
-bool MppDecoder::getSurfaceInfo(VASurfaceID id, uint32_t& width, uint32_t& height, uint32_t& stride, int& dmabuf_fd, bool& failed) {
+bool MppDecoder::getSurfaceInfo(VASurfaceID id, uint32_t& width, uint32_t& height, uint32_t& stride, int& dmabuf_fd, bool& failed, bool& pending) {
     std::lock_guard<std::mutex> lock(surface_mutex_);
     auto it = surfaces_.find(id);
     if (it == surfaces_.end()) return false;
@@ -113,6 +110,7 @@ bool MppDecoder::getSurfaceInfo(VASurfaceID id, uint32_t& width, uint32_t& heigh
     stride = it->second.surface.stride;
     dmabuf_fd = it->second.dmabuf.get();
     failed = it->second.failed.load();
+    pending = it->second.in_flight.load();
     return true;
 }
 
@@ -181,6 +179,7 @@ void MppDecoder::setSurfaceState(VASurfaceID surface, bool ready, bool failed) {
     std::lock_guard<std::mutex> lock(surface_mutex_);
     auto it = surfaces_.find(surface);
     if (it == surfaces_.end()) return;
+    it->second.in_flight.store(false, std::memory_order_release);
     it->second.ready.store(ready, std::memory_order_release);
     it->second.failed.store(failed, std::memory_order_release);
     std::lock_guard<std::mutex> lock2(cv_mutex_);
@@ -255,17 +254,27 @@ VASurfaceID MppDecoder::dropOldestPendingSurfaceLocked() {
 }
 
 bool MppDecoder::waitSurfaceReady(VASurfaceID surface, uint32_t timeout_ms) {
+    std::atomic<bool>* pending_flag = nullptr;
     std::atomic<bool>* ready_flag = nullptr;
     std::atomic<bool>* failed_flag = nullptr;
     {
         std::lock_guard<std::mutex> lock(surface_mutex_);
         auto it = surfaces_.find(surface);
         if (it == surfaces_.end()) return false;
+        pending_flag = &it->second.in_flight;
         ready_flag = &it->second.ready;
         failed_flag = &it->second.failed;
     }
 
-    if (!ready_flag || !failed_flag) return false;
+    if (!pending_flag || !ready_flag || !failed_flag) return false;
+
+    if (ready_flag->load(std::memory_order_acquire) || failed_flag->load(std::memory_order_acquire)) {
+        return ready_flag->load(std::memory_order_acquire) && !failed_flag->load(std::memory_order_acquire);
+    }
+
+    if (!pending_flag->load(std::memory_order_acquire)) {
+        return false;
+    }
 
     static std::atomic<int> wait_start_log_count{0};
     if (wait_start_log_count.fetch_add(1, std::memory_order_relaxed) < 3) {
@@ -295,6 +304,7 @@ void MppDecoder::forceSurfaceReady(VASurfaceID surface) {
     std::lock_guard<std::mutex> lock(surface_mutex_);
     auto it = surfaces_.find(surface);
     if (it == surfaces_.end()) return;
+    it->second.in_flight.store(false);
     it->second.failed.store(false);
     it->second.ready.store(true);
     std::lock_guard<std::mutex> lock2(cv_mutex_);
@@ -305,6 +315,7 @@ void MppDecoder::resetSurface(VASurfaceID surface) {
     std::lock_guard<std::mutex> lock(surface_mutex_);
     auto it = surfaces_.find(surface);
     if (it == surfaces_.end()) return;
+    it->second.in_flight.store(true);
     it->second.ready.store(false);
     it->second.failed.store(false);
     std::lock_guard<std::mutex> lock2(cv_mutex_);
@@ -319,6 +330,7 @@ void MppDecoder::releaseSurface(VASurfaceID surface) {
     it->second.dmabuf.reset();
     it->second.surface.dmabuf_fd = -1;
 
+    it->second.in_flight.store(false);
     it->second.ready.store(false);
     it->second.failed.store(false);
 }
@@ -332,6 +344,7 @@ void MppDecoder::destroySurface(VASurfaceID surface) {
             it->second.buffer.reset();
             it->second.dmabuf.reset();
             it->second.surface.dmabuf_fd = -1;
+            it->second.in_flight.store(false);
 
             surfaces_.erase(it);
         }
@@ -403,6 +416,7 @@ void MppDecoder::shutdown() {
             kv.second.buffer.reset();
             kv.second.dmabuf.reset();
             kv.second.surface.dmabuf_fd = -1;
+            kv.second.in_flight.store(false);
         }
         surfaces_.clear();
     }
@@ -702,6 +716,7 @@ void MppDecoder::outputThreadMain(std::stop_token st) {
                                   "mpp: failed to export decoded frame to surface={} width={} height={} stride={} fd={}",
                                   surface_id, output_width, output_height, src_stride_pixels, frame_fd);
                     }
+                    it->second.in_flight.store(false);
                     it->second.failed.store(true);
                     it->second.ready.store(false);
                     {
@@ -712,6 +727,7 @@ void MppDecoder::outputThreadMain(std::stop_token st) {
                     it->second.surface.width = output_width;
                     it->second.surface.height = output_height;
                     it->second.surface.stride = zero_copy_stride;
+                    it->second.in_flight.store(false);
                     it->second.failed.store(false);
                     it->second.ready.store(true);
                     {

@@ -31,6 +31,7 @@ class MppDecoder {
         unique_fd dmabuf;
         MppBufferHandle buffer;
         MppFrameHandle frame;
+        std::atomic<bool> in_flight{false};
         std::atomic<bool> ready{false};
         std::atomic<bool> failed{false};
     };
@@ -52,7 +53,7 @@ class MppDecoder {
 
     bool allocateSurface(VASurfaceID id, DecodedSurface& out, int width, int height);
     bool updateSurfaceResolution(VASurfaceID id, int width, int height);
-    bool getSurfaceInfo(VASurfaceID id, uint32_t& width, uint32_t& height, uint32_t& stride, int& dmabuf_fd, bool& failed);
+    bool getSurfaceInfo(VASurfaceID id, uint32_t& width, uint32_t& height, uint32_t& stride, int& dmabuf_fd, bool& failed, bool& pending);
     bool getSurfaceState(VASurfaceID id, bool& ready, bool& failed);
     bool waitSurfaceReady(VASurfaceID surface, uint32_t timeout_ms = 60000);
     void forceSurfaceReady(VASurfaceID surface);

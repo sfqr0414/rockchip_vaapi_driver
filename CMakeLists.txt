@@ -20,6 +20,8 @@ add_library(rockchip_drv_video SHARED
 
 add_executable(test_mpp_decode tools/test_mpp_decode.cpp)
 add_executable(vaapi_decode_test tools/vaapi_decode_test.cpp)
+add_executable(gecko_vaapi_probe tools/gecko_vaapi_probe.cpp)
+add_executable(panthor_egl_import_test tools/panthor_egl_import_test.cpp)
 
 target_link_libraries(test_mpp_decode PRIVATE
     dl
@@ -33,6 +35,20 @@ target_link_libraries(vaapi_decode_test PRIVATE
     pthread
 )
 
+target_link_libraries(gecko_vaapi_probe PRIVATE
+    ${LIBVA_LIBRARIES}
+    ${LIBVA_DRM_LIBRARIES}
+    ${LIBDRM_LIBRARIES}
+    dl
+    pthread
+)
+
+target_link_libraries(panthor_egl_import_test PRIVATE
+    ${LIBDRM_LIBRARIES}
+    dl
+    pthread
+)
+
 target_include_directories(test_mpp_decode PRIVATE
     src
 )
@@ -40,6 +56,18 @@ target_include_directories(test_mpp_decode PRIVATE
 target_include_directories(vaapi_decode_test PRIVATE
     ${LIBVA_INCLUDE_DIRS}
     ${LIBVA_DRM_INCLUDE_DIRS}
+    ${LIBDRM_INCLUDE_DIRS}
+    src
+)
+
+target_include_directories(gecko_vaapi_probe PRIVATE
+    ${LIBVA_INCLUDE_DIRS}
+    ${LIBVA_DRM_INCLUDE_DIRS}
+    ${LIBDRM_INCLUDE_DIRS}
+    src
+)
+
+target_include_directories(panthor_egl_import_test PRIVATE
     ${LIBDRM_INCLUDE_DIRS}
     src
 )
