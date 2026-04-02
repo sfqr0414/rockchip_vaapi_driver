@@ -327,6 +327,8 @@ void MppDecoder::destroySurface(VASurfaceID surface) {
         std::lock_guard<std::mutex> lock(surface_mutex_);
         auto it = surfaces_.find(surface);
         if (it != surfaces_.end()) {
+            it->second.frame.reset();
+            it->second.buffer.reset();
             it->second.dmabuf.reset();
             it->second.surface.dmabuf_fd = -1;
 
@@ -396,6 +398,8 @@ void MppDecoder::shutdown() {
     {
         std::scoped_lock lock(surface_mutex_);
         for (auto& kv : surfaces_) {
+            kv.second.frame.reset();
+            kv.second.buffer.reset();
             kv.second.dmabuf.reset();
             kv.second.surface.dmabuf_fd = -1;
         }
@@ -669,60 +673,33 @@ void MppDecoder::outputThreadMain(std::stop_token st) {
                 const uint32_t src_stride_pixels = mpp_frame_get_hor_stride_pixel(frame);
                 const uint32_t src_stride_bytes = mpp_frame_get_hor_stride(frame);
                 const uint32_t src_ver_stride = mpp_frame_get_ver_stride(frame);
-                const uint32_t dst_stride = it->second.surface.stride;
-                bool copy_ok = false;
+                const uint32_t zero_copy_stride = src_stride_pixels ? src_stride_pixels
+                                                                    : (it->second.surface.is_10bit ? src_stride_bytes / 2 : src_stride_bytes);
+                const int frame_fd = mpp_buf ? mpp_buffer_get_fd(mpp_buf) : -1;
+                bool export_ok = false;
 
-                if (mpp_buf && it->second.surface.dmabuf_fd >= 0 && output_width > 0 && output_height > 0 && !is_error) {
-                    const uint8_t* src_ptr = static_cast<const uint8_t*>(mpp_buffer_get_ptr(mpp_buf));
-                    size_t src_size = mpp_buffer_get_size(mpp_buf);
-                    std::vector<uint8_t> mapped_copy;
-                    static std::atomic<int> copy_trace_count{0};
-                    if (copy_trace_count.fetch_add(1, std::memory_order_relaxed) < 1) {
+                if (mpp_buf && frame_fd >= 0 && output_width > 0 && output_height > 0 && !is_error) {
+                    mpp_buffer_inc_ref(mpp_buf);
+                    it->second.buffer.reset(mpp_buf);
+                    it->second.dmabuf.reset(frame_fd >= 0 ? dup(frame_fd) : -1);
+                    it->second.surface.dmabuf_fd = it->second.dmabuf.get();
+                    export_ok = it->second.surface.dmabuf_fd >= 0;
+
+                    static std::atomic<int> zero_copy_log_count{0};
+                    if (export_ok && zero_copy_log_count.fetch_add(1, std::memory_order_relaxed) < 4) {
                         util::log(util::stderr_sink, util::LogLevel::Info,
-                                  "mpp: copy frame surface={} fmt={} mode={} out_w={} out_h={} src_stride_px={} src_stride_bytes={} src_ver_stride={} src_size={}",
+                                  "mpp: zero-copy frame surface={} fmt={} mode={} out_w={} out_h={} stride_px={} stride_bytes={} ver_stride={} fd={}",
                                   surface_id, static_cast<uint32_t>(frame_fmt), frame_mode,
-                                  output_width, output_height, src_stride_pixels, src_stride_bytes, src_ver_stride, src_size);
-                    }
-                    if (!src_ptr) {
-                        int src_fd = mpp_buffer_get_fd(mpp_buf);
-                        if (src_fd >= 0 && src_size > 0) {
-                            auto mapped = MappedRegion::map(src_fd, src_size, PROT_READ | PROT_WRITE);
-                            if (mapped) {
-                                src_ptr = static_cast<const uint8_t*>(mapped.data());
-                                mapped_copy.assign(src_size, 0);
-                                std::memcpy(mapped_copy.data(), src_ptr, src_size);
-                                src_ptr = mapped_copy.data();
-                            }
-                        }
-                    }
-
-                    if (src_ptr) {
-                        if (it->second.surface.is_10bit) {
-                            copy_ok = writeSurfaceP010(it->second.dmabuf.get(),
-                                                       output_width,
-                                                       output_height,
-                                                       dst_stride,
-                                                       src_stride_bytes,
-                                                       src_ver_stride,
-                                                       std::span<const uint8_t>(src_ptr, src_size));
-                        } else {
-                            copy_ok = writeSurfaceNV12(it->second.dmabuf.get(),
-                                                       output_width,
-                                                       output_height,
-                                                       dst_stride,
-                                                       src_stride_bytes,
-                                                       src_ver_stride,
-                                                       std::span<const uint8_t>(src_ptr, src_size));
-                        }
+                                  output_width, output_height, src_stride_pixels, src_stride_bytes, src_ver_stride, frame_fd);
                     }
                 }
 
-                if (is_error || !copy_ok) {
+                if (is_error || !export_ok) {
                     static std::atomic<int> err_log_count{0};
-                    if (err_log_count.fetch_add(1, std::memory_order_relaxed) < 1) {
+                    if (err_log_count.fetch_add(1, std::memory_order_relaxed) < 4) {
                         util::log(util::stderr_sink, util::LogLevel::Warn,
-                                  "mpp: failed to copy decoded frame to surface={} width={} height={} stride={}",
-                                  surface_id, output_width, output_height, src_stride_pixels);
+                                  "mpp: failed to export decoded frame to surface={} width={} height={} stride={} fd={}",
+                                  surface_id, output_width, output_height, src_stride_pixels, frame_fd);
                     }
                     it->second.failed.store(true);
                     it->second.ready.store(false);
@@ -733,7 +710,7 @@ void MppDecoder::outputThreadMain(std::stop_token st) {
                 } else {
                     it->second.surface.width = output_width;
                     it->second.surface.height = output_height;
-                    it->second.surface.stride = dst_stride;
+                    it->second.surface.stride = zero_copy_stride;
                     it->second.failed.store(false);
                     it->second.ready.store(true);
                     {
