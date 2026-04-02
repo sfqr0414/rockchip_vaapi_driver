@@ -511,8 +511,19 @@ static Expected<ResolvedDrmDevice, VAStatus> resolveDrmDevice(VADriverContextP c
         ResolvedDrmDevice device;
         device.fd = *inherited_fd;
         auto status = validateResolvedDrmFd(device.fd, true, &device.rdev, &device.path, &device.driver_name);
-        if (!status) return status.error();
-        return device;
+        if (status) {
+            return device;
+        }
+
+        auto fallback = resolveDrmDeviceFromLibdrmScan();
+        if (fallback) {
+            util::log(util::stdout_sink, util::LogLevel::Warn,
+                      "Falling back from inherited DRM fd {} to compatible render node {} (driver={})",
+                      *inherited_fd, fallback.value().path, fallback.value().driver_name);
+            return fallback;
+        }
+
+        return status.error();
     }
 
     return resolveDrmDeviceFromLibdrmScan();
