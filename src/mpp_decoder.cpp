@@ -549,22 +549,6 @@ void MppDecoder::outputThreadMain(std::stop_token st) {
 
     while (!st.stop_requested() && (running_ || !eos_seen_)) {
         MppFrame frame = nullptr;
-        if (running_ && profile_ != CodecProfile::AV1 && !eos_sent_.load(std::memory_order_relaxed)) {
-            const uint64_t now_us = steadyMicrosNow();
-            const uint64_t last_us = last_enqueue_us_.load(std::memory_order_relaxed);
-            const size_t pending_surfaces = pending_count_;
-            if (last_us != 0 && pending_surfaces > 0 && now_us > last_us + kDecoderFlushIdleMicros) {
-                const bool submitted = submitDecoderEos(ctx, api, running_);
-                if (submitted) {
-                    static std::atomic<int> idle_eos_log_count{0};
-                    if (idle_eos_log_count.fetch_add(1, std::memory_order_relaxed) < 4) {
-                        util::log(util::stderr_sink, util::LogLevel::Info,
-                                  "mpp: outputThread submitted idle EOS pending={}", pending_surfaces);
-                    }
-                    eos_sent_ = true;
-                }
-            }
-        }
         static std::atomic<int> get_log_count{0};
         if (get_log_count.fetch_add(1, std::memory_order_relaxed) < 5) {
             util::log(util::stderr_sink, util::LogLevel::Info,
@@ -584,29 +568,6 @@ void MppDecoder::outputThreadMain(std::stop_token st) {
         }
 
         if (ret == MPP_ERR_TIMEOUT || (ret == MPP_OK && !frame)) {
-            if (profile_ != CodecProfile::AV1 && !eos_sent_.load(std::memory_order_relaxed)) {
-                const uint64_t now_us = steadyMicrosNow();
-                const uint64_t last_enqueue = last_enqueue_us_.load(std::memory_order_relaxed);
-                size_t pending_surfaces = 0;
-                {
-                    std::lock_guard<std::mutex> lock(pending_mutex_);
-                    pending_surfaces = pending_count_;
-                }
-
-                if (pending_surfaces > 0 && last_enqueue != 0 && now_us > last_enqueue + kDecoderFlushIdleMicros) {
-                    const bool submitted = submitDecoderEos(ctx, api, running_);
-                    if (submitted) {
-                        static std::atomic<int> timeout_eos_log_count{0};
-                        if (timeout_eos_log_count.fetch_add(1, std::memory_order_relaxed) < 4) {
-                            util::log(util::stderr_sink, util::LogLevel::Info,
-                                      "mpp: timeout path submitted idle EOS pending={}", pending_surfaces);
-                        }
-                        eos_sent_ = true;
-                        continue;
-                    }
-                }
-            }
-
             if (eos_sent_.load(std::memory_order_relaxed)) {
                 std::lock_guard<std::mutex> lock(pending_mutex_);
                 if (pending_count_ == 0 && pending_surfaces_.empty()) {
