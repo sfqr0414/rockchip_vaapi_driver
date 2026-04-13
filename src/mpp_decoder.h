@@ -9,6 +9,7 @@
 #include <stop_token>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "mpp_common.hpp"
 #include "util/atomic_sync_queue.h"
@@ -38,6 +39,10 @@ class MppDecoder {
         std::atomic<bool> in_flight{false};
         std::atomic<bool> ready{false};
         std::atomic<bool> failed{false};
+        std::atomic<uint64_t> last_submitted_job_id{0};
+        std::atomic<uint64_t> last_completed_job_id{0};
+        std::atomic<uint64_t> last_submit_us{0};
+        std::atomic<uint64_t> last_complete_us{0};
     };
 
     struct DecodeJob {
@@ -45,6 +50,7 @@ class MppDecoder {
         std::vector<uint8_t> bitstream;
         std::vector<uint8_t> extra_data;
         bool eos = false;
+        bool discard_output = false;
         uint64_t job_id = 0;
     };
 
@@ -60,6 +66,7 @@ class MppDecoder {
     bool getSurfaceInfo(VASurfaceID id, uint32_t& width, uint32_t& height, uint32_t& stride, int& dmabuf_fd, bool& failed, bool& pending);
     bool getSurfaceState(VASurfaceID id, bool& ready, bool& failed);
     bool waitSurfaceReady(VASurfaceID surface, uint32_t timeout_ms = 60000);
+    bool getSurfaceDebugInfo(VASurfaceID id, uint64_t& last_submitted_job_id, uint64_t& last_completed_job_id, uint64_t& last_submit_us, uint64_t& last_complete_us);
     void forceSurfaceReady(VASurfaceID surface);
     void resetSurface(VASurfaceID surface);
     void releaseSurface(VASurfaceID surface);
@@ -89,6 +96,7 @@ class MppDecoder {
 
     std::unordered_map<VASurfaceID, SurfaceInfo> surfaces_;
     std::deque<std::pair<uint64_t, VASurfaceID>> pending_surfaces_;
+    std::unordered_set<uint64_t> discard_output_job_ids_;
     std::unordered_map<uint64_t, VASurfaceID> pending_surface_pts_;
     std::deque<MppPacket> pending_packets_;
     std::unordered_map<uint64_t, std::shared_ptr<std::vector<uint8_t>>> pending_payloads_;

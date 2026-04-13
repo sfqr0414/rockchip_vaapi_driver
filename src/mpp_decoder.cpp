@@ -311,6 +311,21 @@ bool MppDecoder::getSurfaceState(VASurfaceID id, bool& ready, bool& failed) {
     return true;
 }
 
+bool MppDecoder::getSurfaceDebugInfo(VASurfaceID id,
+                                     uint64_t& last_submitted_job_id,
+                                     uint64_t& last_completed_job_id,
+                                     uint64_t& last_submit_us,
+                                     uint64_t& last_complete_us) {
+    std::lock_guard<std::mutex> lock(surface_mutex_);
+    auto it = surfaces_.find(id);
+    if (it == surfaces_.end()) return false;
+    last_submitted_job_id = it->second.last_submitted_job_id.load(std::memory_order_acquire);
+    last_completed_job_id = it->second.last_completed_job_id.load(std::memory_order_acquire);
+    last_submit_us = it->second.last_submit_us.load(std::memory_order_acquire);
+    last_complete_us = it->second.last_complete_us.load(std::memory_order_acquire);
+    return true;
+}
+
 bool MppDecoder::enqueueJob(DecodeJob job) {
     if (!session_) return false;
 
@@ -326,6 +341,15 @@ bool MppDecoder::enqueueJob(DecodeJob job) {
     }
 
     if (job.target_surface != VA_INVALID_ID) {
+        {
+            std::lock_guard<std::mutex> surface_lock(surface_mutex_);
+            auto surface_it = surfaces_.find(job.target_surface);
+            if (surface_it != surfaces_.end()) {
+                surface_it->second.last_submitted_job_id.store(job.job_id, std::memory_order_release);
+                surface_it->second.last_submit_us.store(steadyMicrosNow(), std::memory_order_release);
+            }
+        }
+
         size_t surface_count = 0;
         {
             std::lock_guard<std::mutex> lock(surface_mutex_);
@@ -346,10 +370,21 @@ bool MppDecoder::enqueueJob(DecodeJob job) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
             lock.lock();
         }
+        static std::atomic<int> dedupe_log_count{0};
+        if (dropPendingSurfaceLocked(job.target_surface) &&
+            dedupe_log_count.fetch_add(1, std::memory_order_relaxed) < 8) {
+            util::log(util::stderr_sink, util::LogLevel::Info,
+                      "mpp: enqueueJob replaced older pending work for surface={} with job_id={}",
+                      job.target_surface,
+                      static_cast<unsigned long long>(job.job_id));
+        }
         pending_surfaces_.emplace_back(job.job_id, job.target_surface);
         pending_surface_pts_[job.job_id] = job.target_surface;
         ++pending_count_;
         pending_cv_.notify_all();
+    } else if (job.discard_output) {
+        std::lock_guard<std::mutex> lock(pending_mutex_);
+        discard_output_job_ids_.insert(job.job_id);
     }
 
     static std::atomic<int> enqueue_log_count{0};
@@ -393,6 +428,7 @@ std::vector<VASurfaceID> MppDecoder::failPendingSurfaces(VASurfaceID preferred_s
         }
 
         pending_surfaces_.clear();
+        discard_output_job_ids_.clear();
         pending_surface_pts_.clear();
         pending_payloads_.clear();
         pending_count_ = 0;
@@ -409,6 +445,7 @@ bool MppDecoder::dropPendingSurfaceLocked(VASurfaceID surface) {
     bool removed = false;
     for (auto it = pending_surfaces_.begin(); it != pending_surfaces_.end();) {
         if (it->second == surface) {
+            discard_output_job_ids_.insert(it->first);
             pending_surface_pts_.erase(it->first);
             pending_payloads_.erase(it->first);
             it = pending_surfaces_.erase(it);
@@ -430,6 +467,7 @@ bool MppDecoder::dropPendingSurfaceLocked(VASurfaceID surface) {
 bool MppDecoder::dropPendingJobLocked(uint64_t job_id, VASurfaceID* surface) {
     auto surface_it = pending_surface_pts_.find(job_id);
     if (surface_it == pending_surface_pts_.end()) {
+        discard_output_job_ids_.erase(job_id);
         return false;
     }
 
@@ -471,6 +509,10 @@ bool MppDecoder::waitSurfaceReady(VASurfaceID surface, uint32_t timeout_ms) {
     std::atomic<bool>* pending_flag = nullptr;
     std::atomic<bool>* ready_flag = nullptr;
     std::atomic<bool>* failed_flag = nullptr;
+    std::atomic<uint64_t>* last_submitted_job_id = nullptr;
+    std::atomic<uint64_t>* last_completed_job_id = nullptr;
+    std::atomic<uint64_t>* last_submit_us = nullptr;
+    std::atomic<uint64_t>* last_complete_us = nullptr;
     {
         std::lock_guard<std::mutex> lock(surface_mutex_);
         auto it = surfaces_.find(surface);
@@ -478,9 +520,13 @@ bool MppDecoder::waitSurfaceReady(VASurfaceID surface, uint32_t timeout_ms) {
         pending_flag = &it->second.in_flight;
         ready_flag = &it->second.ready;
         failed_flag = &it->second.failed;
+        last_submitted_job_id = &it->second.last_submitted_job_id;
+        last_completed_job_id = &it->second.last_completed_job_id;
+        last_submit_us = &it->second.last_submit_us;
+        last_complete_us = &it->second.last_complete_us;
     }
 
-    if (!pending_flag || !ready_flag || !failed_flag) return false;
+    if (!pending_flag || !ready_flag || !failed_flag || !last_submitted_job_id || !last_completed_job_id || !last_submit_us || !last_complete_us) return false;
 
     if (ready_flag->load(std::memory_order_acquire) || failed_flag->load(std::memory_order_acquire)) {
         return ready_flag->load(std::memory_order_acquire) && !failed_flag->load(std::memory_order_acquire);
@@ -504,10 +550,25 @@ bool MppDecoder::waitSurfaceReady(VASurfaceID surface, uint32_t timeout_ms) {
 
     const bool failed = failed_flag->load(std::memory_order_acquire);
     const bool ready = ready_flag->load(std::memory_order_acquire);
+    const bool still_pending = pending_flag->load(std::memory_order_acquire);
+    const uint64_t submitted_job_id = last_submitted_job_id->load(std::memory_order_acquire);
+    const uint64_t completed_job_id = last_completed_job_id->load(std::memory_order_acquire);
+    const uint64_t submit_us = last_submit_us->load(std::memory_order_acquire);
+    const uint64_t complete_us = last_complete_us->load(std::memory_order_acquire);
+    const uint64_t now_us = steadyMicrosNow();
     static std::atomic<int> wait_end_log_count{0};
     if (wait_end_log_count.fetch_add(1, std::memory_order_relaxed) < 3) {
         util::log(util::stderr_sink, util::LogLevel::Info,
-                  "mpp: waitSurfaceReady end surface={} ready={} failed={}", surface, ready ? 1 : 0, failed ? 1 : 0);
+                  "mpp: waitSurfaceReady end surface={} ready={} failed={} pending={} submitted_job={} completed_job={} wait_ms={} since_submit_ms={} since_complete_ms={}",
+                  surface,
+                  ready ? 1 : 0,
+                  failed ? 1 : 0,
+                  still_pending ? 1 : 0,
+                  static_cast<unsigned long long>(submitted_job_id),
+                  static_cast<unsigned long long>(completed_job_id),
+                  timeout_ms,
+                  submit_us == 0 ? 0ull : static_cast<unsigned long long>((now_us - submit_us) / 1000),
+                  complete_us == 0 ? 0ull : static_cast<unsigned long long>((now_us - complete_us) / 1000));
     }
 
     if (failed) return false;
@@ -840,10 +901,22 @@ void MppDecoder::outputThreadMain(std::stop_token st) {
             if (surface_id == VA_INVALID_ID) {
                 RK_S64 frame_pts = mpp_frame_get_pts(frame);
                 if (frame_pts > 0) {
-                    auto it = pending_surface_pts_.find(static_cast<uint64_t>(frame_pts));
+                    const uint64_t frame_job_id = static_cast<uint64_t>(frame_pts);
+                    if (discard_output_job_ids_.erase(frame_job_id) > 0) {
+                        static std::atomic<int> discard_log_count{0};
+                        if (discard_log_count.fetch_add(1, std::memory_order_relaxed) < 8) {
+                            util::log(util::stderr_sink, util::LogLevel::Info,
+                                      "mpp: outputThread discarded priming frame job_id={} pts={}",
+                                      static_cast<unsigned long long>(frame_job_id),
+                                      static_cast<long long>(frame_pts));
+                        }
+                        continue;
+                    }
+
+                    auto it = pending_surface_pts_.find(frame_job_id);
                     if (it != pending_surface_pts_.end()) {
                         surface_id = it->second;
-                        dropPendingJobLocked(static_cast<uint64_t>(frame_pts));
+                        dropPendingJobLocked(frame_job_id);
                     }
                 }
             }
@@ -957,6 +1030,8 @@ void MppDecoder::outputThreadMain(std::stop_token st) {
                     it->second.in_flight.store(false);
                     it->second.failed.store(true);
                     it->second.ready.store(false);
+                    it->second.last_completed_job_id.store(static_cast<uint64_t>(mpp_frame_get_pts(frame)), std::memory_order_release);
+                    it->second.last_complete_us.store(steadyMicrosNow(), std::memory_order_release);
                     {
                         std::lock_guard<std::mutex> lock(cv_mutex_);
                         cv_.notify_all();
@@ -968,6 +1043,8 @@ void MppDecoder::outputThreadMain(std::stop_token st) {
                     it->second.in_flight.store(false);
                     it->second.failed.store(false);
                     it->second.ready.store(true);
+                    it->second.last_completed_job_id.store(static_cast<uint64_t>(mpp_frame_get_pts(frame)), std::memory_order_release);
+                    it->second.last_complete_us.store(steadyMicrosNow(), std::memory_order_release);
                     {
                         std::lock_guard<std::mutex> lock(cv_mutex_);
                         cv_.notify_all();

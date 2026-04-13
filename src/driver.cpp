@@ -168,6 +168,8 @@ struct PendingAv1Frame {
 struct CodecSessionState {
     bool sequence_headers_sent = false;
     unsigned int startup_prime_pictures_remaining = 0;
+    std::vector<VASurfaceID> startup_prime_surfaces;
+    size_t next_prime_surface_index = 0;
     bool av1_sequence_enable_restoration = false;
     std::array<VASurfaceID, 8> av1_ref_frame_map{};
     bool av1_ref_frame_map_valid = false;
@@ -176,6 +178,8 @@ struct CodecSessionState {
     void beginContext(VAProfile profile) {
         sequence_headers_sent = false;
         startup_prime_pictures_remaining = startupPrimePicturesForProfile(profile);
+        startup_prime_surfaces.clear();
+        next_prime_surface_index = 0;
         av1_sequence_enable_restoration = false;
         av1_ref_frame_map.fill(VA_INVALID_SURFACE);
         av1_ref_frame_map_valid = false;
@@ -201,6 +205,20 @@ struct CodecSessionState {
         }
     }
 
+    void setStartupPrimeSurfaces(std::span<const VASurfaceID> surfaces) {
+        startup_prime_surfaces.assign(surfaces.begin(), surfaces.end());
+        next_prime_surface_index = 0;
+    }
+
+    VASurfaceID nextStartupPrimeSurface() {
+        if (startup_prime_surfaces.empty()) {
+            return VA_INVALID_ID;
+        }
+        const VASurfaceID surface = startup_prime_surfaces[next_prime_surface_index % startup_prime_surfaces.size()];
+        ++next_prime_surface_index;
+        return surface;
+    }
+
     static unsigned int startupPrimePicturesForProfile(VAProfile profile) {
         if (isH264Profile(profile)) {
             return 6;
@@ -217,6 +235,16 @@ struct CodecSessionState {
         }
         if (profile == VAProfileHEVCMain || profile == VAProfileHEVCMain10) {
             return 1;
+        }
+        return 0;
+    }
+
+    static unsigned int startupPrimeSurfaceCountForProfile(VAProfile profile) {
+        if (isH264Profile(profile)) {
+            return 3;
+        }
+        if (profile == VAProfileHEVCMain || profile == VAProfileHEVCMain10) {
+            return 2;
         }
         return 0;
     }
@@ -238,6 +266,8 @@ struct DriverState {
         VAConfigID config_id = VA_INVALID_ID;
         VAProfile profile = VAProfileNone;
         uint32_t rt_format = VA_RT_FORMAT_YUV420;
+        std::vector<VASurfaceID> prime_surfaces;
+        size_t next_prime_surface_index = 0;
     };
 
     std::unique_ptr<MppDecoder> decoder;
@@ -255,6 +285,7 @@ struct DriverState {
     VAConfigID next_config_id = 1;
     std::unordered_map<VAContextID, ContextState> active_contexts;
     VAContextID next_context_id = 1;
+    VASurfaceID next_internal_surface_id = 0x40000000u;
     std::vector<VADisplayAttribute> display_attributes;
     unique_fd resolved_drm_fd;
     int drm_fd = -1;
@@ -881,8 +912,23 @@ static VAStatus vaSyncSurface(VADriverContextP ctx, VASurfaceID surface) {
         }
 
         if (!ready && !failed && pending) {
+            uint64_t last_submitted_job_id = 0;
+            uint64_t last_completed_job_id = 0;
+            uint64_t last_submit_us = 0;
+            uint64_t last_complete_us = 0;
+            d->decoder->getSurfaceDebugInfo(surface,
+                                            last_submitted_job_id,
+                                            last_completed_job_id,
+                                            last_submit_us,
+                                            last_complete_us);
+            const uint64_t now_us = steadyMicrosNow();
             util::log(util::stderr_sink, util::LogLevel::Warn,
-                      "vaSyncSurface: surface={} waitSurfaceReady timed out", surface);
+                      "vaSyncSurface: surface={} waitSurfaceReady timed out submitted_job={} completed_job={} since_submit_ms={} since_complete_ms={}",
+                      surface,
+                      static_cast<unsigned long long>(last_submitted_job_id),
+                      static_cast<unsigned long long>(last_completed_job_id),
+                      last_submit_us == 0 ? 0ull : static_cast<unsigned long long>((now_us - last_submit_us) / 1000),
+                      last_complete_us == 0 ? 0ull : static_cast<unsigned long long>((now_us - last_complete_us) / 1000));
             return VA_STATUS_ERROR_TIMEDOUT;
         }
 
@@ -1289,12 +1335,48 @@ static VAStatus vaCreateContext(VADriverContextP ctx,
         return VA_STATUS_ERROR_ALLOCATION_FAILED;
     }
 
+    std::vector<VASurfaceID> prime_surfaces;
+    const unsigned int prime_surface_count = CodecSessionState::startupPrimeSurfaceCountForProfile(config.profile);
+    const bool wants_10bit_surfaces = rtFormatRequires10BitSurface(config.rt_format);
+    for (unsigned int index = 0; index < prime_surface_count; ++index) {
+        MppDecoder::DecodedSurface scratch_surface;
+        scratch_surface.is_10bit = wants_10bit_surfaces;
+        const VASurfaceID internal_surface_id = d->next_internal_surface_id++;
+        if (!d->decoder->allocateSurface(internal_surface_id, scratch_surface, picture_width, picture_height)) {
+            for (VASurfaceID allocated_surface : prime_surfaces) {
+                d->decoder->destroySurface(allocated_surface);
+            }
+            util::log(util::stderr_sink, util::LogLevel::Warn,
+                      "vaCreateContext: failed to allocate startup-prime surface profile={} index={}",
+                      config.profile,
+                      index);
+            return VA_STATUS_ERROR_ALLOCATION_FAILED;
+        }
+        prime_surfaces.push_back(internal_surface_id);
+    }
+    if (d->active_contexts.empty()) {
+        d->session.setStartupPrimeSurfaces(prime_surfaces);
+    }
+
     const VAContextID new_context = d->next_context_id++;
     d->active_contexts.emplace(new_context, DriverState::ContextState{
         .config_id = config_id,
         .profile = config.profile,
         .rt_format = config.rt_format,
+        .prime_surfaces = std::move(prime_surfaces),
     });
+    static std::atomic<int> context_prime_log_count{0};
+    if (context_prime_log_count.fetch_add(1, std::memory_order_relaxed) < 8) {
+        const auto& context_state = d->active_contexts.at(new_context);
+        util::log(util::stderr_sink, util::LogLevel::Info,
+                  "vaCreateContext: context={} profile={} rt_format=0x{:x} render_targets={} prime_surfaces={} first_prime_surface={}",
+                  new_context,
+                  config.profile,
+                  config.rt_format,
+                  num_render_targets,
+                  context_state.prime_surfaces.size(),
+                  context_state.prime_surfaces.empty() ? VA_INVALID_ID : context_state.prime_surfaces.front());
+    }
     *context = new_context;
     return VA_STATUS_SUCCESS;
 }
@@ -1307,6 +1389,9 @@ static VAStatus vaDestroyContext(VADriverContextP ctx, VAContextID context) {
     std::lock_guard<std::mutex> lock(d->lock);
     auto context_it = d->active_contexts.find(context);
     if (context_it == d->active_contexts.end()) return VA_STATUS_ERROR_INVALID_CONTEXT;
+    for (VASurfaceID surface : context_it->second.prime_surfaces) {
+        d->decoder->destroySurface(surface);
+    }
     d->active_contexts.erase(context_it);
     if (!d->active_contexts.empty()) return VA_STATUS_SUCCESS;
 
@@ -1781,7 +1866,21 @@ static VAStatus vaEndPicture(VADriverContextP ctx,
     const unsigned int startup_prime_copies = session.consumeStartupPrimeCopies(d->profile);
     for (unsigned int copy_index = 0; copy_index < startup_prime_copies; ++copy_index) {
         MppDecoder::DecodeJob prime_job;
-        prime_job.target_surface = job.target_surface;
+        prime_job.target_surface = session.nextStartupPrimeSurface();
+        if (prime_job.target_surface == VA_INVALID_ID) {
+            prime_job.target_surface = VA_INVALID_ID;
+            prime_job.discard_output = true;
+        }
+        static std::atomic<int> prime_target_log_count{0};
+        if (prime_target_log_count.fetch_add(1, std::memory_order_relaxed) < 12) {
+            util::log(util::stderr_sink, util::LogLevel::Info,
+                      "vaEndPicture: priming copy={}/{} current_surface={} prime_surface={} discard_output={}",
+                      copy_index + 1,
+                      startup_prime_copies,
+                      picture.current_surface,
+                      prime_job.target_surface,
+                      prime_job.discard_output ? 1 : 0);
+        }
         prime_job.bitstream = job.bitstream;
         prime_job.extra_data = job.extra_data;
         prime_job.eos = false;
