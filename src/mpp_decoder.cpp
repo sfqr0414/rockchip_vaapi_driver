@@ -16,6 +16,8 @@ extern "C" {
 
 #include <mutex>
 #include <optional>
+#include <fstream>
+#include <sstream>
 #include <thread>
 
 #include <rockchip/mpp_log.h>
@@ -38,6 +40,34 @@ bool envDisabled(const char* name) {
 
 bool av1ExportAs10BitEnabled() {
     return !envDisabled("ROCKCHIP_VAAPI_AV1_EXPORT_P010");
+}
+
+bool isInternalSurfaceId(VASurfaceID surface_id) {
+    return surface_id >= 0x40000000u;
+}
+
+std::string formatBytePrefix(std::span<const uint8_t> bytes, size_t limit = 24) {
+    std::ostringstream stream;
+    const size_t prefix_len = std::min(limit, bytes.size());
+    for (size_t index = 0; index < prefix_len; ++index) {
+        if (index > 0) {
+            stream << ' ';
+        }
+        char buf[4] = {};
+        std::snprintf(buf, sizeof(buf), "%02x", bytes[index]);
+        stream << buf;
+    }
+    return stream.str();
+}
+
+void dumpPayloadToFile(uint64_t job_id, VASurfaceID surface_id, std::span<const uint8_t> payload) {
+    std::ostringstream path;
+    path << "/tmp/rockchip-h264-job-" << job_id << "-surface-" << surface_id << ".bin";
+    std::ofstream stream(path.str(), std::ios::binary | std::ios::trunc);
+    if (!stream) {
+        return;
+    }
+    stream.write(reinterpret_cast<const char*>(payload.data()), static_cast<std::streamsize>(payload.size()));
 }
 
 bool hasDumbBufferCap(int fd) {
@@ -326,6 +356,55 @@ bool MppDecoder::getSurfaceDebugInfo(VASurfaceID id,
     return true;
 }
 
+std::string MppDecoder::getPendingQueueSummary(VASurfaceID focus_surface) {
+    std::ostringstream stream;
+    std::lock_guard<std::mutex> lock(pending_mutex_);
+
+    size_t focus_matches = 0;
+    uint64_t focus_latest_job_id = 0;
+    for (const auto& pending : pending_surfaces_) {
+        if (pending.second == focus_surface) {
+            ++focus_matches;
+            focus_latest_job_id = pending.first;
+        }
+    }
+
+    stream << "pending_count=" << pending_count_
+           << " pending_surfaces=" << pending_surfaces_.size()
+           << " tracked_pts=" << pending_surface_pts_.size()
+           << " discard_jobs=" << discard_output_job_ids_.size()
+           << " payloads=" << pending_payloads_.size();
+
+    if (!pending_surfaces_.empty()) {
+        stream << " queue=[";
+        size_t index = 0;
+        for (const auto& pending : pending_surfaces_) {
+            if (index > 0) {
+                stream << ",";
+            }
+            stream << pending.first << ":" << pending.second;
+            ++index;
+            if (index >= 8) {
+                if (pending_surfaces_.size() > index) {
+                    stream << ",...";
+                }
+                break;
+            }
+        }
+        stream << "]";
+    }
+
+    if (focus_surface != VA_INVALID_ID) {
+        stream << " focus_surface=" << focus_surface
+               << " focus_pending=" << focus_matches;
+        if (focus_latest_job_id != 0) {
+            stream << " focus_latest_job=" << focus_latest_job_id;
+        }
+    }
+
+    return stream.str();
+}
+
 bool MppDecoder::enqueueJob(DecodeJob job) {
     if (!session_) return false;
 
@@ -559,7 +638,7 @@ bool MppDecoder::waitSurfaceReady(VASurfaceID surface, uint32_t timeout_ms) {
     static std::atomic<int> wait_end_log_count{0};
     if (wait_end_log_count.fetch_add(1, std::memory_order_relaxed) < 3) {
         util::log(util::stderr_sink, util::LogLevel::Info,
-                  "mpp: waitSurfaceReady end surface={} ready={} failed={} pending={} submitted_job={} completed_job={} wait_ms={} since_submit_ms={} since_complete_ms={}",
+                  "mpp: waitSurfaceReady end surface={} ready={} failed={} pending={} submitted_job={} completed_job={} wait_ms={} since_submit_ms={} since_complete_ms={} {}",
                   surface,
                   ready ? 1 : 0,
                   failed ? 1 : 0,
@@ -568,7 +647,8 @@ bool MppDecoder::waitSurfaceReady(VASurfaceID surface, uint32_t timeout_ms) {
                   static_cast<unsigned long long>(completed_job_id),
                   timeout_ms,
                   submit_us == 0 ? 0ull : static_cast<unsigned long long>((now_us - submit_us) / 1000),
-                  complete_us == 0 ? 0ull : static_cast<unsigned long long>((now_us - complete_us) / 1000));
+                  complete_us == 0 ? 0ull : static_cast<unsigned long long>((now_us - complete_us) / 1000),
+                  getPendingQueueSummary(surface));
     }
 
     if (failed) return false;
@@ -590,6 +670,23 @@ void MppDecoder::resetSurface(VASurfaceID surface) {
     std::lock_guard<std::mutex> lock(surface_mutex_);
     auto it = surfaces_.find(surface);
     if (it == surfaces_.end()) return;
+
+    const bool had_output_refs = static_cast<bool>(it->second.buffer) || static_cast<bool>(it->second.frame) || it->second.surface.dmabuf_fd >= 0;
+    it->second.frame.reset();
+    it->second.buffer.reset();
+    if (!stable_export_enabled_) {
+        it->second.dmabuf.reset();
+    }
+    it->second.surface.dmabuf_fd = it->second.dmabuf.get();
+
+    static std::atomic<int> reset_log_count{0};
+    if (had_output_refs && reset_log_count.fetch_add(1, std::memory_order_relaxed) < 12) {
+        util::log(util::stderr_sink, util::LogLevel::Info,
+                  "mpp: resetSurface released prior output refs surface={} stable_export={}",
+                  surface,
+                  stable_export_enabled_ ? 1 : 0);
+    }
+
     it->second.in_flight.store(true);
     it->second.ready.store(false);
     it->second.failed.store(false);
@@ -602,11 +699,14 @@ void MppDecoder::releaseSurface(VASurfaceID surface) {
     auto it = surfaces_.find(surface);
     if (it == surfaces_.end()) return;
 
+    it->second.frame.reset();
+    it->second.buffer.reset();
+
     if (!stable_export_enabled_) {
         it->second.dmabuf.reset();
     }
 
-    it->second.surface.dmabuf_fd = -1;
+    it->second.surface.dmabuf_fd = it->second.dmabuf.get();
 
     it->second.in_flight.store(false);
     it->second.ready.store(false);
@@ -735,6 +835,8 @@ void MppDecoder::inputThreadMain(std::stop_token st) {
         std::vector<uint8_t> payload;
         const uint8_t* payload_ptr = nullptr;
         size_t payload_size = 0;
+        const size_t bitstream_size = job.bitstream.size();
+        const size_t extra_data_size = job.extra_data.size();
 
         if (job.eos) {
             const bool submitted = submitDecoderEos(ctx, api, running_);
@@ -764,6 +866,26 @@ void MppDecoder::inputThreadMain(std::stop_token st) {
         }
 
         if (payload_size == 0) continue;
+
+        if (!job.discard_output && job.target_surface != VA_INVALID_ID && !isInternalSurfaceId(job.target_surface)) {
+            static std::atomic<int> packet_diag_log_count{0};
+            if (packet_diag_log_count.fetch_add(1, std::memory_order_relaxed) < 96) {
+                util::log(util::stderr_sink, util::LogLevel::Info,
+                          "mpp: packet diag job_id={} surface={} bytes={} bitstream_bytes={} extra_bytes={} prefix={}",
+                          static_cast<unsigned long long>(job.job_id),
+                          job.target_surface,
+                          payload_size,
+                          bitstream_size,
+                          extra_data_size,
+                          formatBytePrefix(std::span<const uint8_t>(payload.data(), payload.size())));
+            }
+
+            if (profile_ == CodecProfile::H264 && envEnabled("ROCKCHIP_VAAPI_DUMP_H264_PAYLOADS") && job.job_id <= 48) {
+                dumpPayloadToFile(job.job_id,
+                                  job.target_surface,
+                                  std::span<const uint8_t>(payload.data(), payload.size()));
+            }
+        }
 
         MppPacket raw_packet = nullptr;
         if (mpp_packet_init(&raw_packet, const_cast<uint8_t*>(payload_ptr), payload_size) != MPP_OK) {
@@ -895,14 +1017,42 @@ void MppDecoder::outputThreadMain(std::stop_token st) {
 
         const MppBuffer frame_buffer = mpp_frame_get_buffer(frame);
         VASurfaceID surface_id = VA_INVALID_ID;
+        const RK_S64 frame_pts = mpp_frame_get_pts(frame);
+        const uint32_t output_width = mpp_frame_get_width(frame);
+        const uint32_t output_height = mpp_frame_get_height(frame);
+        const uint32_t src_stride_pixels = mpp_frame_get_hor_stride_pixel(frame);
+        const uint32_t src_stride_bytes = mpp_frame_get_hor_stride(frame);
+        const uint32_t src_ver_stride = mpp_frame_get_ver_stride(frame);
+        const MppFrameFormat frame_fmt = mpp_frame_get_fmt(frame);
+        const uint32_t frame_mode = mpp_frame_get_mode(frame);
+        const int frame_fd = frame_buffer ? mpp_buffer_get_fd(frame_buffer) : -1;
+
+        static std::atomic<int> audit_log_count{0};
+        if (audit_log_count.fetch_add(1, std::memory_order_relaxed) < 256) {
+            util::log(util::stderr_sink, util::LogLevel::Info,
+                      "mpp: audit frame pts={} eos={} discard={} err={} fmt={} mode={} out_w={} out_h={} stride_px={} stride_bytes={} ver_stride={} fd={} {}",
+                      static_cast<long long>(frame_pts),
+                      is_eos_frame ? 1 : 0,
+                      mpp_frame_get_discard(frame) ? 1 : 0,
+                      mpp_frame_get_errinfo(frame) ? 1 : 0,
+                      static_cast<uint32_t>(frame_fmt),
+                      frame_mode,
+                      output_width,
+                      output_height,
+                      src_stride_pixels,
+                      src_stride_bytes,
+                      src_ver_stride,
+                      frame_fd,
+                      getPendingQueueSummary());
+        }
 
         {
             std::lock_guard<std::mutex> lock(pending_mutex_);
             if (surface_id == VA_INVALID_ID) {
-                RK_S64 frame_pts = mpp_frame_get_pts(frame);
                 if (frame_pts > 0) {
                     const uint64_t frame_job_id = static_cast<uint64_t>(frame_pts);
                     if (discard_output_job_ids_.erase(frame_job_id) > 0) {
+                        pending_payloads_.erase(frame_job_id);
                         static std::atomic<int> discard_log_count{0};
                         if (discard_log_count.fetch_add(1, std::memory_order_relaxed) < 8) {
                             util::log(util::stderr_sink, util::LogLevel::Info,
@@ -917,19 +1067,28 @@ void MppDecoder::outputThreadMain(std::stop_token st) {
                     if (it != pending_surface_pts_.end()) {
                         surface_id = it->second;
                         dropPendingJobLocked(frame_job_id);
+                    } else {
+                        static std::atomic<int> orphan_log_count{0};
+                        if (orphan_log_count.fetch_add(1, std::memory_order_relaxed) < 64) {
+                            util::log(util::stderr_sink, util::LogLevel::Warn,
+                                      "mpp: orphan frame pts={} has no pending surface match {}",
+                                      static_cast<long long>(frame_pts),
+                                      getPendingQueueSummary());
+                        }
                     }
                 }
             }
 
-            if (surface_id == VA_INVALID_ID) {
+            if (surface_id == VA_INVALID_ID && frame_pts <= 0) {
                 surface_id = dropOldestPendingSurfaceLocked();
                 static std::atomic<int> fallback_surface_log_count{0};
                 if (surface_id != VA_INVALID_ID &&
                     fallback_surface_log_count.fetch_add(1, std::memory_order_relaxed) < 8) {
                     util::log(util::stderr_sink, util::LogLevel::Info,
-                              "mpp: outputThread fallback-mapped frame pts={} to oldest pending surface={}",
-                              static_cast<long long>(mpp_frame_get_pts(frame)),
-                              surface_id);
+                              "mpp: outputThread fallback-mapped frame pts={} to oldest pending surface={} {}",
+                              static_cast<long long>(frame_pts),
+                              surface_id,
+                              getPendingQueueSummary(surface_id));
                 }
             }
         }
@@ -938,17 +1097,9 @@ void MppDecoder::outputThreadMain(std::stop_token st) {
             std::lock_guard<std::mutex> lock(surface_mutex_);
             auto it = surfaces_.find(surface_id);
             if (it != surfaces_.end()) {
-                const MppFrameFormat frame_fmt = mpp_frame_get_fmt(frame);
-                const uint32_t frame_mode = mpp_frame_get_mode(frame);
                 MppBuffer mpp_buf = mpp_frame_get_buffer(frame);
-                const uint32_t output_width = mpp_frame_get_width(frame);
-                const uint32_t output_height = mpp_frame_get_height(frame);
-                const uint32_t src_stride_pixels = mpp_frame_get_hor_stride_pixel(frame);
-                const uint32_t src_stride_bytes = mpp_frame_get_hor_stride(frame);
-                const uint32_t src_ver_stride = mpp_frame_get_ver_stride(frame);
                 const uint32_t zero_copy_stride = src_stride_pixels ? src_stride_pixels
                                                                     : (it->second.surface.is_10bit ? src_stride_bytes / 2 : src_stride_bytes);
-                const int frame_fd = mpp_buf ? mpp_buffer_get_fd(mpp_buf) : -1;
                 uint32_t published_stride = zero_copy_stride;
                 bool export_ok = false;
 
@@ -1030,7 +1181,7 @@ void MppDecoder::outputThreadMain(std::stop_token st) {
                     it->second.in_flight.store(false);
                     it->second.failed.store(true);
                     it->second.ready.store(false);
-                    it->second.last_completed_job_id.store(static_cast<uint64_t>(mpp_frame_get_pts(frame)), std::memory_order_release);
+                    it->second.last_completed_job_id.store(static_cast<uint64_t>(frame_pts > 0 ? frame_pts : 0), std::memory_order_release);
                     it->second.last_complete_us.store(steadyMicrosNow(), std::memory_order_release);
                     {
                         std::lock_guard<std::mutex> lock(cv_mutex_);
@@ -1043,13 +1194,24 @@ void MppDecoder::outputThreadMain(std::stop_token st) {
                     it->second.in_flight.store(false);
                     it->second.failed.store(false);
                     it->second.ready.store(true);
-                    it->second.last_completed_job_id.store(static_cast<uint64_t>(mpp_frame_get_pts(frame)), std::memory_order_release);
+                    it->second.last_completed_job_id.store(static_cast<uint64_t>(frame_pts > 0 ? frame_pts : 0), std::memory_order_release);
                     it->second.last_complete_us.store(steadyMicrosNow(), std::memory_order_release);
                     {
                         std::lock_guard<std::mutex> lock(cv_mutex_);
                         cv_.notify_all();
                     }
                 }
+            }
+        } else {
+            static std::atomic<int> unmatched_log_count{0};
+            if (unmatched_log_count.fetch_add(1, std::memory_order_relaxed) < 64) {
+                util::log(util::stderr_sink, util::LogLevel::Warn,
+                          "mpp: dropping unmatched frame pts={} eos={} discard={} err={} {}",
+                          static_cast<long long>(frame_pts),
+                          is_eos_frame ? 1 : 0,
+                          mpp_frame_get_discard(frame) ? 1 : 0,
+                          mpp_frame_get_errinfo(frame) ? 1 : 0,
+                          getPendingQueueSummary());
             }
         }
 

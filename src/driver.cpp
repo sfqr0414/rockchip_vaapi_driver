@@ -18,6 +18,7 @@
 #include <cstring>
 #include <filesystem>
 #include <optional>
+#include <sstream>
 #include <span>
 #include <mutex>
 #include <memory>
@@ -65,6 +66,10 @@ bool av1CorrectionEnabled() {
     return envEnabledLocal("ROCKCHIP_VAAPI_AV1_CORRECTION");
 }
 
+bool startupPrimingDisabled() {
+    return envEnabledLocal("ROCKCHIP_VAAPI_DISABLE_STARTUP_PRIMING");
+}
+
 bool isH264Profile(VAProfile profile) {
     switch (profile) {
         case VAProfileH264ConstrainedBaseline:
@@ -75,6 +80,165 @@ bool isH264Profile(VAProfile profile) {
         default:
             return false;
     }
+}
+
+bool isInternalSurfaceId(VASurfaceID surface_id) {
+    return surface_id >= 0x40000000u;
+}
+
+std::string formatBytePrefix(std::span<const uint8_t> bytes, size_t limit = 16) {
+    std::ostringstream stream;
+    const size_t prefix_len = std::min(limit, bytes.size());
+    for (size_t index = 0; index < prefix_len; ++index) {
+        if (index > 0) {
+            stream << ' ';
+        }
+        char buf[4] = {};
+        std::snprintf(buf, sizeof(buf), "%02x", bytes[index]);
+        stream << buf;
+    }
+    return stream.str();
+}
+
+std::string describeH264Picture(const VAPictureH264& picture) {
+    std::ostringstream stream;
+    stream << "id=" << picture.picture_id
+           << "/idx=" << picture.frame_idx
+           << "/flags=0x" << std::hex << picture.flags << std::dec
+           << "/top=" << picture.TopFieldOrderCnt
+           << "/bottom=" << picture.BottomFieldOrderCnt;
+    return stream.str();
+}
+
+std::string summarizeH264ReferenceFrames(const VAPictureParameterBufferH264& picture, size_t limit = 6) {
+    size_t valid_count = 0;
+    size_t short_term_count = 0;
+    size_t long_term_count = 0;
+    std::ostringstream stream;
+    stream << "refs=[";
+    for (size_t index = 0; index < std::size(picture.ReferenceFrames); ++index) {
+        const auto& ref = picture.ReferenceFrames[index];
+        if ((ref.flags & VA_PICTURE_H264_INVALID) != 0 || ref.picture_id == VA_INVALID_SURFACE) {
+            continue;
+        }
+        ++valid_count;
+        if ((ref.flags & VA_PICTURE_H264_SHORT_TERM_REFERENCE) != 0) {
+            ++short_term_count;
+        }
+        if ((ref.flags & VA_PICTURE_H264_LONG_TERM_REFERENCE) != 0) {
+            ++long_term_count;
+        }
+        if (valid_count <= limit) {
+            if (valid_count > 1) {
+                stream << ", ";
+            }
+            stream << index << ":" << describeH264Picture(ref);
+        }
+    }
+    if (valid_count > limit) {
+        stream << ", ...";
+    }
+    stream << "] valid=" << valid_count
+           << " short=" << short_term_count
+           << " long=" << long_term_count;
+    return stream.str();
+}
+
+std::string summarizeH264SliceParams(std::span<const uint8_t> slice_param_data, uint32_t num_elements) {
+    if (num_elements == 0 || slice_param_data.size() < static_cast<size_t>(num_elements) * sizeof(VASliceParameterBufferH264)) {
+        return "slices=[]";
+    }
+
+    const auto* slices = reinterpret_cast<const VASliceParameterBufferH264*>(slice_param_data.data());
+    const auto& first = slices[0];
+    const auto& last = slices[num_elements - 1];
+    std::ostringstream stream;
+    stream << "slices=count=" << num_elements
+           << " first={size=" << first.slice_data_size
+           << ", offset=" << first.slice_data_offset
+           << ", bit_offset=" << first.slice_data_bit_offset
+           << ", type=" << static_cast<unsigned>(first.slice_type)
+           << ", first_mb=" << first.first_mb_in_slice
+           << ", num_ref_l0=" << static_cast<unsigned>(first.num_ref_idx_l0_active_minus1 + 1)
+           << ", num_ref_l1=" << static_cast<unsigned>(first.num_ref_idx_l1_active_minus1 + 1)
+           << ", flag=" << first.slice_data_flag
+           << "} last={size=" << last.slice_data_size
+           << ", offset=" << last.slice_data_offset
+           << ", bit_offset=" << last.slice_data_bit_offset
+           << ", type=" << static_cast<unsigned>(last.slice_type)
+           << ", first_mb=" << last.first_mb_in_slice
+           << ", num_ref_l0=" << static_cast<unsigned>(last.num_ref_idx_l0_active_minus1 + 1)
+           << ", num_ref_l1=" << static_cast<unsigned>(last.num_ref_idx_l1_active_minus1 + 1)
+           << ", flag=" << last.slice_data_flag
+           << "}";
+    return stream.str();
+}
+
+std::string summarizeH264IqMatrix(std::span<const uint8_t> iq_matrix_data) {
+    if (iq_matrix_data.size() < sizeof(VAIQMatrixBufferH264)) {
+        return "iq=missing";
+    }
+
+    const auto& iq = *reinterpret_cast<const VAIQMatrixBufferH264*>(iq_matrix_data.data());
+    std::uint32_t checksum4x4 = 0;
+    std::uint32_t checksum8x8 = 0;
+    for (const auto& list : iq.ScalingList4x4) {
+        for (std::uint8_t value : list) {
+            checksum4x4 = checksum4x4 * 131u + value;
+        }
+    }
+    for (const auto& list : iq.ScalingList8x8) {
+        for (std::uint8_t value : list) {
+            checksum8x8 = checksum8x8 * 131u + value;
+        }
+    }
+
+    std::ostringstream stream;
+    stream << "iq=4x4[0]=[";
+    for (size_t index = 0; index < 8; ++index) {
+        if (index > 0) {
+            stream << ',';
+        }
+        stream << static_cast<unsigned>(iq.ScalingList4x4[0][index]);
+    }
+    stream << "] 8x8[0]=[";
+    for (size_t index = 0; index < 8; ++index) {
+        if (index > 0) {
+            stream << ',';
+        }
+        stream << static_cast<unsigned>(iq.ScalingList8x8[0][index]);
+    }
+    stream << "] checksum4x4=0x" << std::hex << checksum4x4
+           << " checksum8x8=0x" << checksum8x8 << std::dec;
+    return stream.str();
+}
+
+template <typename BufferMap>
+std::string summarizeBufferSizes(const std::vector<VABufferID>& buffer_ids,
+                                 const BufferMap& buffers,
+                                 size_t limit = 6) {
+    std::ostringstream stream;
+    stream << "buffers=count=" << buffer_ids.size() << " sizes=[";
+    size_t shown = 0;
+    for (VABufferID buffer_id : buffer_ids) {
+        auto it = buffers.find(buffer_id);
+        if (it == buffers.end()) {
+            continue;
+        }
+        if (shown > 0) {
+            stream << ", ";
+        }
+        stream << it->second->size_bytes();
+        ++shown;
+        if (shown >= limit) {
+            if (buffer_ids.size() > shown) {
+                stream << ", ...";
+            }
+            break;
+        }
+    }
+    stream << "]";
+    return stream.str();
 }
 
 }  // namespace
@@ -121,11 +285,13 @@ struct VABuffer {
 
 struct DecodeState {
     std::optional<VABufferID> picture_param_buffer_id;
+    std::optional<VABufferID> iq_matrix_buffer_id;
     std::vector<VABufferID> slice_param_buffer_ids;
     std::vector<VABufferID> slice_data_buffer_ids;
 
     void clear() {
         picture_param_buffer_id.reset();
+        iq_matrix_buffer_id.reset();
         slice_param_buffer_ids.clear();
         slice_data_buffer_ids.clear();
     }
@@ -250,6 +416,9 @@ struct CodecSessionState {
     }
 
     static bool shouldPrimeStartup(VAProfile profile) {
+        if (startupPrimingDisabled()) {
+            return false;
+        }
         return isH264Profile(profile) || profile == VAProfileHEVCMain || profile == VAProfileHEVCMain10;
     }
 };
@@ -898,7 +1067,60 @@ static VAStatus vaSyncSurface(VADriverContextP ctx, VASurfaceID surface) {
 
     // Wait for MPP to report either completion or failure. Avoid an extra
     // ready-only wait path so failed frames do not deadlock callers.
-    bool ready = d->decoder->waitSurfaceReady(surface);
+    constexpr uint32_t kSyncProbeMs = 1000;
+    constexpr uint32_t kSyncTotalTimeoutMs = 60000;
+    const bool panic_recovery_enabled = envEnabledLocal("ROCKCHIP_VAAPI_PANIC_SYNC_RECOVERY");
+
+    bool ready = false;
+    for (uint32_t waited_ms = 0; waited_ms < kSyncTotalTimeoutMs; waited_ms += kSyncProbeMs) {
+        ready = d->decoder->waitSurfaceReady(surface, kSyncProbeMs);
+        if (ready) {
+            break;
+        }
+
+        uint32_t probe_width = 0;
+        uint32_t probe_height = 0;
+        uint32_t probe_stride = 0;
+        int probe_fd = -1;
+        bool probe_failed = false;
+        bool probe_pending = false;
+        if (!d->decoder->getSurfaceInfo(surface, probe_width, probe_height, probe_stride, probe_fd, probe_failed, probe_pending)) {
+            break;
+        }
+        if (probe_failed || !probe_pending) {
+            break;
+        }
+
+        uint64_t last_submitted_job_id = 0;
+        uint64_t last_completed_job_id = 0;
+        uint64_t last_submit_us = 0;
+        uint64_t last_complete_us = 0;
+        d->decoder->getSurfaceDebugInfo(surface,
+                                        last_submitted_job_id,
+                                        last_completed_job_id,
+                                        last_submit_us,
+                                        last_complete_us);
+        const uint64_t now_us = steadyMicrosNow();
+        util::log(util::stderr_sink, util::LogLevel::Warn,
+                  "vaSyncSurface: probe stall surface={} elapsed_ms={} submitted_job={} completed_job={} since_submit_ms={} since_complete_ms={} {}",
+                  surface,
+                  waited_ms + kSyncProbeMs,
+                  static_cast<unsigned long long>(last_submitted_job_id),
+                  static_cast<unsigned long long>(last_completed_job_id),
+                  last_submit_us == 0 ? 0ull : static_cast<unsigned long long>((now_us - last_submit_us) / 1000),
+                  last_complete_us == 0 ? 0ull : static_cast<unsigned long long>((now_us - last_complete_us) / 1000),
+                  d->decoder->getPendingQueueSummary(surface));
+
+        if (panic_recovery_enabled) {
+            util::log(util::stderr_sink, util::LogLevel::Warn,
+                      "vaSyncSurface: panic recovery forcing ready surface={} after {} ms",
+                      surface,
+                      waited_ms + kSyncProbeMs);
+            d->decoder->forceSurfaceReady(surface);
+            ready = true;
+            break;
+        }
+    }
 
     uint32_t width = 0, height = 0, stride = 0;
     int fd = -1;
@@ -923,12 +1145,13 @@ static VAStatus vaSyncSurface(VADriverContextP ctx, VASurfaceID surface) {
                                             last_complete_us);
             const uint64_t now_us = steadyMicrosNow();
             util::log(util::stderr_sink, util::LogLevel::Warn,
-                      "vaSyncSurface: surface={} waitSurfaceReady timed out submitted_job={} completed_job={} since_submit_ms={} since_complete_ms={}",
+                      "vaSyncSurface: surface={} waitSurfaceReady timed out submitted_job={} completed_job={} since_submit_ms={} since_complete_ms={} {}",
                       surface,
                       static_cast<unsigned long long>(last_submitted_job_id),
                       static_cast<unsigned long long>(last_completed_job_id),
                       last_submit_us == 0 ? 0ull : static_cast<unsigned long long>((now_us - last_submit_us) / 1000),
-                      last_complete_us == 0 ? 0ull : static_cast<unsigned long long>((now_us - last_complete_us) / 1000));
+                      last_complete_us == 0 ? 0ull : static_cast<unsigned long long>((now_us - last_complete_us) / 1000),
+                      d->decoder->getPendingQueueSummary(surface));
             return VA_STATUS_ERROR_TIMEDOUT;
         }
 
@@ -1650,6 +1873,20 @@ static VAStatus vaEndPicture(VADriverContextP ctx,
         auto it = d->buffers.find(*picture.decode_state.picture_param_buffer_id);
         if (it != d->buffers.end()) {
             const auto& picture_param_buffer = *it->second;
+            const VABuffer* current_slice_param_buffer = nullptr;
+            const VABuffer* current_iq_matrix_buffer = nullptr;
+            if (!picture.decode_state.slice_param_buffer_ids.empty()) {
+                auto slice_param_it = d->buffers.find(picture.decode_state.slice_param_buffer_ids.front());
+                if (slice_param_it != d->buffers.end()) {
+                    current_slice_param_buffer = slice_param_it->second.get();
+                }
+            }
+            if (picture.decode_state.iq_matrix_buffer_id) {
+                auto iq_matrix_it = d->buffers.find(*picture.decode_state.iq_matrix_buffer_id);
+                if (iq_matrix_it != d->buffers.end()) {
+                    current_iq_matrix_buffer = iq_matrix_it->second.get();
+                }
+            }
             if (d->profile == VAProfileHEVCMain || d->profile == VAProfileHEVCMain10) {
                 const auto& hevc = *reinterpret_cast<const VAPictureParameterBufferHEVC*>(picture_param_buffer.data.data());
                 static std::atomic<int> hevc_param_log_count{0};
@@ -1681,6 +1918,29 @@ static VAStatus vaEndPicture(VADriverContextP ctx,
                             *reinterpret_cast<const VAPictureParameterBufferH264*>(picture_param_buffer.data.data()),
                             d->picture_width,
                             d->picture_height);
+                    }
+                    if (current_slice_param_buffer && !isInternalSurfaceId(picture.current_surface)) {
+                        const auto& h264 = *reinterpret_cast<const VAPictureParameterBufferH264*>(picture_param_buffer.data.data());
+                        static std::atomic<int> h264_diag_log_count{0};
+                        if (h264_diag_log_count.fetch_add(1, std::memory_order_relaxed) < 96) {
+                            util::log(util::stderr_sink, util::LogLevel::Info,
+                                      "h264 diag: surface={} curr={} frame_num={} num_ref_frames={} seq=0x{:x} pic=0x{:x} {} {} {} slice_params={} slice_data={} frame_bytes={} frame_prefix={} extra_bytes={} extra_prefix={}",
+                                      picture.current_surface,
+                                      describeH264Picture(h264.CurrPic),
+                                      h264.frame_num,
+                                      h264.num_ref_frames,
+                                      h264.seq_fields.value,
+                                      h264.pic_fields.value,
+                                      summarizeH264ReferenceFrames(h264),
+                                      summarizeH264SliceParams(current_slice_param_buffer->map(), current_slice_param_buffer->num_elements),
+                                      current_iq_matrix_buffer ? summarizeH264IqMatrix(current_iq_matrix_buffer->map()) : std::string{"iq=absent"},
+                                      summarizeBufferSizes(picture.decode_state.slice_param_buffer_ids, d->buffers),
+                                      summarizeBufferSizes(picture.decode_state.slice_data_buffer_ids, d->buffers),
+                                      picture.frame_buffer.size(),
+                                      formatBytePrefix(picture.frame_buffer, 24),
+                                      picture.frame_extra_data.size(),
+                                      formatBytePrefix(picture.frame_extra_data, 24));
+                        }
                     }
                     break;
                 case VAProfileHEVCMain:
@@ -2794,6 +3054,9 @@ static VAStatus vaRenderPicture(VADriverContextP ctx,
         switch (vb.type) {
             case VAPictureParameterBufferType:
                 picture.decode_state.picture_param_buffer_id = buffers[i];
+                break;
+            case VAIQMatrixBufferType:
+                picture.decode_state.iq_matrix_buffer_id = buffers[i];
                 break;
             case VASliceParameterBufferType:
                 picture.decode_state.slice_param_buffer_ids.push_back(buffers[i]);

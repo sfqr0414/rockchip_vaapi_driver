@@ -7,6 +7,7 @@
 #include <memory>
 #include <mutex>
 #include <stop_token>
+#include <string>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -67,6 +68,7 @@ class MppDecoder {
     bool getSurfaceState(VASurfaceID id, bool& ready, bool& failed);
     bool waitSurfaceReady(VASurfaceID surface, uint32_t timeout_ms = 60000);
     bool getSurfaceDebugInfo(VASurfaceID id, uint64_t& last_submitted_job_id, uint64_t& last_completed_job_id, uint64_t& last_submit_us, uint64_t& last_complete_us);
+    std::string getPendingQueueSummary(VASurfaceID focus_surface = VA_INVALID_ID);
     void forceSurfaceReady(VASurfaceID surface);
     void resetSurface(VASurfaceID surface);
     void releaseSurface(VASurfaceID surface);
