@@ -31,6 +31,8 @@ vaapi_enabled=${FIREFOX_VAAPI_ENABLED:-true}
 force_zero_copy=${FIREFOX_VAAPI_FORCE_ZERO_COPY:-true}
 hwdecode_enabled=${FIREFOX_HWDECODE_ENABLED:-true}
 test_video=${FIREFOX_TEST_VIDEO:-Test Jellyfin 1080p AVC 20M.mp4}
+seek_at=${FIREFOX_TEST_SEEK_AT:-}
+seek_to=${FIREFOX_TEST_SEEK_TO:-}
 
 pick_http_port() {
 	python3 - <<'PY'
@@ -109,6 +111,13 @@ ensure_http_server() {
 
 server_port=$(ensure_http_server)
 encoded_video=$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1]))' "$test_video")
+query_string="video=$encoded_video"
+if [[ -n "$seek_at" ]]; then
+	query_string+="&seekAt=$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1]))' "$seek_at")"
+fi
+if [[ -n "$seek_to" ]]; then
+	query_string+="&seekTo=$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1]))' "$seek_to")"
+fi
 
 cat >"$profile_dir/user.js" <<'EOF'
 user_pref("media.ffmpeg.vaapi.enabled", __VAAPI_ENABLED__);
@@ -134,13 +143,14 @@ sed -i \
 export MOZ_ENABLE_WAYLAND=${MOZ_ENABLE_WAYLAND:-1}
 export MOZ_DISABLE_RDD_SANDBOX=${MOZ_DISABLE_RDD_SANDBOX:-1}
 export LIBVA_DRIVER_NAME=${LIBVA_DRIVER_NAME:-rockchip}
+export ROCKCHIP_VAAPI_AV1_EXPORT_P010=${ROCKCHIP_VAAPI_AV1_EXPORT_P010:-1}
 export MOZ_DRM_DEVICE=$drm_device
 export LIBVA_DRM_DEVICE=${LIBVA_DRM_DEVICE:-$drm_device}
 export MOZ_WEBRENDER=${MOZ_WEBRENDER:-1}
 export MOZ_LOG=${MOZ_LOG:-PlatformDecoderModule:5,FFmpegVideo:5,Dmabuf:5,VAAPI:5}
 
 firefox_bin=${FIREFOX_BIN:-firefox}
-target_url=${1:-"http://127.0.0.1:$server_port/tools/firefox_headless_video_test.html?video=$encoded_video"}
+target_url=${1:-"http://127.0.0.1:$server_port/tools/firefox_headless_video_test.html?$query_string"}
 
 printf 'PROFILE=%s\n' "$profile_dir"
 printf 'URL=%s\n' "$target_url"

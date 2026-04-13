@@ -64,6 +64,10 @@ def compute_summary(samples):
         "last_paused": last.get("paused"),
         "last_error": last.get("error"),
         "last_events": last.get("events"),
+        "seek_enabled": any(bool(sample.get("seekEnabled")) for sample in samples),
+        "seek_triggered": any(bool(sample.get("seekTriggered")) for sample in samples),
+        "seek_completed": any(bool(sample.get("seekCompleted")) for sample in samples),
+        "seek_target": next((sample.get("seekTarget") for sample in reversed(samples) if sample.get("seekTarget") is not None), None),
     }
 
     if first.get("currentTime") is not None and last.get("currentTime") is not None:
@@ -82,6 +86,8 @@ def main() -> int:
     parser.add_argument("--mode", choices=["hw", "sw"], required=True)
     parser.add_argument("--duration", type=float, default=12.0)
     parser.add_argument("--stable-export", action="store_true")
+    parser.add_argument("--seek-at", type=float)
+    parser.add_argument("--seek-to", type=float)
     parser.add_argument("--stdout-file")
     args = parser.parse_args()
 
@@ -92,6 +98,14 @@ def main() -> int:
     env["FIREFOX_VAAPI_ENABLED"] = "true" if args.mode == "hw" else "false"
     env["FIREFOX_HWDECODE_ENABLED"] = "true" if args.mode == "hw" else "false"
     env["FIREFOX_VAAPI_FORCE_ZERO_COPY"] = "true" if args.mode == "hw" else "false"
+    if args.seek_at is not None:
+        env["FIREFOX_TEST_SEEK_AT"] = str(args.seek_at)
+    else:
+        env.pop("FIREFOX_TEST_SEEK_AT", None)
+    if args.seek_to is not None:
+        env["FIREFOX_TEST_SEEK_TO"] = str(args.seek_to)
+    else:
+        env.pop("FIREFOX_TEST_SEEK_TO", None)
     if args.stable_export:
         env["ROCKCHIP_VAAPI_STABLE_EXPORT"] = "1"
     else:
@@ -130,6 +144,8 @@ def main() -> int:
                 "video": args.video,
                 "mode": args.mode,
                 "stable_export": args.stable_export,
+                "seek_at": args.seek_at,
+                "seek_to": args.seek_to,
                 "duration_seconds": args.duration,
             }
         )

@@ -95,8 +95,15 @@
     const requestedVideo = params.get('video');
     const videoPath = requestedVideo ? `../videos/${requestedVideo}` : '../videos/Test Jellyfin 1080p AVC 20M.mp4';
     const sourceUrl = new URL(videoPath, window.location.href).href;
+    const seekAtParam = params.get('seekAt');
+    const seekToParam = params.get('seekTo');
+    const seekAt = seekAtParam === null ? Number.NaN : Number(seekAtParam);
+    const seekTo = seekToParam === null ? Number.NaN : Number(seekToParam);
+    const seekEnabled = Number.isFinite(seekAt) && Number.isFinite(seekTo) && seekAt >= 0 && seekTo >= 0;
     const recentEvents = [];
     let lastPostedAt = 0;
+    let seekTriggered = false;
+    let seekCompleted = false;
 
     async function postStatus(payload) {
       try {
@@ -129,6 +136,10 @@
         `decodedVideoFrames: ${decoded}`,
         `droppedVideoFrames: ${dropped}`,
         `totalFrameDelay: ${frameDelay}`,
+        `seekEnabled: ${seekEnabled}`,
+        `seekTriggered: ${seekTriggered}`,
+        `seekCompleted: ${seekCompleted}`,
+        `seekTarget: ${seekEnabled ? seekTo.toFixed(3) : 'n/a'}`,
         `error: ${error}`,
         extra,
         `events: ${recentEvents.join(', ')}`
@@ -154,6 +165,10 @@
           totalFrameDelay: quality && typeof quality.totalFrameDelay === 'number'
             ? Number(quality.totalFrameDelay.toFixed(3))
             : null,
+          seekEnabled,
+          seekTriggered,
+          seekCompleted,
+          seekTarget: seekEnabled ? Number(seekTo.toFixed(3)) : null,
           error,
           events: [...recentEvents]
         });
@@ -161,6 +176,9 @@
     }
 
     function note(eventName) {
+      if (eventName === 'seeked') {
+        seekCompleted = true;
+      }
       recentEvents.push(eventName);
       if (recentEvents.length > 8) {
         recentEvents.shift();
@@ -174,6 +192,17 @@
         note('play() ok');
       } catch (error) {
         note(`play() failed: ${error && error.message ? error.message : error}`);
+      }
+    }
+
+    function maybeTriggerSeek() {
+      if (!seekEnabled || seekTriggered || video.seeking || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
+        return;
+      }
+      if (video.currentTime >= seekAt) {
+        seekTriggered = true;
+        note(`seek-request:${seekTo.toFixed(3)}`);
+        video.currentTime = seekTo;
       }
     }
 
@@ -202,6 +231,9 @@
           video.currentTime = 0;
           ensurePlayback();
         }
+        if (eventName === 'timeupdate' || eventName === 'loadeddata' || eventName === 'playing') {
+          maybeTriggerSeek();
+        }
       });
     });
 
@@ -219,6 +251,7 @@
     });
 
     setInterval(() => renderStatus(), 250);
+    setInterval(maybeTriggerSeek, 100);
     ensurePlayback();
   </script>
 </body>

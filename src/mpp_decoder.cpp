@@ -30,8 +30,14 @@ bool envEnabled(const char* name) {
     return std::strcmp(value, "1") == 0 || std::strcmp(value, "true") == 0 || std::strcmp(value, "yes") == 0;
 }
 
+bool envDisabled(const char* name) {
+    const char* value = std::getenv(name);
+    if (!value) return false;
+    return std::strcmp(value, "0") == 0 || std::strcmp(value, "false") == 0 || std::strcmp(value, "no") == 0;
+}
+
 bool av1ExportAs10BitEnabled() {
-    return envEnabled("ROCKCHIP_VAAPI_AV1_EXPORT_P010");
+    return !envDisabled("ROCKCHIP_VAAPI_AV1_EXPORT_P010");
 }
 
 bool hasDumbBufferCap(int fd) {
