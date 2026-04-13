@@ -167,7 +167,7 @@ struct PendingAv1Frame {
 
 struct CodecSessionState {
     bool sequence_headers_sent = false;
-    unsigned int startup_prime_jobs_remaining = 0;
+    unsigned int startup_prime_pictures_remaining = 0;
     bool av1_sequence_enable_restoration = false;
     std::array<VASurfaceID, 8> av1_ref_frame_map{};
     bool av1_ref_frame_map_valid = false;
@@ -175,7 +175,7 @@ struct CodecSessionState {
 
     void beginContext(VAProfile profile) {
         sequence_headers_sent = false;
-        startup_prime_jobs_remaining = startupPrimeJobsForProfile(profile);
+        startup_prime_pictures_remaining = startupPrimePicturesForProfile(profile);
         av1_sequence_enable_restoration = false;
         av1_ref_frame_map.fill(VA_INVALID_SURFACE);
         av1_ref_frame_map_valid = false;
@@ -184,15 +184,15 @@ struct CodecSessionState {
 
     void endContext() {
         beginContext(VAProfileNone);
-        startup_prime_jobs_remaining = 0;
+        startup_prime_pictures_remaining = 0;
     }
 
-    bool consumeStartupPrimeJob(VAProfile profile) {
-        if (!shouldPrimeStartup(profile) || startup_prime_jobs_remaining == 0) {
-            return false;
+    unsigned int consumeStartupPrimeCopies(VAProfile profile) {
+        if (!shouldPrimeStartup(profile) || startup_prime_pictures_remaining == 0) {
+            return 0;
         }
-        --startup_prime_jobs_remaining;
-        return true;
+        --startup_prime_pictures_remaining;
+        return startupPrimeCopiesPerPicture(profile);
     }
 
     void noteSequenceHeaders(std::span<const uint8_t> extra_data) {
@@ -201,12 +201,22 @@ struct CodecSessionState {
         }
     }
 
-    static unsigned int startupPrimeJobsForProfile(VAProfile profile) {
+    static unsigned int startupPrimePicturesForProfile(VAProfile profile) {
         if (isH264Profile(profile)) {
-            return 2;
+            return 6;
         }
         if (profile == VAProfileHEVCMain || profile == VAProfileHEVCMain10) {
             return 4;
+        }
+        return 0;
+    }
+
+    static unsigned int startupPrimeCopiesPerPicture(VAProfile profile) {
+        if (isH264Profile(profile)) {
+            return 3;
+        }
+        if (profile == VAProfileHEVCMain || profile == VAProfileHEVCMain10) {
+            return 1;
         }
         return 0;
     }
@@ -219,6 +229,17 @@ struct CodecSessionState {
 struct DriverState {
     DriverState() : decoder(std::make_unique<MppDecoder>()) {}
 
+    struct ConfigState {
+        VAProfile profile = VAProfileNone;
+        uint32_t rt_format = VA_RT_FORMAT_YUV420;
+    };
+
+    struct ContextState {
+        VAConfigID config_id = VA_INVALID_ID;
+        VAProfile profile = VAProfileNone;
+        uint32_t rt_format = VA_RT_FORMAT_YUV420;
+    };
+
     std::unique_ptr<MppDecoder> decoder;
     std::mutex resource_mutex;
     std::unordered_map<VASurfaceID, std::unique_ptr<SurfaceState>> surfaces;
@@ -230,7 +251,9 @@ struct DriverState {
     VADriverVTable* vtable = nullptr;
     std::mutex lock;
     VAProfile profile = VAProfileNone;
-    std::unordered_set<VAContextID> active_contexts;
+    std::unordered_map<VAConfigID, ConfigState> configs;
+    VAConfigID next_config_id = 1;
+    std::unordered_map<VAContextID, ContextState> active_contexts;
     VAContextID next_context_id = 1;
     std::vector<VADisplayAttribute> display_attributes;
     unique_fd resolved_drm_fd;
@@ -280,8 +303,6 @@ struct DriverState {
     };
     std::unordered_map<VASubpictureID, SubpictureState> subpictures;
     VASubpictureID next_subpicture_id = 1;
-    bool config_created = false;
-    uint32_t config_rt_format = VA_RT_FORMAT_YUV420;
 };
 
 class MappedDmabuf {
@@ -1053,10 +1074,10 @@ static VAStatus vaCreateConfig(VADriverContextP ctx,
         }
     }
 
+    const VAConfigID new_config_id = d->next_config_id++;
+    d->configs.emplace(new_config_id, DriverState::ConfigState{.profile = profile, .rt_format = requested_rt_format});
     d->profile = profile;
-    d->config_created = true;
-    d->config_rt_format = requested_rt_format;
-    *config_id = 1;
+    *config_id = new_config_id;
     return VA_STATUS_SUCCESS;
 }
 
@@ -1065,13 +1086,12 @@ static VAStatus vaDestroyConfig(VADriverContextP ctx, VAConfigID config_id) {
     if (!d) return VA_STATUS_ERROR_INVALID_CONTEXT;
     std::lock_guard<std::mutex> lock(d->lock);
 
-    // This driver only has a single config
-    if (!d->config_created || config_id != 1) {
+    auto config_it = d->configs.find(config_id);
+    if (config_it == d->configs.end()) {
         return VA_STATUS_ERROR_INVALID_CONFIG;
     }
 
-    d->config_created = false;
-    d->config_rt_format = VA_RT_FORMAT_YUV420;
+    d->configs.erase(config_it);
     return VA_STATUS_SUCCESS;
 }
 
@@ -1092,9 +1112,11 @@ static VAStatus vaQueryConfigAttributes(VADriverContextP ctx,
     auto* d = toDriver(ctx);
     if (!d) return VA_STATUS_ERROR_INVALID_CONTEXT;
     std::lock_guard<std::mutex> lock(d->lock);
-    if (!d->config_created || config_id != 1) return VA_STATUS_ERROR_INVALID_CONFIG;
+    auto config_it = d->configs.find(config_id);
+    if (config_it == d->configs.end()) return VA_STATUS_ERROR_INVALID_CONFIG;
+    const auto& config = config_it->second;
 
-    if (profile) *profile = d->profile;
+    if (profile) *profile = config.profile;
     if (entrypoint) *entrypoint = VAEntrypointVLD;
 
     constexpr int kConfigAttribCount = 3;
@@ -1109,7 +1131,7 @@ static VAStatus vaQueryConfigAttributes(VADriverContextP ctx,
     }
 
     attrib_list[0].type = VAConfigAttribRTFormat;
-    attrib_list[0].value = d->config_rt_format;
+    attrib_list[0].value = config.rt_format;
     attrib_list[1].type = VAConfigAttribMaxPictureWidth;
     attrib_list[1].value = kMaxPictureWidth;
     attrib_list[2].type = VAConfigAttribMaxPictureHeight;
@@ -1132,9 +1154,14 @@ static VAStatus vaQuerySurfaceAttributes(VADriverContextP ctx,
     auto* d = toDriver(ctx);
     if (!d) return VA_STATUS_ERROR_INVALID_CONTEXT;
     std::lock_guard<std::mutex> lock(d->lock);
-    if (config_id != VA_INVALID_ID && config_id != 1) return VA_STATUS_ERROR_INVALID_CONFIG;
+    uint32_t config_rt_format = VA_RT_FORMAT_YUV420;
+    if (config_id != VA_INVALID_ID) {
+        auto config_it = d->configs.find(config_id);
+        if (config_it == d->configs.end()) return VA_STATUS_ERROR_INVALID_CONFIG;
+        config_rt_format = config_it->second.rt_format;
+    }
 
-    const bool uses_10bit_output = rtFormatRequires10BitSurface(d->config_rt_format);
+    const bool uses_10bit_output = rtFormatRequires10BitSurface(config_rt_format);
     static uint64_t linear_modifier = DRM_FORMAT_MOD_LINEAR;
     static VADRMFormatModifierList linear_modifier_list = {
         .num_modifiers = 1,
@@ -1218,10 +1245,12 @@ static VAStatus vaCreateContext(VADriverContextP ctx,
         return VA_STATUS_ERROR_INVALID_CONTEXT;
     }
     std::lock_guard<std::mutex> lock(d->lock);
-    if (!d->config_created || config_id != 1) {
-        util::log(util::stderr_sink, util::LogLevel::Warn, "vaCreateContext: config not ready config_created={} config_id={}", d->config_created, config_id);
+    auto config_it = d->configs.find(config_id);
+    if (config_it == d->configs.end()) {
+        util::log(util::stderr_sink, util::LogLevel::Warn, "vaCreateContext: missing config_id={}", config_id);
         return VA_STATUS_ERROR_INVALID_CONFIG;
     }
+    const auto& config = config_it->second;
     if (num_render_targets <= 0 || !render_targets) {
         util::log(util::stderr_sink, util::LogLevel::Warn, "vaCreateContext: invalid render targets count={} ptr={}",
               num_render_targets, static_cast<const void*>(render_targets));
@@ -1240,26 +1269,32 @@ static VAStatus vaCreateContext(VADriverContextP ctx,
         }
     }
 
-    if (!isSupportedProfile(d->profile)) {
-        util::log(util::stderr_sink, util::LogLevel::Warn, "vaCreateContext: unsupported profile={}", d->profile);
+    if (!isSupportedProfile(config.profile)) {
+        util::log(util::stderr_sink, util::LogLevel::Warn, "vaCreateContext: unsupported profile={}", config.profile);
         return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;
     }
 
     if (d->active_contexts.empty()) {
         d->picture_width = static_cast<uint32_t>(picture_width);
         d->picture_height = static_cast<uint32_t>(picture_height);
-        d->session.beginContext(d->profile);
+        d->session.beginContext(config.profile);
         resetPictureState(d);
     }
 
+    d->profile = config.profile;
+
     // Initialize decoder with the requested size; it may adjust later.
     if (!d->decoder || (!d->decoder->isInitialized() &&
-                        !d->decoder->initialize(vaProfileToCodec(d->profile), picture_width, picture_height, d->drm_fd))) {
+                        !d->decoder->initialize(vaProfileToCodec(config.profile), picture_width, picture_height, d->drm_fd))) {
         return VA_STATUS_ERROR_ALLOCATION_FAILED;
     }
 
     const VAContextID new_context = d->next_context_id++;
-    d->active_contexts.insert(new_context);
+    d->active_contexts.emplace(new_context, DriverState::ContextState{
+        .config_id = config_id,
+        .profile = config.profile,
+        .rt_format = config.rt_format,
+    });
     *context = new_context;
     return VA_STATUS_SUCCESS;
 }
@@ -1414,10 +1449,17 @@ static VAStatus vaDestroyBuffer(VADriverContextP ctx,
 }
 
 static VAStatus vaBeginPicture(VADriverContextP ctx,
-                               VAContextID /*context*/,
+                               VAContextID context,
                                VASurfaceID render_target) {
     auto* d = toDriver(ctx);
     if (!d) return VA_STATUS_ERROR_INVALID_CONTEXT;
+
+    {
+        std::lock_guard<std::mutex> lock(d->lock);
+        auto context_it = d->active_contexts.find(context);
+        if (context_it == d->active_contexts.end()) return VA_STATUS_ERROR_INVALID_CONTEXT;
+        d->profile = context_it->second.profile;
+    }
 
     d->picture.beginPicture(render_target);
     {
@@ -1429,9 +1471,15 @@ static VAStatus vaBeginPicture(VADriverContextP ctx,
 }
 
 static VAStatus vaEndPicture(VADriverContextP ctx,
-                             VAContextID /*context*/) {
+                             VAContextID context) {
     auto* d = toDriver(ctx);
     if (!d) return VA_STATUS_ERROR_INVALID_CONTEXT;
+    {
+        std::lock_guard<std::mutex> lock(d->lock);
+        auto context_it = d->active_contexts.find(context);
+        if (context_it == d->active_contexts.end()) return VA_STATUS_ERROR_INVALID_CONTEXT;
+        d->profile = context_it->second.profile;
+    }
     ScopedPictureStateReset cleanup{d};
     auto& picture = d->picture;
     auto& session = d->session;
@@ -1730,7 +1778,8 @@ static VAStatus vaEndPicture(VADriverContextP ctx,
     // should not be forced to flush per VA picture.
     job.eos = false;
 
-    if (session.consumeStartupPrimeJob(d->profile)) {
+    const unsigned int startup_prime_copies = session.consumeStartupPrimeCopies(d->profile);
+    for (unsigned int copy_index = 0; copy_index < startup_prime_copies; ++copy_index) {
         MppDecoder::DecodeJob prime_job;
         prime_job.target_surface = job.target_surface;
         prime_job.bitstream = job.bitstream;
@@ -1738,7 +1787,10 @@ static VAStatus vaEndPicture(VADriverContextP ctx,
         prime_job.eos = false;
         if (!d->decoder->enqueueJob(std::move(prime_job))) {
             util::log(util::stderr_sink, util::LogLevel::Error,
-                      "vaEndPicture: startup prime enqueue failed for surface={}", picture.current_surface);
+                      "vaEndPicture: startup prime enqueue failed for surface={} copy={}/{}",
+                      picture.current_surface,
+                      copy_index + 1,
+                      startup_prime_copies);
             return VA_STATUS_ERROR_ALLOCATION_FAILED;
         }
     }
@@ -2594,12 +2646,18 @@ static VAStatus vaSetDisplayAttributes(VADriverContextP ctx,
 }
 
 static VAStatus vaRenderPicture(VADriverContextP ctx,
-                                VAContextID /*context*/,
+                                VAContextID context,
                                 VABufferID* buffers,
                                 int num_buffers) {
     auto* d = toDriver(ctx);
     if (!d) return VA_STATUS_ERROR_INVALID_CONTEXT;
     if (!buffers || num_buffers <= 0) return VA_STATUS_ERROR_INVALID_PARAMETER;
+    {
+        std::lock_guard<std::mutex> lock(d->lock);
+        auto context_it = d->active_contexts.find(context);
+        if (context_it == d->active_contexts.end()) return VA_STATUS_ERROR_INVALID_CONTEXT;
+        d->profile = context_it->second.profile;
+    }
     auto& picture = d->picture;
 
     const VABuffer* slice_param_buffer = nullptr;

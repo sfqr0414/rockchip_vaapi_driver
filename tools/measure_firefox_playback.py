@@ -62,6 +62,7 @@ def compute_summary(samples):
         "dropped_delta": None,
         "last_readyState": last.get("readyState"),
         "last_paused": last.get("paused"),
+        "last_ended": last.get("ended"),
         "last_error": last.get("error"),
         "last_events": last.get("events"),
         "seek_enabled": any(bool(sample.get("seekEnabled")) for sample in samples),
@@ -89,6 +90,8 @@ def main() -> int:
     parser.add_argument("--seek-at", type=float)
     parser.add_argument("--seek-to", type=float)
     parser.add_argument("--stdout-file")
+    parser.add_argument("--summary-file")
+    parser.add_argument("--last-sample-file")
     args = parser.parse_args()
 
     clear_harness_processes()
@@ -149,6 +152,14 @@ def main() -> int:
                 "duration_seconds": args.duration,
             }
         )
+        if args.summary_file:
+            summary_path = Path(args.summary_file)
+            summary_path.parent.mkdir(parents=True, exist_ok=True)
+            summary_path.write_text(json.dumps(summary, ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
+        if args.last_sample_file and samples:
+            last_sample_path = Path(args.last_sample_file)
+            last_sample_path.parent.mkdir(parents=True, exist_ok=True)
+            last_sample_path.write_text(json.dumps(samples[-1], ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
         print(json.dumps(summary, ensure_ascii=True, indent=2))
         return 0
     finally:

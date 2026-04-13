@@ -24,6 +24,7 @@ extern "C" {
 #include <iostream>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -70,48 +71,38 @@ static bool probe_dimensions(const std::string& infile, int& width, int& height)
     return width > 0 && height > 0;
 }
 
-static void save_surface_to_jpg(VADisplay display,
-                                VASurfaceID surface,
-                                uint32_t width,
-                                uint32_t height,
-                                bool is_10bit,
-                                int frame_num,
-                                const std::string& output_dir) {
+static bool write_surface_visible_bytes(VADisplay display,
+                                        VASurfaceID surface,
+                                        uint32_t width,
+                                        uint32_t height,
+                                        bool is_10bit,
+                                        util::SubProcess& sink,
+                                        uint32_t* out_stride = nullptr) {
     VADRMPRIMESurfaceDescriptor desc = {};
     VAStatus export_status = vaExportSurfaceHandle(display, surface,
                                                    VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
                                                    VA_EXPORT_SURFACE_READ_ONLY, &desc);
     if (export_status != VA_STATUS_SUCCESS || desc.num_objects == 0 || desc.objects[0].fd < 0) {
-        util::console(std::cerr, "Failed to export surface {} for frame {}\n", surface, frame_num);
-        return;
+        util::console(std::cerr, "Failed to export surface {}\n", surface);
+        return false;
     }
 
     const uint32_t stride = desc.layers[0].pitch[0];
+    if (out_stride) {
+        *out_stride = stride;
+    }
     const uint32_t bytes_per_sample = is_10bit ? 2u : 1u;
-    const size_t y_offset = desc.layers[0].offset[0];
     const size_t uv_offset = desc.layers[0].offset[1];
     const size_t total_size = desc.objects[0].size;
-    util::console(std::cerr,
-                  "Saving frame {} surface={} width={} height={} stride={} y_offset={} uv_offset={} 10bit={} total_size={}\n",
-                  frame_num, surface, width, height, stride, y_offset, uv_offset, is_10bit ? 1 : 0, total_size);
 
     void* ptr = mmap(nullptr, total_size, PROT_READ, MAP_SHARED, desc.objects[0].fd, 0);
     if (ptr == MAP_FAILED) {
         close(desc.objects[0].fd);
-        util::console(std::cerr, "Failed to mmap surface {} for frame {}\n", surface, frame_num);
-        return;
+        util::console(std::cerr, "Failed to mmap surface {}\n", surface);
+        return false;
     }
 
-    const char* pix_fmt = is_10bit ? "p010le" : "nv12";
-    const std::string filename = util::format_to("{}/frame_{:03d}.jpg", output_dir, frame_num);
-    const std::string cmd = util::format_to(
-        "ffmpeg -hide_banner -loglevel error -y -f rawvideo -pixel_format {} -video_size {}x{} -i pipe:0 -vframes 1 \"{}\"",
-        pix_fmt, width, height, filename);
-
-    util::SubProcess proc(cmd, util::SubProcess::WRITE);
     uint8_t* base = static_cast<uint8_t*>(ptr);
-    const uint32_t aligned_height = is_10bit ? ((height + 7) / 8) * 8 : height;
-    const size_t y_plane_bytes = static_cast<size_t>(stride) * static_cast<size_t>(aligned_height);
     const size_t output_row_bytes = static_cast<size_t>(width) * bytes_per_sample;
     std::vector<uint8_t> row_buffer(output_row_bytes, 0);
 
@@ -119,7 +110,7 @@ static void save_surface_to_jpg(VADisplay display,
         const uint8_t* src_row = base + static_cast<size_t>(row) * stride;
         const size_t copy_bytes = std::min(output_row_bytes, static_cast<size_t>(stride));
         std::memcpy(row_buffer.data(), src_row, copy_bytes);
-        proc.write(row_buffer.data(), output_row_bytes);
+        sink.write(row_buffer.data(), output_row_bytes);
     }
 
     const uint8_t* uv_base = base + uv_offset;
@@ -127,23 +118,61 @@ static void save_surface_to_jpg(VADisplay display,
         const uint8_t* src_row = uv_base + static_cast<size_t>(row) * stride;
         const size_t copy_bytes = std::min(output_row_bytes, static_cast<size_t>(stride));
         std::memcpy(row_buffer.data(), src_row, copy_bytes);
-        proc.write(row_buffer.data(), output_row_bytes);
+        sink.write(row_buffer.data(), output_row_bytes);
     }
 
     munmap(ptr, total_size);
     close(desc.objects[0].fd);
+    return true;
+}
+
+static bool save_surface_to_jpg(VADisplay display,
+                                VASurfaceID surface,
+                                uint32_t width,
+                                uint32_t height,
+                                bool is_10bit,
+                                int frame_num,
+                                const std::string& output_dir,
+                                uint32_t* out_stride = nullptr) {
+    const char* pix_fmt = is_10bit ? "p010le" : "nv12";
+    const std::string filename = util::format_to("{}/frame_{:03d}.jpg", output_dir, frame_num);
+    const std::string cmd = util::format_to(
+        "ffmpeg -hide_banner -loglevel error -y -f rawvideo -pixel_format {} -video_size {}x{} -i pipe:0 -vframes 1 \"{}\"",
+        pix_fmt, width, height, filename);
+
+    util::SubProcess proc(cmd, util::SubProcess::WRITE);
+    return write_surface_visible_bytes(display, surface, width, height, is_10bit, proc, out_stride);
 }
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        util::console("Usage: {} <input.mp4> [max_decoded_frames]\n", argv[0]);
+        util::console("Usage: {} <input.mp4> [max_decoded_frames] [--framemd5-out <path>] [--no-images]\n", argv[0]);
         return 1;
     }
 
     const char* infile = argv[1];
     int width = 0;
     int height = 0;
-    int kMaxDecodedFrames = (argc > 2) ? atoi(argv[2]) : 0; // 0 means no limit (decode full stream)
+    int kMaxDecodedFrames = 0; // 0 means no limit (decode full stream)
+    bool save_images = true;
+    std::optional<std::string> framemd5_out;
+
+    for (int argi = 2; argi < argc; ++argi) {
+        std::string_view arg = argv[argi];
+        if (arg == "--no-images") {
+            save_images = false;
+            continue;
+        }
+        if (arg == "--framemd5-out") {
+            if (argi + 1 >= argc) {
+                util::console(std::cerr, "Missing path after --framemd5-out\n");
+                return 1;
+            }
+            framemd5_out = argv[++argi];
+            continue;
+        }
+        kMaxDecodedFrames = atoi(argv[argi]);
+    }
 
     if (!probe_dimensions(infile, width, height)) {
         if (!probe_dimensions(infile, width, height)) {
@@ -178,7 +207,9 @@ int main(int argc, char** argv) {
 
     std::string base_name = std::filesystem::path(infile).stem().string();
     std::string output_dir = std::string("output/") + base_name;
-    std::filesystem::create_directories(output_dir);
+    if (save_images) {
+        std::filesystem::create_directories(output_dir);
+    }
 
     VAProfile profile = VAProfileH264High;
     if (codec_cat == "h264")
@@ -260,6 +291,14 @@ int main(int argc, char** argv) {
 
     int surface_idx = 0;
     int decoded_frames = 0;
+    std::unique_ptr<util::SubProcess> framemd5_sink;
+    if (framemd5_out.has_value()) {
+        const char* pix_fmt = is_10bit ? "p010le" : "nv12";
+        const std::string framemd5_cmd = util::format_to(
+            "ffmpeg -hide_banner -loglevel error -y -f rawvideo -pixel_format {} -video_size {}x{} -framerate 60 -i pipe:0 -f framemd5 \"{}\"",
+            pix_fmt, width, height, *framemd5_out);
+        framemd5_sink = std::make_unique<util::SubProcess>(framemd5_cmd, util::SubProcess::WRITE);
+    }
 
     // util::SubProcess proc(cmd, util::SubProcess::READ);
 
@@ -342,33 +381,40 @@ int main(int argc, char** argv) {
 
             VAStatus sync = syncSurfaceWithRetry(surfaces[surface_idx % 2]);
             if (sync == VA_STATUS_SUCCESS) {
-                VADRMPRIMESurfaceDescriptor desc;
-                VAStatus export_status = vaExportSurfaceHandle(display, surfaces[surface_idx % 2],
-                                                               VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
-                                                               VA_EXPORT_SURFACE_READ_ONLY, &desc);
-                if (export_status == VA_STATUS_SUCCESS) {
-                    save_surface_to_jpg(display,
-                                        surfaces[surface_idx % 2],
-                                        width,
-                                        height,
-                                        is_10bit,
-                                        decoded_frames + 1,
-                                        output_dir);
-                    for (uint32_t i = 0; i < desc.num_objects; i++) {
-                        if (desc.objects[i].fd >= 0) {
-                            close(desc.objects[i].fd);
-                            desc.objects[i].fd = -1;
-                        }
-                    }
+                uint32_t exported_stride = 0;
+                bool wrote_frame = true;
+                if (save_images) {
+                    util::console(std::cerr,
+                                  "Saving frame {} surface={} width={} height={} 10bit={}\n",
+                                  decoded_frames + 1, surfaces[surface_idx % 2], width, height, is_10bit ? 1 : 0);
+                    wrote_frame = save_surface_to_jpg(display,
+                                                      surfaces[surface_idx % 2],
+                                                      width,
+                                                      height,
+                                                      is_10bit,
+                                                      decoded_frames + 1,
+                                                      output_dir,
+                                                      &exported_stride);
+                }
+                if (wrote_frame && framemd5_sink) {
+                    wrote_frame = write_surface_visible_bytes(display,
+                                                              surfaces[surface_idx % 2],
+                                                              width,
+                                                              height,
+                                                              is_10bit,
+                                                              *framemd5_sink,
+                                                              &exported_stride);
+                }
 
+                if (wrote_frame) {
                     decoded_frames++;
                     surface_idx++;
                     if ((decoded_frames % 100) == 0) {
                         util::console(std::cerr, "Decoded {} frames (surface={} stride={})\n",
-                                      decoded_frames, surface_idx - 1, desc.layers[0].pitch[0]);
+                                      decoded_frames, surface_idx - 1, exported_stride);
                     }
                 } else {
-                    util::console(std::cerr, "vaExportSurfaceHandle failed: {}\n", export_status);
+                    util::console(std::cerr, "Failed to persist decoded surface {}\n", surfaces[surface_idx % 2]);
                 }
             } else {
                 util::console(std::cerr, "vaSyncSurface failed: {} after retries\n", sync);
