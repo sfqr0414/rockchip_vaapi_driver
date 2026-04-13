@@ -70,6 +70,20 @@ bool startupPrimingDisabled() {
     return envEnabledLocal("ROCKCHIP_VAAPI_DISABLE_STARTUP_PRIMING");
 }
 
+unsigned int h264IdrPrimeCopies() {
+    const char* value = std::getenv("ROCKCHIP_VAAPI_H264_IDR_PRIME_COPIES");
+    if (!value || !*value) {
+        return 0;
+    }
+
+    char* end = nullptr;
+    unsigned long parsed = std::strtoul(value, &end, 10);
+    if (end == value || (end && *end != '\0')) {
+        return 0;
+    }
+    return static_cast<unsigned int>(std::min<unsigned long>(parsed, 8));
+}
+
 bool isH264Profile(VAProfile profile) {
     switch (profile) {
         case VAProfileH264ConstrainedBaseline:
@@ -84,6 +98,18 @@ bool isH264Profile(VAProfile profile) {
 
 bool isInternalSurfaceId(VASurfaceID surface_id) {
     return surface_id >= 0x40000000u;
+}
+
+bool h264AccessUnitStartsWithIdr(std::span<const uint8_t> bytes) {
+    if (bytes.size() >= 5 && bytes[0] == 0x00 && bytes[1] == 0x00) {
+        if (bytes[2] == 0x01) {
+            return (bytes[3] & 0x1fu) == 5;
+        }
+        if (bytes.size() >= 5 && bytes[2] == 0x00 && bytes[3] == 0x01) {
+            return (bytes[4] & 0x1fu) == 5;
+        }
+    }
+    return false;
 }
 
 std::string formatBytePrefix(std::span<const uint8_t> bytes, size_t limit = 16) {
@@ -1913,7 +1939,7 @@ static VAStatus vaEndPicture(VADriverContextP ctx,
                 case VAProfileH264Baseline:
                 case VAProfileH264Main:
                 case VAProfileH264High:
-                    if (!session.sequence_headers_sent) {
+                    if (!session.sequence_headers_sent || h264AccessUnitStartsWithIdr(picture.frame_buffer)) {
                         picture.frame_extra_data = bitstream::build_h264_headers(
                             *reinterpret_cast<const VAPictureParameterBufferH264*>(picture_param_buffer.data.data()),
                             d->picture_width,
@@ -2122,6 +2148,7 @@ static VAStatus vaEndPicture(VADriverContextP ctx,
     // Do NOT set EOS here; the decoder will take packets as a stream and
     // should not be forced to flush per VA picture.
     job.eos = false;
+    const bool h264_idr = isH264Profile(d->profile) && h264AccessUnitStartsWithIdr(job.bitstream);
 
     const unsigned int startup_prime_copies = session.consumeStartupPrimeCopies(d->profile);
     for (unsigned int copy_index = 0; copy_index < startup_prime_copies; ++copy_index) {
@@ -2150,6 +2177,36 @@ static VAStatus vaEndPicture(VADriverContextP ctx,
                       picture.current_surface,
                       copy_index + 1,
                       startup_prime_copies);
+            return VA_STATUS_ERROR_ALLOCATION_FAILED;
+        }
+    }
+
+    const unsigned int idr_prime_copies = h264_idr ? h264IdrPrimeCopies() : 0;
+    for (unsigned int copy_index = 0; copy_index < idr_prime_copies; ++copy_index) {
+        MppDecoder::DecodeJob prime_job;
+        prime_job.target_surface = session.nextStartupPrimeSurface();
+        if (prime_job.target_surface == VA_INVALID_ID) {
+            prime_job.discard_output = true;
+        }
+        static std::atomic<int> idr_prime_log_count{0};
+        if (idr_prime_log_count.fetch_add(1, std::memory_order_relaxed) < 24) {
+            util::log(util::stderr_sink, util::LogLevel::Info,
+                      "vaEndPicture: h264 idr prime copy={}/{} current_surface={} prime_surface={} discard_output={}",
+                      copy_index + 1,
+                      idr_prime_copies,
+                      picture.current_surface,
+                      prime_job.target_surface,
+                      prime_job.discard_output ? 1 : 0);
+        }
+        prime_job.bitstream = job.bitstream;
+        prime_job.extra_data = job.extra_data;
+        prime_job.eos = false;
+        if (!d->decoder->enqueueJob(std::move(prime_job))) {
+            util::log(util::stderr_sink, util::LogLevel::Error,
+                      "vaEndPicture: h264 idr prime enqueue failed for surface={} copy={}/{}",
+                      picture.current_surface,
+                      copy_index + 1,
+                      idr_prime_copies);
             return VA_STATUS_ERROR_ALLOCATION_FAILED;
         }
     }

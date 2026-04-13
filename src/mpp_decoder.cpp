@@ -26,6 +26,10 @@ namespace rockchip {
 
 namespace {
 
+#ifndef MPP_PACKET_FLAG_EOI
+#define MPP_PACKET_FLAG_EOI 0x00000040
+#endif
+
 bool envEnabled(const char* name) {
     const char* value = std::getenv(name);
     if (!value) return false;
@@ -40,6 +44,10 @@ bool envDisabled(const char* name) {
 
 bool av1ExportAs10BitEnabled() {
     return !envDisabled("ROCKCHIP_VAAPI_AV1_EXPORT_P010");
+}
+
+bool h264ImmediateOutEnabled() {
+    return envEnabled("ROCKCHIP_VAAPI_H264_IMMEDIATE_OUT");
 }
 
 bool isInternalSurfaceId(VASurfaceID surface_id) {
@@ -272,6 +280,11 @@ bool MppDecoder::initialize(CodecProfile profile, int width, int height, int drm
 
     uint32_t split_parse = 1;
     api->control(ctx, MPP_DEC_SET_PARSER_SPLIT_MODE, &split_parse);
+
+    if (profile_ == CodecProfile::H264 && h264ImmediateOutEnabled()) {
+        RK_U32 immediate_out = 1;
+        api->control(ctx, MPP_DEC_SET_IMMEDIATE_OUT, &immediate_out);
+    }
 
     MppPollType nonblock = MPP_POLL_NON_BLOCK;
     api->control(ctx, MPP_SET_OUTPUT_TIMEOUT, &nonblock);
@@ -827,16 +840,62 @@ void MppDecoder::inputThreadMain(std::stop_token st) {
     MppCtx ctx = session->ctx();
     MppApi* api = session->api();
 
+    auto submit_packet = [&](const uint8_t* data,
+                             size_t size,
+                             bool is_extra_data,
+                             uint64_t job_id,
+                             VASurfaceID target_surface) -> bool {
+        if (!data || size == 0) {
+            return true;
+        }
+
+        MppPacket raw_packet = nullptr;
+        if (mpp_packet_init(&raw_packet, const_cast<uint8_t*>(data), size) != MPP_OK) {
+            return false;
+        }
+        MppPacketHandle packet{raw_packet};
+
+        if (is_extra_data) {
+            mpp_packet_set_extra_data(packet.get());
+        } else if (job_id > 0) {
+            mpp_packet_set_pts(packet.get(), static_cast<RK_S64>(job_id));
+            mpp_packet_set_dts(packet.get(), static_cast<RK_S64>(job_id));
+            mpp_packet_set_flag(packet.get(), mpp_packet_get_flag(packet.get()) | MPP_PACKET_FLAG_EOI);
+        }
+
+        while (running_) {
+            int ret = api->decode_put_packet(ctx, packet.get());
+            if (ret == MPP_OK) {
+                return true;
+            }
+            if (ret == MPP_ERR_BUFFER_FULL) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                continue;
+            }
+            util::log(util::stderr_sink, util::LogLevel::Error,
+                      "mpp: decode_put_packet returned {} extra_data={} job_id={} surface={} size={}",
+                      ret,
+                      is_extra_data ? 1 : 0,
+                      static_cast<unsigned long long>(job_id),
+                      target_surface,
+                      size);
+            failPendingSurfaces(target_surface);
+            running_ = false;
+            eos_seen_ = true;
+            return false;
+        }
+
+        return false;
+    };
+
     while (!st.stop_requested() && (running_ || !eos_sent_)) {
         auto job_opt = input_queue_.pop();
         if (!job_opt) break;
         DecodeJob job = std::move(*job_opt);
 
-        std::vector<uint8_t> payload;
-        const uint8_t* payload_ptr = nullptr;
-        size_t payload_size = 0;
         const size_t bitstream_size = job.bitstream.size();
         const size_t extra_data_size = job.extra_data.size();
+        std::vector<uint8_t> diagnostic_payload;
 
         if (job.eos) {
             const bool submitted = submitDecoderEos(ctx, api, running_);
@@ -849,22 +908,15 @@ void MppDecoder::inputThreadMain(std::stop_token st) {
             continue;
         }
 
-        if (!job.extra_data.empty() && !job.bitstream.empty()) {
-            payload.reserve(job.extra_data.size() + job.bitstream.size());
-            payload.insert(payload.end(), job.extra_data.begin(), job.extra_data.end());
-            payload.insert(payload.end(), job.bitstream.begin(), job.bitstream.end());
-            payload_ptr = payload.data();
-            payload_size = payload.size();
-        } else if (!job.extra_data.empty()) {
-            payload = std::move(job.extra_data);
-            payload_ptr = payload.data();
-            payload_size = payload.size();
+        if (!job.extra_data.empty()) {
+            diagnostic_payload.reserve(job.extra_data.size() + job.bitstream.size());
+            diagnostic_payload.insert(diagnostic_payload.end(), job.extra_data.begin(), job.extra_data.end());
+            diagnostic_payload.insert(diagnostic_payload.end(), job.bitstream.begin(), job.bitstream.end());
         } else {
-            payload = std::move(job.bitstream);
-            payload_ptr = payload.data();
-            payload_size = payload.size();
+            diagnostic_payload = job.bitstream;
         }
 
+        const size_t payload_size = diagnostic_payload.size();
         if (payload_size == 0) continue;
 
         if (!job.discard_output && job.target_surface != VA_INVALID_ID && !isInternalSurfaceId(job.target_surface)) {
@@ -877,53 +929,38 @@ void MppDecoder::inputThreadMain(std::stop_token st) {
                           payload_size,
                           bitstream_size,
                           extra_data_size,
-                          formatBytePrefix(std::span<const uint8_t>(payload.data(), payload.size())));
+                          formatBytePrefix(std::span<const uint8_t>(diagnostic_payload.data(), diagnostic_payload.size())));
             }
 
             if (profile_ == CodecProfile::H264 && envEnabled("ROCKCHIP_VAAPI_DUMP_H264_PAYLOADS") && job.job_id <= 48) {
                 dumpPayloadToFile(job.job_id,
                                   job.target_surface,
-                                  std::span<const uint8_t>(payload.data(), payload.size()));
+                                  std::span<const uint8_t>(diagnostic_payload.data(), diagnostic_payload.size()));
             }
         }
 
-        MppPacket raw_packet = nullptr;
-        if (mpp_packet_init(&raw_packet, const_cast<uint8_t*>(payload_ptr), payload_size) != MPP_OK) {
-            continue;
-        }
-        MppPacketHandle packet{raw_packet};
-
-        if (job.job_id > 0) {
-            mpp_packet_set_pts(packet.get(), static_cast<RK_S64>(job.job_id));
-            mpp_packet_set_dts(packet.get(), static_cast<RK_S64>(job.job_id));
-        }
-
-        bool packet_submitted = false;
-        while (running_) {
-            int ret = api->decode_put_packet(ctx, packet.get());
-            if (ret == MPP_OK) {
-                packet_submitted = true;
+        if (!job.extra_data.empty()) {
+            static std::atomic<int> extra_log_count{0};
+            if (extra_log_count.fetch_add(1, std::memory_order_relaxed) < 32) {
+                util::log(util::stderr_sink, util::LogLevel::Info,
+                          "mpp: submit extra_data job_id={} surface={} bytes={} prefix={}",
+                          static_cast<unsigned long long>(job.job_id),
+                          job.target_surface,
+                          extra_data_size,
+                          formatBytePrefix(std::span<const uint8_t>(job.extra_data.data(), job.extra_data.size())));
+            }
+            if (!submit_packet(job.extra_data.data(), job.extra_data.size(), true, job.job_id, job.target_surface)) {
                 break;
             }
-            if (ret == MPP_ERR_BUFFER_FULL) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(2));
-                continue;
-            }
-            util::log(util::stderr_sink, util::LogLevel::Error,
-                      "mpp: decode_put_packet returned {}", ret);
-            failPendingSurfaces(job.target_surface);
-            running_ = false;
-            eos_seen_ = true;
-            break;
         }
 
-        if (!packet_submitted) {
+        if (!submit_packet(job.bitstream.data(), job.bitstream.size(), false, job.job_id, job.target_surface)) {
             break;
         }
 
         {
             std::lock_guard<std::mutex> lock(pending_mutex_);
-            pending_payloads_[job.job_id] = std::make_shared<std::vector<uint8_t>>(std::move(payload));
+            pending_payloads_[job.job_id] = std::make_shared<std::vector<uint8_t>>(std::move(diagnostic_payload));
         }
 
         static std::atomic<int> input_log_count{0};
