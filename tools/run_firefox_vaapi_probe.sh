@@ -34,6 +34,9 @@ user_pref("media.hardware-video-decoding.force-enabled", true);
 user_pref("media.rdd-ffmpeg.enabled", true);
 user_pref("widget.dmabuf.force-enabled", true);
 user_pref("gfx.webrender.all", true);
+user_pref("gfx.webrender.compositor.force-enabled", true);
+user_pref("layers.gpu-process.enabled", true);
+user_pref("gfx.blocklist.all", -1);
 user_pref("media.ffvpx.enabled", false);
 EOF
 
