@@ -31,6 +31,10 @@ class MppDecoder {
         unique_fd dmabuf;
         MppBufferHandle buffer;
         MppFrameHandle frame;
+        void* export_map = nullptr;
+        size_t export_size = 0;
+        uint32_t export_handle = 0;
+        uint32_t export_pitch = 0;
         std::atomic<bool> in_flight{false};
         std::atomic<bool> ready{false};
         std::atomic<bool> failed{false};
@@ -67,6 +71,7 @@ class MppDecoder {
     void outputThreadMain(std::stop_token st);
     void setSurfaceState(VASurfaceID surface, bool ready, bool failed);
     std::vector<VASurfaceID> failPendingSurfaces(VASurfaceID preferred_surface = VA_INVALID_ID);
+    bool dropPendingJobLocked(uint64_t job_id, VASurfaceID* surface = nullptr);
     bool dropPendingSurfaceLocked(VASurfaceID surface);
     VASurfaceID dropOldestPendingSurfaceLocked();
 
@@ -74,7 +79,7 @@ class MppDecoder {
     std::shared_ptr<MppSession> session_;
     bool session_initialized_ = false;
     MppBufferGroup group_ = nullptr;
-    util::AtomicSyncQueue<DecodeJob, 16> input_queue_;
+    util::AtomicSyncQueue<DecodeJob, 64> input_queue_;
     std::atomic<bool> running_{false};
     std::atomic<bool> eos_sent_{false};
     std::atomic<bool> eos_seen_{false};
@@ -83,14 +88,16 @@ class MppDecoder {
     std::jthread output_thread_;
 
     std::unordered_map<VASurfaceID, SurfaceInfo> surfaces_;
-    std::deque<VASurfaceID> pending_surfaces_;
+    std::deque<std::pair<uint64_t, VASurfaceID>> pending_surfaces_;
     std::unordered_map<uint64_t, VASurfaceID> pending_surface_pts_;
     std::deque<MppPacket> pending_packets_;
-    std::deque<std::shared_ptr<std::vector<uint8_t>>> pending_payloads_;
+    std::unordered_map<uint64_t, std::shared_ptr<std::vector<uint8_t>>> pending_payloads_;
     size_t pending_count_ = 0;
     std::atomic<uint64_t> last_enqueue_us_{0};
     std::atomic<uint64_t> last_progress_us_{0};
     std::atomic<uint64_t> next_job_id_{1};
+    unique_fd export_drm_fd_;
+    bool stable_export_enabled_ = false;
 
     std::mutex surface_mutex_;
     std::mutex pending_mutex_;

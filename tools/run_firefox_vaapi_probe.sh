@@ -30,6 +30,7 @@ drm_device=$(pick_drm_device)
 vaapi_enabled=${FIREFOX_VAAPI_ENABLED:-true}
 force_zero_copy=${FIREFOX_VAAPI_FORCE_ZERO_COPY:-true}
 hwdecode_enabled=${FIREFOX_HWDECODE_ENABLED:-true}
+test_video=${FIREFOX_TEST_VIDEO:-Test Jellyfin 1080p AVC 20M.mp4}
 
 pick_http_port() {
 	python3 - <<'PY'
@@ -107,10 +108,12 @@ ensure_http_server() {
 }
 
 server_port=$(ensure_http_server)
+encoded_video=$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1]))' "$test_video")
 
 cat >"$profile_dir/user.js" <<'EOF'
 user_pref("media.ffmpeg.vaapi.enabled", __VAAPI_ENABLED__);
 user_pref("media.ffmpeg.vaapi.force-surface-zero-copy", __FORCE_ZERO_COPY__);
+user_pref("media.ffmpeg.dmabuf-textures.enabled", true);
 user_pref("media.hardware-video-decoding.enabled", __HWDECODE_ENABLED__);
 user_pref("media.hardware-video-decoding.force-enabled", __HWDECODE_ENABLED__);
 user_pref("media.rdd-ffmpeg.enabled", true);
@@ -137,7 +140,7 @@ export MOZ_WEBRENDER=${MOZ_WEBRENDER:-1}
 export MOZ_LOG=${MOZ_LOG:-PlatformDecoderModule:5,FFmpegVideo:5,Dmabuf:5,VAAPI:5}
 
 firefox_bin=${FIREFOX_BIN:-firefox}
-target_url=${1:-"http://127.0.0.1:$server_port/tools/firefox_headless_video_test.html"}
+target_url=${1:-"http://127.0.0.1:$server_port/tools/firefox_headless_video_test.html?video=$encoded_video"}
 
 printf 'PROFILE=%s\n' "$profile_dir"
 printf 'URL=%s\n' "$target_url"

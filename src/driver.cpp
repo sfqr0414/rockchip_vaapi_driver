@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cassert>
+#include <cstdlib>
 #include <cstddef>
 #include <cstring>
 #include <filesystem>
@@ -43,6 +44,32 @@ namespace rockchip_vaapi {
 namespace {
 
 constexpr bool kExposePrime2Export = true;
+
+bool envEnabledLocal(const char* name) {
+    const char* value = std::getenv(name);
+    if (!value) return false;
+    return std::strcmp(value, "1") == 0 || std::strcmp(value, "true") == 0 || std::strcmp(value, "yes") == 0;
+}
+
+bool av1ExportAs10BitEnabled() {
+    return envEnabledLocal("ROCKCHIP_VAAPI_AV1_EXPORT_P010");
+}
+
+bool av1CorrectionEnabled() {
+    return envEnabledLocal("ROCKCHIP_VAAPI_AV1_CORRECTION");
+}
+
+bool isH264Profile(VAProfile profile) {
+    switch (profile) {
+        case VAProfileH264ConstrainedBaseline:
+        case VAProfileH264Baseline:
+        case VAProfileH264Main:
+        case VAProfileH264High:
+            return true;
+        default:
+            return false;
+    }
+}
 
 }  // namespace
 
@@ -130,9 +157,11 @@ struct DriverState {
     std::vector<uint8_t> frame_buffer;
     std::vector<uint8_t> frame_extra_data;
     bool sequence_headers_sent = false;
+    unsigned int h264_startup_prime_jobs_remaining = 0;
     bool av1_sequence_enable_restoration = false;
     std::array<VASurfaceID, 8> av1_ref_frame_map{};
     bool av1_ref_frame_map_valid = false;
+    unsigned int hevc_startup_prime_jobs_remaining = 0;
     struct PendingAv1Frame {
         bool valid = false;
         VASurfaceID surface = VA_INVALID_ID;
@@ -395,6 +424,9 @@ static constexpr uint32_t supportedRtFormats() {
     return VA_RT_FORMAT_YUV420 | VA_RT_FORMAT_YUV420_10BPP;
 }
 
+static constexpr uint32_t kMaxPictureWidth = 8192;
+static constexpr uint32_t kMaxPictureHeight = 8192;
+
 struct ResolvedDrmDevice {
     unique_fd owned_fd;
     int fd = -1;
@@ -532,8 +564,9 @@ static Expected<ResolvedDrmDevice, VAStatus> resolveDrmDevice(VADriverContextP c
 static bool profileSupports10BitOutput(VAProfile profile) {
     switch (profile) {
         case VAProfileHEVCMain10:
-        case VAProfileAV1Profile0:
             return true;
+        case VAProfileAV1Profile0:
+            return av1ExportAs10BitEnabled();
         default:
             return false;
     }
@@ -569,6 +602,7 @@ static DriverState* toDriver(VADriverContextP ctx) {
 static bool isSupportedProfile(VAProfile profile) {
     switch (profile) {
         case VAProfileH264ConstrainedBaseline:
+        case VAProfileH264Baseline:
         case VAProfileH264Main:
         case VAProfileH264High:
         case VAProfileHEVCMain:
@@ -757,9 +791,10 @@ static VAStatus vaSyncSurface(VADriverContextP ctx, VASurfaceID surface) {
         }
 
         if (!ready && !failed && !pending) {
-            util::log(util::stderr_sink, util::LogLevel::Warn,
-                      "vaSyncSurface: surface={} has no decoded output", surface);
-            return VA_STATUS_ERROR_INVALID_SURFACE;
+            util::log(util::stderr_sink, util::LogLevel::Info,
+                      "vaSyncSurface: surface={} has no decoded output yet; treating idle sync as success",
+                      surface);
+            return VA_STATUS_SUCCESS;
         }
 
         if (failed || fd < 0) {
@@ -815,6 +850,7 @@ static VAStatus vaQueryConfigProfiles(VADriverContextP ctx,
     }
     constexpr VAProfile supported[] = {
         VAProfileH264ConstrainedBaseline,
+        VAProfileH264Baseline,
         VAProfileH264Main,
         VAProfileH264High,
         VAProfileHEVCMain,
@@ -889,10 +925,19 @@ static VAStatus vaGetConfigAttributes(VADriverContextP ctx,
     if (entrypoint != VAEntrypointVLD) return VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT;
 
     for (int i = 0; i < num_attribs; i++) {
-        if (attrib_list[i].type == VAConfigAttribRTFormat) {
-            attrib_list[i].value = supportedRtFormats();
-        } else {
-            attrib_list[i].value = 0;
+        switch (attrib_list[i].type) {
+            case VAConfigAttribRTFormat:
+                attrib_list[i].value = supportedRtFormats();
+                break;
+            case VAConfigAttribMaxPictureWidth:
+                attrib_list[i].value = kMaxPictureWidth;
+                break;
+            case VAConfigAttribMaxPictureHeight:
+                attrib_list[i].value = kMaxPictureHeight;
+                break;
+            default:
+                attrib_list[i].value = VA_ATTRIB_NOT_SUPPORTED;
+                break;
         }
     }
     return VA_STATUS_SUCCESS;
@@ -972,7 +1017,7 @@ static VAStatus vaQueryConfigAttributes(VADriverContextP ctx,
     if (profile) *profile = d->profile;
     if (entrypoint) *entrypoint = VAEntrypointVLD;
 
-    constexpr int kConfigAttribCount = 1;
+    constexpr int kConfigAttribCount = 3;
     if (!attrib_list) {
         *num_attribs = kConfigAttribCount;
         return VA_STATUS_SUCCESS;
@@ -985,6 +1030,10 @@ static VAStatus vaQueryConfigAttributes(VADriverContextP ctx,
 
     attrib_list[0].type = VAConfigAttribRTFormat;
     attrib_list[0].value = supportedRtFormats();
+    attrib_list[1].type = VAConfigAttribMaxPictureWidth;
+    attrib_list[1].value = kMaxPictureWidth;
+    attrib_list[2].type = VAConfigAttribMaxPictureHeight;
+    attrib_list[2].value = kMaxPictureHeight;
     *num_attribs = kConfigAttribCount;
     return VA_STATUS_SUCCESS;
 }
@@ -1119,8 +1168,14 @@ static VAStatus vaCreateContext(VADriverContextP ctx,
     if (d->active_contexts.empty()) {
         d->picture_width = static_cast<uint32_t>(picture_width);
         d->picture_height = static_cast<uint32_t>(picture_height);
+        d->sequence_headers_sent = false;
+        d->h264_startup_prime_jobs_remaining = isH264Profile(d->profile) ? 2u : 0u;
+        d->av1_sequence_enable_restoration = false;
+        d->hevc_startup_prime_jobs_remaining = 4;
         d->av1_ref_frame_map.fill(VA_INVALID_SURFACE);
         d->av1_ref_frame_map_valid = false;
+        d->pending_av1_frame = {};
+        resetPictureState(d);
     }
 
     // Initialize decoder with the requested size; it may adjust later.
@@ -1158,8 +1213,16 @@ static VAStatus vaDestroyContext(VADriverContextP ctx, VAContextID context) {
     d->ready_flags.clear();
     d->current_surface = VA_INVALID_ID;
     d->current_buffers.clear();
+    d->sequence_headers_sent = false;
+    d->h264_startup_prime_jobs_remaining = 0;
+    d->av1_sequence_enable_restoration = false;
+    d->hevc_startup_prime_jobs_remaining = 0;
     d->av1_ref_frame_map.fill(VA_INVALID_SURFACE);
     d->av1_ref_frame_map_valid = false;
+    d->pending_av1_frame = {};
+    d->frame_buffer.clear();
+    d->frame_extra_data.clear();
+    d->decode_state.clear();
 
     for (auto& kv : d->images) {
         releaseDirectImageAlias(kv.second);
@@ -1310,6 +1373,78 @@ static VAStatus vaEndPicture(VADriverContextP ctx,
 
     // Ensure we have collected data for the current picture.
     if (d->current_surface == VA_INVALID_ID) return VA_STATUS_ERROR_INVALID_SURFACE;
+
+    if (!d->decode_state.slice_data_buffer_ids.empty()) {
+        std::vector<uint8_t> rebuilt_frame_buffer;
+        for (size_t index = 0; index < d->decode_state.slice_data_buffer_ids.size(); ++index) {
+            auto data_it = d->buffers.find(d->decode_state.slice_data_buffer_ids[index]);
+            if (data_it == d->buffers.end()) {
+                continue;
+            }
+
+            const auto& slice_data_buffer = *data_it->second;
+            const auto slice_data = slice_data_buffer.map();
+            const VABuffer* slice_param_buffer = nullptr;
+            if (index < d->decode_state.slice_param_buffer_ids.size()) {
+                auto param_it = d->buffers.find(d->decode_state.slice_param_buffer_ids[index]);
+                if (param_it != d->buffers.end()) {
+                    slice_param_buffer = param_it->second.get();
+                }
+            }
+
+            std::vector<uint8_t> framed;
+            if (slice_param_buffer && slice_param_buffer->num_elements > 0) {
+                if (isH264Profile(d->profile) &&
+                    slice_param_buffer->size_bytes() >= slice_param_buffer->num_elements * sizeof(VASliceParameterBufferH264)) {
+                    framed = bitstream::build_h264_annexb_slices(
+                        reinterpret_cast<const VASliceParameterBufferH264*>(slice_param_buffer->data.data()),
+                        slice_param_buffer->num_elements,
+                        slice_data.data(),
+                        slice_data.size());
+                } else if ((d->profile == VAProfileHEVCMain || d->profile == VAProfileHEVCMain10) &&
+                           slice_param_buffer->size_bytes() >= slice_param_buffer->num_elements * sizeof(VASliceParameterBufferHEVC)) {
+                    framed = bitstream::build_hevc_annexb_slices(
+                        reinterpret_cast<const VASliceParameterBufferHEVC*>(slice_param_buffer->data.data()),
+                        slice_param_buffer->num_elements,
+                        slice_data.data(),
+                        slice_data.size());
+                } else if (d->profile == VAProfileAV1Profile0 &&
+                           slice_param_buffer->size_bytes() >= slice_param_buffer->num_elements * sizeof(VASliceParameterBufferAV1)) {
+                    const auto* av1_slices = reinterpret_cast<const VASliceParameterBufferAV1*>(slice_param_buffer->data.data());
+                    size_t total_size = 0;
+                    bool valid = true;
+                    for (uint32_t slice_index = 0; slice_index < slice_param_buffer->num_elements; ++slice_index) {
+                        const auto offset = static_cast<size_t>(av1_slices[slice_index].slice_data_offset);
+                        const auto size = static_cast<size_t>(av1_slices[slice_index].slice_data_size);
+                        if (offset > slice_data.size() || size > slice_data.size() - offset) {
+                            valid = false;
+                            break;
+                        }
+                        total_size += size;
+                    }
+                    if (valid) {
+                        framed.reserve(total_size);
+                        for (uint32_t slice_index = 0; slice_index < slice_param_buffer->num_elements; ++slice_index) {
+                            const auto offset = static_cast<size_t>(av1_slices[slice_index].slice_data_offset);
+                            const auto size = static_cast<size_t>(av1_slices[slice_index].slice_data_size);
+                            framed.insert(framed.end(), slice_data.begin() + offset, slice_data.begin() + offset + size);
+                        }
+                    }
+                }
+            }
+
+            if (!framed.empty()) {
+                rebuilt_frame_buffer.insert(rebuilt_frame_buffer.end(), framed.begin(), framed.end());
+            } else {
+                rebuilt_frame_buffer.insert(rebuilt_frame_buffer.end(), slice_data.begin(), slice_data.end());
+            }
+        }
+
+        if (!rebuilt_frame_buffer.empty()) {
+            d->frame_buffer = std::move(rebuilt_frame_buffer);
+        }
+    }
+
     if (d->frame_buffer.empty()) return VA_STATUS_ERROR_INVALID_BUFFER;
 
     d->frame_extra_data.clear();
@@ -1317,7 +1452,7 @@ static VAStatus vaEndPicture(VADriverContextP ctx,
         auto it = d->buffers.find(*d->decode_state.picture_param_buffer_id);
         if (it != d->buffers.end()) {
             const auto& picture_param_buffer = *it->second;
-            if (d->profile == VAProfileHEVCMain) {
+            if (d->profile == VAProfileHEVCMain || d->profile == VAProfileHEVCMain10) {
                 const auto& hevc = *reinterpret_cast<const VAPictureParameterBufferHEVC*>(picture_param_buffer.data.data());
                 static std::atomic<int> hevc_param_log_count{0};
                 if (hevc_param_log_count.fetch_add(1, std::memory_order_relaxed) < 3) {
@@ -1339,11 +1474,19 @@ static VAStatus vaEndPicture(VADriverContextP ctx,
                 }
             }
             switch (d->profile) {
+                case VAProfileH264ConstrainedBaseline:
+                case VAProfileH264Baseline:
+                case VAProfileH264Main:
                 case VAProfileH264High:
-                    d->frame_extra_data = bitstream::build_h264_headers(
-                        *reinterpret_cast<const VAPictureParameterBufferH264*>(picture_param_buffer.data.data()));
+                    if (!d->sequence_headers_sent) {
+                        d->frame_extra_data = bitstream::build_h264_headers(
+                            *reinterpret_cast<const VAPictureParameterBufferH264*>(picture_param_buffer.data.data()),
+                            d->picture_width,
+                            d->picture_height);
+                    }
                     break;
                 case VAProfileHEVCMain:
+                case VAProfileHEVCMain10:
                     d->frame_extra_data = bitstream::build_hevc_headers(
                         *reinterpret_cast<const VAPictureParameterBufferHEVC*>(picture_param_buffer.data.data()));
                     break;
@@ -1360,7 +1503,8 @@ static VAStatus vaEndPicture(VADriverContextP ctx,
                                 pending_ref_frame_map,
                                 true,
                                 d->pending_av1_frame.surface);
-                            if (resolved_refresh_frame_flags != d->pending_av1_frame.provisional_refresh_frame_flags) {
+                            if (av1CorrectionEnabled() &&
+                                resolved_refresh_frame_flags != d->pending_av1_frame.provisional_refresh_frame_flags) {
                                 MppDecoder::DecodeJob correction_job;
                                 correction_job.target_surface = d->pending_av1_frame.surface;
                                 correction_job.bitstream = bitstream::build_av1_frame_obu(
@@ -1507,6 +1651,20 @@ static VAStatus vaEndPicture(VADriverContextP ctx,
                   d->current_surface, d->frame_buffer.size(), d->frame_extra_data.size(), prefix);
     }
 
+    static std::atomic<int> extra_prefix_log_count{0};
+    if (extra_prefix_log_count.fetch_add(1, std::memory_order_relaxed) < 2 && !d->frame_extra_data.empty()) {
+        char extra_prefix[128] = {0};
+        size_t extra_prefix_len = std::min<size_t>(16, d->frame_extra_data.size());
+        for (size_t i = 0; i < extra_prefix_len; ++i) {
+            std::snprintf(extra_prefix + i * 3, sizeof(extra_prefix) - i * 3, "%02x ", d->frame_extra_data[i]);
+        }
+        util::log(util::stderr_sink, util::LogLevel::Info,
+                  "vaEndPicture: extra_data_prefix={} slice_param_buffers={} slice_data_buffers={}",
+                  extra_prefix,
+                  d->decode_state.slice_param_buffer_ids.size(),
+                  d->decode_state.slice_data_buffer_ids.size());
+    }
+
     MppDecoder::DecodeJob job;
     job.target_surface = d->current_surface;
     job.bitstream = std::move(d->frame_buffer);
@@ -1514,6 +1672,35 @@ static VAStatus vaEndPicture(VADriverContextP ctx,
     // Do NOT set EOS here; the decoder will take packets as a stream and
     // should not be forced to flush per VA picture.
     job.eos = false;
+
+    if (isH264Profile(d->profile) && d->h264_startup_prime_jobs_remaining > 0) {
+        MppDecoder::DecodeJob prime_job;
+        prime_job.target_surface = job.target_surface;
+        prime_job.bitstream = job.bitstream;
+        prime_job.extra_data = job.extra_data;
+        prime_job.eos = false;
+        if (!d->decoder->enqueueJob(std::move(prime_job))) {
+            util::log(util::stderr_sink, util::LogLevel::Error,
+                      "vaEndPicture: H264 startup prime enqueue failed for surface={}", d->current_surface);
+            return VA_STATUS_ERROR_ALLOCATION_FAILED;
+        }
+        --d->h264_startup_prime_jobs_remaining;
+    }
+
+    if ((d->profile == VAProfileHEVCMain || d->profile == VAProfileHEVCMain10) &&
+        d->hevc_startup_prime_jobs_remaining > 0) {
+        MppDecoder::DecodeJob prime_job;
+        prime_job.target_surface = job.target_surface;
+        prime_job.bitstream = job.bitstream;
+        prime_job.extra_data = job.extra_data;
+        prime_job.eos = false;
+        if (!d->decoder->enqueueJob(std::move(prime_job))) {
+            util::log(util::stderr_sink, util::LogLevel::Error,
+                      "vaEndPicture: HEVC startup prime enqueue failed for surface={}", d->current_surface);
+            return VA_STATUS_ERROR_ALLOCATION_FAILED;
+        }
+        --d->hevc_startup_prime_jobs_remaining;
+    }
 
     // Submit the complete frame to the decoder thread (which will feed MPP).
     if (!d->decoder->enqueueJob(std::move(job))) {
@@ -2426,14 +2613,14 @@ static VAStatus vaRenderPicture(VADriverContextP ctx,
         const auto slice_data = slice_data_buffer->map();
         std::vector<uint8_t> framed;
         if (slice_param_buffer && slice_param_buffer->num_elements > 0) {
-            if (d->profile == VAProfileH264High &&
+            if (isH264Profile(d->profile) &&
                 slice_param_buffer->size_bytes() >= slice_param_buffer->num_elements * sizeof(VASliceParameterBufferH264)) {
                 framed = bitstream::build_h264_annexb_slices(
                     reinterpret_cast<const VASliceParameterBufferH264*>(slice_param_buffer->data.data()),
                     slice_param_buffer->num_elements,
                     slice_data.data(),
                     slice_data.size());
-            } else if (d->profile == VAProfileHEVCMain &&
+            } else if ((d->profile == VAProfileHEVCMain || d->profile == VAProfileHEVCMain10) &&
                        slice_param_buffer->size_bytes() >= slice_param_buffer->num_elements * sizeof(VASliceParameterBufferHEVC)) {
                 framed = bitstream::build_hevc_annexb_slices(
                     reinterpret_cast<const VASliceParameterBufferHEVC*>(slice_param_buffer->data.data()),

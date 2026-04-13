@@ -2,15 +2,184 @@
 
 #include <chrono>
 
+extern "C" {
+#include <fcntl.h>
+#include <sys/ioctl.h>
+
+#include <drm/drm.h>
+#include <drm/drm_mode.h>
+#include <xf86drm.h>
+}
+
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
 
 #include <mutex>
+#include <optional>
 #include <thread>
 
 #include <rockchip/mpp_log.h>
 
 namespace rockchip {
+
+namespace {
+
+bool envEnabled(const char* name) {
+    const char* value = std::getenv(name);
+    if (!value) return false;
+    return std::strcmp(value, "1") == 0 || std::strcmp(value, "true") == 0 || std::strcmp(value, "yes") == 0;
+}
+
+bool av1ExportAs10BitEnabled() {
+    return envEnabled("ROCKCHIP_VAAPI_AV1_EXPORT_P010");
+}
+
+bool hasDumbBufferCap(int fd) {
+    uint64_t value = 0;
+    return drmGetCap(fd, DRM_CAP_DUMB_BUFFER, &value) == 0 && value != 0;
+}
+
+std::optional<unique_fd> openStableExportDrmFd() {
+    std::array<drmDevicePtr, 64> devices{};
+    const int device_count = drmGetDevices2(0, devices.data(), static_cast<int>(devices.size()));
+    if (device_count < 0) {
+        return std::nullopt;
+    }
+
+    std::optional<unique_fd> preferred;
+    std::optional<unique_fd> fallback;
+    for (int index = 0; index < device_count; ++index) {
+        drmDevicePtr device_info = devices[index];
+        if (!device_info) continue;
+        if ((device_info->available_nodes & (1 << DRM_NODE_PRIMARY)) == 0) continue;
+        const char* node = device_info->nodes[DRM_NODE_PRIMARY];
+        if (!node) continue;
+
+        unique_fd fd{open(node, O_RDWR | O_CLOEXEC)};
+        if (!fd) continue;
+        if (!hasDumbBufferCap(fd.get())) continue;
+
+        drmVersionPtr version = drmGetVersion(fd.get());
+        const std::string driver_name = version && version->name ? version->name : "";
+        if (version) drmFreeVersion(version);
+
+        if (driver_name.find("rockchip") != std::string::npos) {
+            preferred = std::move(fd);
+            break;
+        }
+        if (!fallback) {
+            fallback = std::move(fd);
+        }
+    }
+
+    drmFreeDevices(devices.data(), device_count);
+    if (preferred) return preferred;
+    if (fallback) return fallback;
+    return std::nullopt;
+}
+
+bool createStableExportBuffer(MppDecoder::SurfaceInfo& surface_info,
+                              int drm_fd,
+                              uint32_t width,
+                              uint32_t height,
+                              bool is_10bit) {
+    if (drm_fd < 0 || is_10bit) {
+        return false;
+    }
+
+    drm_mode_create_dumb create = {};
+    create.width = alignUp(width, 64);
+    create.height = height + height / 2;
+    create.bpp = 8;
+    if (drmIoctl(drm_fd, DRM_IOCTL_MODE_CREATE_DUMB, &create) != 0) {
+        return false;
+    }
+
+    drm_prime_handle prime = {};
+    prime.handle = create.handle;
+    prime.flags = DRM_CLOEXEC | DRM_RDWR;
+    if (drmIoctl(drm_fd, DRM_IOCTL_PRIME_HANDLE_TO_FD, &prime) != 0) {
+        drm_mode_destroy_dumb destroy = {};
+        destroy.handle = create.handle;
+        drmIoctl(drm_fd, DRM_IOCTL_MODE_DESTROY_DUMB, &destroy);
+        return false;
+    }
+
+    drm_mode_map_dumb map = {};
+    map.handle = create.handle;
+    if (drmIoctl(drm_fd, DRM_IOCTL_MODE_MAP_DUMB, &map) != 0) {
+        ::close(prime.fd);
+        drm_mode_destroy_dumb destroy = {};
+        destroy.handle = create.handle;
+        drmIoctl(drm_fd, DRM_IOCTL_MODE_DESTROY_DUMB, &destroy);
+        return false;
+    }
+
+    void* addr = mmap(nullptr, create.size, PROT_READ | PROT_WRITE, MAP_SHARED, drm_fd, static_cast<off_t>(map.offset));
+    if (addr == MAP_FAILED) {
+        ::close(prime.fd);
+        drm_mode_destroy_dumb destroy = {};
+        destroy.handle = create.handle;
+        drmIoctl(drm_fd, DRM_IOCTL_MODE_DESTROY_DUMB, &destroy);
+        return false;
+    }
+
+    surface_info.export_map = addr;
+    surface_info.export_size = create.size;
+    surface_info.export_handle = create.handle;
+    surface_info.export_pitch = create.pitch;
+    surface_info.dmabuf.reset(prime.fd);
+    return true;
+}
+
+void destroyStableExportBuffer(MppDecoder::SurfaceInfo& surface_info, int drm_fd) {
+    if (surface_info.export_map && surface_info.export_map != MAP_FAILED) {
+        munmap(surface_info.export_map, surface_info.export_size);
+    }
+    surface_info.export_map = nullptr;
+    surface_info.export_size = 0;
+    surface_info.export_pitch = 0;
+    surface_info.dmabuf.reset();
+    surface_info.surface.dmabuf_fd = -1;
+
+    if (drm_fd >= 0 && surface_info.export_handle != 0) {
+        drm_mode_destroy_dumb destroy = {};
+        destroy.handle = surface_info.export_handle;
+        drmIoctl(drm_fd, DRM_IOCTL_MODE_DESTROY_DUMB, &destroy);
+    }
+    surface_info.export_handle = 0;
+}
+
+bool copyFrameToStableExport(void* dst_map,
+                             uint32_t dst_pitch,
+                             uint32_t width,
+                             uint32_t height,
+                             uint32_t src_stride_bytes,
+                             uint32_t src_ver_stride,
+                             const uint8_t* src_base) {
+    if (!dst_map || !src_base || width == 0 || height == 0) {
+        return false;
+    }
+
+    uint8_t* dst_y = static_cast<uint8_t*>(dst_map);
+    uint8_t* dst_uv = dst_y + static_cast<size_t>(dst_pitch) * height;
+    const uint8_t* src_y = src_base;
+    const uint8_t* src_uv = src_base + static_cast<size_t>(src_stride_bytes) * src_ver_stride;
+
+    for (uint32_t row = 0; row < height; ++row) {
+        std::memcpy(dst_y + static_cast<size_t>(row) * dst_pitch,
+                    src_y + static_cast<size_t>(row) * src_stride_bytes,
+                    width);
+    }
+    for (uint32_t row = 0; row < height / 2; ++row) {
+        std::memcpy(dst_uv + static_cast<size_t>(row) * dst_pitch,
+                    src_uv + static_cast<size_t>(row) * src_stride_bytes,
+                    width);
+    }
+    return true;
+}
+
+}  // namespace
 
 MppDecoder::MppDecoder() { mpp_set_log_level(MPP_LOG_ERROR); }
 
@@ -20,6 +189,9 @@ bool MppDecoder::initialize(CodecProfile profile, int width, int height, int drm
     std::scoped_lock lock(init_mutex_);
     profile_ = profile;
     if (session_initialized_) return true;
+
+    stable_export_enabled_ = envEnabled("ROCKCHIP_VAAPI_STABLE_EXPORT") ||
+                             (profile == CodecProfile::HEVC && !envEnabled("ROCKCHIP_VAAPI_DISABLE_STABLE_EXPORT"));
 
     struct stat stat_buf = {};
     if (drm_fd < 0 || fstat(drm_fd, &stat_buf) != 0 || !S_ISCHR(stat_buf.st_mode) || major(stat_buf.st_rdev) != 226 || minor(stat_buf.st_rdev) < 128) {
@@ -39,9 +211,20 @@ bool MppDecoder::initialize(CodecProfile profile, int width, int height, int drm
         return false;
     }
 
-    MppFrameFormat output_format = (profile_ == CodecProfile::AV1 && kAv1ExportAsP010)
+    MppFrameFormat output_format = (profile_ == CodecProfile::AV1 && av1ExportAs10BitEnabled())
                                        ? MPP_FMT_YUV420SP_10BIT
                                        : MPP_FMT_YUV420SP;
+    static std::atomic<int> init_log_count{0};
+    if (init_log_count.fetch_add(1, std::memory_order_relaxed) < 8) {
+        util::log(util::stderr_sink, util::LogLevel::Info,
+                  "mpp: initialize profile={} stable_export={} av1_p010={} output_format={} width={} height={}",
+                  static_cast<int>(profile_),
+                  stable_export_enabled_ ? 1 : 0,
+                  av1ExportAs10BitEnabled() ? 1 : 0,
+                  static_cast<int>(output_format),
+                  width,
+                  height);
+    }
     api->control(ctx, MPP_DEC_SET_OUTPUT_FORMAT, &output_format);
 
     MppDecCfg raw_cfg = nullptr;
@@ -80,8 +263,7 @@ bool MppDecoder::allocateSurface(VASurfaceID id, DecodedSurface& out, int width,
     std::lock_guard<std::mutex> lock(surface_mutex_);
     auto& entry = surfaces_[id];
     entry.surface = ds;
-    entry.dmabuf.reset();
-    entry.surface.dmabuf_fd = -1;
+    destroyStableExportBuffer(entry, export_drm_fd_.get());
     entry.in_flight.store(false);
     entry.ready.store(false);
     entry.failed.store(false);
@@ -108,7 +290,7 @@ bool MppDecoder::getSurfaceInfo(VASurfaceID id, uint32_t& width, uint32_t& heigh
     width = it->second.surface.width;
     height = it->second.surface.height;
     stride = it->second.surface.stride;
-    dmabuf_fd = it->second.dmabuf.get();
+    dmabuf_fd = it->second.surface.dmabuf_fd;
     failed = it->second.failed.load();
     pending = it->second.in_flight.load();
     return true;
@@ -145,7 +327,8 @@ bool MppDecoder::enqueueJob(DecodeJob job) {
         }
 
         std::unique_lock<std::mutex> lock(pending_mutex_);
-        const size_t max_in_flight = std::max<size_t>(1, std::min<size_t>(surface_count == 0 ? kMaxInFlightJobs : surface_count, kMaxInFlightJobs));
+        const size_t target_in_flight = (surface_count == 0) ? kMaxInFlightJobs : std::min<size_t>(surface_count * 4, kMaxInFlightJobs);
+        const size_t max_in_flight = std::max<size_t>(1, target_in_flight);
         static std::atomic<int> enqueue_wait_log_count{0};
         while (pending_count_ >= max_in_flight && running_.load()) {
             if (enqueue_wait_log_count.fetch_add(1, std::memory_order_relaxed) < 5) {
@@ -157,7 +340,7 @@ bool MppDecoder::enqueueJob(DecodeJob job) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
             lock.lock();
         }
-        pending_surfaces_.push_back(job.target_surface);
+        pending_surfaces_.emplace_back(job.job_id, job.target_surface);
         pending_surface_pts_[job.job_id] = job.target_surface;
         ++pending_count_;
         pending_cv_.notify_all();
@@ -195,7 +378,8 @@ std::vector<VASurfaceID> MppDecoder::failPendingSurfaces(VASurfaceID preferred_s
             dropPendingSurfaceLocked(preferred_surface);
         }
 
-        for (VASurfaceID surface : pending_surfaces_) {
+        for (const auto& pending : pending_surfaces_) {
+            VASurfaceID surface = pending.second;
             if (surface != VA_INVALID_ID &&
                 std::find(failed_surfaces.begin(), failed_surfaces.end(), surface) == failed_surfaces.end()) {
                 failed_surfaces.push_back(surface);
@@ -217,27 +401,18 @@ std::vector<VASurfaceID> MppDecoder::failPendingSurfaces(VASurfaceID preferred_s
 
 bool MppDecoder::dropPendingSurfaceLocked(VASurfaceID surface) {
     bool removed = false;
-    auto queue_it = std::find(pending_surfaces_.begin(), pending_surfaces_.end(), surface);
-    if (queue_it != pending_surfaces_.end()) {
-        pending_surfaces_.erase(queue_it);
-        removed = true;
-    }
-
-    for (auto it = pending_surface_pts_.begin(); it != pending_surface_pts_.end();) {
+    for (auto it = pending_surfaces_.begin(); it != pending_surfaces_.end();) {
         if (it->second == surface) {
-            it = pending_surface_pts_.erase(it);
+            pending_surface_pts_.erase(it->first);
+            pending_payloads_.erase(it->first);
+            it = pending_surfaces_.erase(it);
             removed = true;
+            if (pending_count_ > 0) {
+                --pending_count_;
+            }
         } else {
             ++it;
         }
-    }
-
-    if (removed && pending_count_ > 0) {
-        --pending_count_;
-    }
-
-    if (removed && !pending_payloads_.empty()) {
-        pending_payloads_.pop_front();
     }
 
     if (removed) {
@@ -246,10 +421,43 @@ bool MppDecoder::dropPendingSurfaceLocked(VASurfaceID surface) {
     return removed;
 }
 
+bool MppDecoder::dropPendingJobLocked(uint64_t job_id, VASurfaceID* surface) {
+    auto surface_it = pending_surface_pts_.find(job_id);
+    if (surface_it == pending_surface_pts_.end()) {
+        return false;
+    }
+
+    if (surface) {
+        *surface = surface_it->second;
+    }
+    pending_surface_pts_.erase(surface_it);
+    pending_payloads_.erase(job_id);
+
+    for (auto it = pending_surfaces_.begin(); it != pending_surfaces_.end(); ++it) {
+        if (it->first == job_id) {
+            pending_surfaces_.erase(it);
+            if (pending_count_ > 0) {
+                --pending_count_;
+            }
+            pending_cv_.notify_all();
+            return true;
+        }
+    }
+
+    pending_cv_.notify_all();
+    return true;
+}
+
 VASurfaceID MppDecoder::dropOldestPendingSurfaceLocked() {
     if (pending_surfaces_.empty()) return VA_INVALID_ID;
-    const VASurfaceID surface = pending_surfaces_.front();
-    dropPendingSurfaceLocked(surface);
+    const auto [job_id, surface] = pending_surfaces_.front();
+    pending_surfaces_.pop_front();
+    pending_surface_pts_.erase(job_id);
+    pending_payloads_.erase(job_id);
+    if (pending_count_ > 0) {
+        --pending_count_;
+    }
+    pending_cv_.notify_all();
     return surface;
 }
 
@@ -327,7 +535,10 @@ void MppDecoder::releaseSurface(VASurfaceID surface) {
     auto it = surfaces_.find(surface);
     if (it == surfaces_.end()) return;
 
-    it->second.dmabuf.reset();
+    if (!stable_export_enabled_) {
+        it->second.dmabuf.reset();
+    }
+
     it->second.surface.dmabuf_fd = -1;
 
     it->second.in_flight.store(false);
@@ -342,8 +553,7 @@ void MppDecoder::destroySurface(VASurfaceID surface) {
         if (it != surfaces_.end()) {
             it->second.frame.reset();
             it->second.buffer.reset();
-            it->second.dmabuf.reset();
-            it->second.surface.dmabuf_fd = -1;
+            destroyStableExportBuffer(it->second, export_drm_fd_.get());
             it->second.in_flight.store(false);
 
             surfaces_.erase(it);
@@ -414,8 +624,7 @@ void MppDecoder::shutdown() {
         for (auto& kv : surfaces_) {
             kv.second.frame.reset();
             kv.second.buffer.reset();
-            kv.second.dmabuf.reset();
-            kv.second.surface.dmabuf_fd = -1;
+            destroyStableExportBuffer(kv.second, export_drm_fd_.get());
             kv.second.in_flight.store(false);
         }
         surfaces_.clear();
@@ -525,7 +734,7 @@ void MppDecoder::inputThreadMain(std::stop_token st) {
 
         {
             std::lock_guard<std::mutex> lock(pending_mutex_);
-            pending_payloads_.push_back(std::make_shared<std::vector<uint8_t>>(std::move(payload)));
+            pending_payloads_[job.job_id] = std::make_shared<std::vector<uint8_t>>(std::move(payload));
         }
 
         static std::atomic<int> input_log_count{0};
@@ -628,12 +837,21 @@ void MppDecoder::outputThreadMain(std::stop_token st) {
                     auto it = pending_surface_pts_.find(static_cast<uint64_t>(frame_pts));
                     if (it != pending_surface_pts_.end()) {
                         surface_id = it->second;
+                        dropPendingJobLocked(static_cast<uint64_t>(frame_pts));
                     }
                 }
             }
 
-            if (surface_id != VA_INVALID_ID) {
-                dropPendingSurfaceLocked(surface_id);
+            if (surface_id == VA_INVALID_ID) {
+                surface_id = dropOldestPendingSurfaceLocked();
+                static std::atomic<int> fallback_surface_log_count{0};
+                if (surface_id != VA_INVALID_ID &&
+                    fallback_surface_log_count.fetch_add(1, std::memory_order_relaxed) < 8) {
+                    util::log(util::stderr_sink, util::LogLevel::Info,
+                              "mpp: outputThread fallback-mapped frame pts={} to oldest pending surface={}",
+                              static_cast<long long>(mpp_frame_get_pts(frame)),
+                              surface_id);
+                }
             }
         }
 
@@ -652,9 +870,62 @@ void MppDecoder::outputThreadMain(std::stop_token st) {
                 const uint32_t zero_copy_stride = src_stride_pixels ? src_stride_pixels
                                                                     : (it->second.surface.is_10bit ? src_stride_bytes / 2 : src_stride_bytes);
                 const int frame_fd = mpp_buf ? mpp_buffer_get_fd(mpp_buf) : -1;
+                uint32_t published_stride = zero_copy_stride;
                 bool export_ok = false;
 
-                if (mpp_buf && frame_fd >= 0 && output_width > 0 && output_height > 0 && !is_error) {
+                if (stable_export_enabled_ && mpp_buf && output_width > 0 && output_height > 0 && !is_error) {
+                    if (!it->second.export_map) {
+                        if (!export_drm_fd_) {
+                            auto export_fd = openStableExportDrmFd();
+                            if (export_fd) {
+                                export_drm_fd_ = std::move(*export_fd);
+                            }
+
+                            static std::atomic<int> stable_open_log_count{0};
+                            if (stable_open_log_count.fetch_add(1, std::memory_order_relaxed) < 4) {
+                                util::log(util::stderr_sink,
+                                          export_drm_fd_ ? util::LogLevel::Info : util::LogLevel::Warn,
+                                          "mpp: stable-export open drm fd ok={}",
+                                          export_drm_fd_ ? 1 : 0);
+                            }
+                        }
+
+                        const bool created = createStableExportBuffer(it->second,
+                                                                      export_drm_fd_.get(),
+                                                                      output_width,
+                                                                      output_height,
+                                                                      it->second.surface.is_10bit);
+                        static std::atomic<int> stable_alloc_log_count{0};
+                        if (stable_alloc_log_count.fetch_add(1, std::memory_order_relaxed) < 4) {
+                            util::log(util::stderr_sink, created ? util::LogLevel::Info : util::LogLevel::Warn,
+                                      "mpp: stable-export buffer create surface={} out_w={} out_h={} ok={} pitch={} fd={}",
+                                      surface_id, output_width, output_height, created ? 1 : 0,
+                                      it->second.export_pitch, it->second.dmabuf.get());
+                        }
+                    }
+
+                    if (it->second.export_map) {
+                        const uint8_t* frame_ptr = static_cast<const uint8_t*>(mpp_buffer_get_ptr(mpp_buf));
+                        export_ok = copyFrameToStableExport(it->second.export_map,
+                                                            it->second.export_pitch,
+                                                            output_width,
+                                                            output_height,
+                                                            src_stride_bytes,
+                                                            src_ver_stride,
+                                                            frame_ptr);
+                        if (export_ok) {
+                            it->second.surface.dmabuf_fd = it->second.dmabuf.get();
+                            published_stride = it->second.export_pitch;
+                        }
+
+                        static std::atomic<int> stable_copy_log_count{0};
+                        if (export_ok && stable_copy_log_count.fetch_add(1, std::memory_order_relaxed) < 4) {
+                            util::log(util::stderr_sink, util::LogLevel::Info,
+                                      "mpp: stable-export copy surface={} out_w={} out_h={} src_stride_bytes={} src_ver_stride={} export_pitch={}",
+                                      surface_id, output_width, output_height, src_stride_bytes, src_ver_stride, it->second.export_pitch);
+                        }
+                    }
+                } else if (mpp_buf && frame_fd >= 0 && output_width > 0 && output_height > 0 && !is_error) {
                     mpp_buffer_inc_ref(mpp_buf);
                     it->second.buffer.reset(mpp_buf);
                     it->second.dmabuf.reset(frame_fd >= 0 ? dup(frame_fd) : -1);
@@ -687,7 +958,7 @@ void MppDecoder::outputThreadMain(std::stop_token st) {
                 } else {
                     it->second.surface.width = output_width;
                     it->second.surface.height = output_height;
-                    it->second.surface.stride = zero_copy_stride;
+                    it->second.surface.stride = published_stride;
                     it->second.in_flight.store(false);
                     it->second.failed.store(false);
                     it->second.ready.store(true);
@@ -700,14 +971,6 @@ void MppDecoder::outputThreadMain(std::stop_token st) {
         }
 
         last_progress_us_.store(steadyMicrosNow(), std::memory_order_relaxed);
-
-        {
-            std::lock_guard<std::mutex> lock(pending_mutex_);
-            if (!pending_payloads_.empty()) {
-                pending_payloads_.pop_front();
-            }
-        }
-
         if (is_eos_frame) {
             eos_seen_ = true;
         }

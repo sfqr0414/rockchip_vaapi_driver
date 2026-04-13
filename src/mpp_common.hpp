@@ -329,9 +329,8 @@ class MppDecCfgHandle {
     MppDecCfg cfg_ = nullptr;
 };
 
-inline constexpr bool kAv1ExportAsP010 = true;
 inline constexpr uint64_t kDecoderFlushIdleMicros = 2'000'000ULL;
-inline constexpr size_t kMaxInFlightJobs = 16;
+inline constexpr size_t kMaxInFlightJobs = 64;
 
 [[nodiscard]] inline MppCodingType codecProfileToMpp(CodecProfile profile) {
     switch (profile) {

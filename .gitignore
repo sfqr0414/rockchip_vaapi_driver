@@ -8,5 +8,7 @@ output/
 
 .vscode/
 
-tools/firefox_headless_video_test.html
+#tools/firefox_headless_video_test.html
+
+__pycache__
 mesa_ref

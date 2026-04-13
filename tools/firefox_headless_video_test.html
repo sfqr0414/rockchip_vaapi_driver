@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Firefox VA-API Playback Test</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: "Noto Sans", sans-serif;
+      background: #11161c;
+      color: #eef3f8;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      background:
+        radial-gradient(circle at top, rgba(90, 140, 180, 0.28), transparent 40%),
+        linear-gradient(180deg, #11161c, #06080b);
+    }
+
+    main {
+      width: min(960px, calc(100vw - 32px));
+      display: grid;
+      gap: 16px;
+      padding: 24px;
+      border-radius: 18px;
+      background: rgba(10, 14, 18, 0.84);
+      box-shadow: 0 18px 70px rgba(0, 0, 0, 0.4);
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 28px;
+    }
+
+    p {
+      margin: 0;
+      color: #b8c3cf;
+    }
+
+    video {
+      width: 100%;
+      aspect-ratio: 16 / 9;
+      background: #000;
+      border-radius: 14px;
+    }
+
+    .status {
+      display: grid;
+      gap: 8px;
+      padding: 14px;
+      border-radius: 12px;
+      background: rgba(255, 255, 255, 0.04);
+      font: 14px/1.5 "JetBrains Mono", monospace;
+      white-space: pre-wrap;
+    }
+
+    .actions {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+
+    button {
+      border: 0;
+      border-radius: 999px;
+      padding: 10px 16px;
+      background: #7cc7ff;
+      color: #0b141b;
+      font: 600 14px/1 "Noto Sans", sans-serif;
+      cursor: pointer;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Firefox VA-API Playback Test</h1>
+    <p>这页会直接显示是否真的在播、当前播放时间、以及出错信息。</p>
+    <video id="sample" controls muted autoplay playsinline preload="auto"></video>
+    <div class="actions">
+      <button id="play">Play</button>
+      <button id="restart">Restart</button>
+    </div>
+    <div id="status" class="status">initializing...</div>
+  </main>
+  <script>
+    const video = document.getElementById('sample');
+    const status = document.getElementById('status');
+    const playButton = document.getElementById('play');
+    const restartButton = document.getElementById('restart');
+    const params = new URLSearchParams(window.location.search);
+    const requestedVideo = params.get('video');
+    const videoPath = requestedVideo ? `../videos/${requestedVideo}` : '../videos/Test Jellyfin 1080p AVC 20M.mp4';
+    const sourceUrl = new URL(videoPath, window.location.href).href;
+    const recentEvents = [];
+    let lastPostedAt = 0;
+
+    async function postStatus(payload) {
+      try {
+        await fetch('/__status__', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+      } catch {
+      }
+    }
+
+    function renderStatus(extra = '') {
+      const quality = video.getVideoPlaybackQuality ? video.getVideoPlaybackQuality() : null;
+      const decoded = quality ? quality.totalVideoFrames : 'n/a';
+      const dropped = quality ? quality.droppedVideoFrames : 'n/a';
+      const frameDelay = quality && typeof quality.totalFrameDelay === 'number'
+        ? quality.totalFrameDelay.toFixed(3)
+        : 'n/a';
+      const error = video.error ? `${video.error.code}: ${video.error.message || 'media error'}` : 'none';
+      status.textContent = [
+        `src: ${sourceUrl}`,
+        `readyState: ${video.readyState}`,
+        `networkState: ${video.networkState}`,
+        `paused: ${video.paused}`,
+        `ended: ${video.ended}`,
+        `currentTime: ${video.currentTime.toFixed(3)}`,
+        `duration: ${Number.isFinite(video.duration) ? video.duration.toFixed(3) : 'n/a'}`,
+        `resolution: ${video.videoWidth}x${video.videoHeight}`,
+        `decodedVideoFrames: ${decoded}`,
+        `droppedVideoFrames: ${dropped}`,
+        `totalFrameDelay: ${frameDelay}`,
+        `error: ${error}`,
+        extra,
+        `events: ${recentEvents.join(', ')}`
+      ].filter(Boolean).join('\n');
+      document.title = `VAAPI t=${video.currentTime.toFixed(2)} p=${video.paused ? 1 : 0} d=${decoded} drop=${dropped}`;
+
+      const now = Date.now();
+      if (now - lastPostedAt >= 500) {
+        lastPostedAt = now;
+        postStatus({
+          timestamp: now,
+          src: sourceUrl,
+          readyState: video.readyState,
+          networkState: video.networkState,
+          paused: video.paused,
+          ended: video.ended,
+          currentTime: Number(video.currentTime.toFixed(3)),
+          duration: Number.isFinite(video.duration) ? Number(video.duration.toFixed(3)) : null,
+          videoWidth: video.videoWidth,
+          videoHeight: video.videoHeight,
+          decodedVideoFrames: quality ? quality.totalVideoFrames : null,
+          droppedVideoFrames: quality ? quality.droppedVideoFrames : null,
+          totalFrameDelay: quality && typeof quality.totalFrameDelay === 'number'
+            ? Number(quality.totalFrameDelay.toFixed(3))
+            : null,
+          error,
+          events: [...recentEvents]
+        });
+      }
+    }
+
+    function note(eventName) {
+      recentEvents.push(eventName);
+      if (recentEvents.length > 8) {
+        recentEvents.shift();
+      }
+      renderStatus();
+    }
+
+    async function ensurePlayback() {
+      try {
+        await video.play();
+        note('play() ok');
+      } catch (error) {
+        note(`play() failed: ${error && error.message ? error.message : error}`);
+      }
+    }
+
+    video.src = sourceUrl;
+
+    [
+      'loadstart',
+      'loadedmetadata',
+      'loadeddata',
+      'canplay',
+      'canplaythrough',
+      'play',
+      'playing',
+      'pause',
+      'waiting',
+      'stalled',
+      'seeking',
+      'seeked',
+      'ended',
+      'error',
+      'timeupdate'
+    ].forEach((eventName) => {
+      video.addEventListener(eventName, () => {
+        note(eventName);
+        if (eventName === 'ended') {
+          video.currentTime = 0;
+          ensurePlayback();
+        }
+      });
+    });
+
+    playButton.addEventListener('click', ensurePlayback);
+    restartButton.addEventListener('click', async () => {
+      video.currentTime = 0;
+      await ensurePlayback();
+    });
+
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden && video.paused && !video.ended) {
+        ensurePlayback();
+      }
+      renderStatus(`visibility: ${document.visibilityState}`);
+    });
+
+    setInterval(() => renderStatus(), 250);
+    ensurePlayback();
+  </script>
+</body>
+</html>

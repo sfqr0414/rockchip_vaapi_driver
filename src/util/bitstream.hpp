@@ -284,7 +284,26 @@ struct H264SpsSyntax {
     std::uint32_t mb_adaptive_frame_field_flag : 1 = 0; // mb_adaptive_frame_field_flag: MBAFF enable.
     std::uint32_t direct_8x8_inference_flag : 1 = 1; // direct_8x8_inference_flag: direct mode inference size.
     std::uint32_t frame_cropping_flag : 1 = 0; // frame_cropping_flag: cropping metadata presence.
+    std::uint32_t frame_crop_left_offset = 0; // frame_crop_left_offset: left crop units.
+    std::uint32_t frame_crop_right_offset = 0; // frame_crop_right_offset: right crop units.
+    std::uint32_t frame_crop_top_offset = 0; // frame_crop_top_offset: top crop units.
+    std::uint32_t frame_crop_bottom_offset = 0; // frame_crop_bottom_offset: bottom crop units.
     std::uint32_t vui_parameters_present_flag : 1 = 0; // vui_parameters_present_flag: VUI presence.
+    std::uint32_t aspect_ratio_info_present_flag : 1 = 0; // aspect_ratio_info_present_flag: SAR signaling present.
+    std::uint32_t overscan_info_present_flag : 1 = 0; // overscan_info_present_flag: overscan signaling present.
+    std::uint32_t video_signal_type_present_flag : 1 = 0; // video_signal_type_present_flag: video format signaling present.
+    std::uint32_t video_format : 3 = 5; // video_format: unspecified video format.
+    std::uint32_t video_full_range_flag : 1 = 0; // video_full_range_flag: limited range.
+    std::uint32_t colour_description_present_flag : 1 = 0; // colour_description_present_flag: colorimetry present.
+    std::uint32_t colour_primaries : 8 = 1; // colour_primaries: BT.709/sample default.
+    std::uint32_t transfer_characteristics : 8 = 2; // transfer_characteristics: sample default.
+    std::uint32_t matrix_coefficients : 8 = 1; // matrix_coefficients: BT.709/sample default.
+    std::uint32_t chroma_loc_info_present_flag : 1 = 0; // chroma_loc_info_present_flag: chroma location signaling present.
+    std::uint32_t timing_info_present_flag : 1 = 0; // timing_info_present_flag: timing info present.
+    std::uint32_t nal_hrd_parameters_present_flag : 1 = 0; // nal_hrd_parameters_present_flag: NAL HRD present.
+    std::uint32_t vcl_hrd_parameters_present_flag : 1 = 0; // vcl_hrd_parameters_present_flag: VCL HRD present.
+    std::uint32_t pic_struct_present_flag : 1 = 0; // pic_struct_present_flag: pic_struct timing SEI present.
+    std::uint32_t bitstream_restriction_flag : 1 = 0; // bitstream_restriction_flag: bitstream restriction syntax present.
 
     void serialize(Serializer& serializer) const {
         serializer.write(seq(
@@ -319,10 +338,39 @@ struct H264SpsSyntax {
         if (!frame_mbs_only_flag) {
             serializer.write(bits<1>(mb_adaptive_frame_field_flag));
         }
-        serializer.write(seq(
-            bits<1>(direct_8x8_inference_flag),
-            bits<1>(frame_cropping_flag),
-            bits<1>(vui_parameters_present_flag)));
+        serializer.write(bits<1>(direct_8x8_inference_flag));
+        serializer.write(bits<1>(frame_cropping_flag));
+        if (frame_cropping_flag) {
+            serializer.write(seq(
+                ue(frame_crop_left_offset),
+                ue(frame_crop_right_offset),
+                ue(frame_crop_top_offset),
+                ue(frame_crop_bottom_offset)));
+        }
+        serializer.write(bits<1>(vui_parameters_present_flag));
+        if (vui_parameters_present_flag) {
+            serializer.write(bits<1>(aspect_ratio_info_present_flag));
+            serializer.write(bits<1>(overscan_info_present_flag));
+            serializer.write(bits<1>(video_signal_type_present_flag));
+            if (video_signal_type_present_flag) {
+                serializer.write(seq(
+                    bits<3>(video_format),
+                    bits<1>(video_full_range_flag),
+                    bits<1>(colour_description_present_flag)));
+                if (colour_description_present_flag) {
+                    serializer.write(seq(
+                        bits<8>(colour_primaries),
+                        bits<8>(transfer_characteristics),
+                        bits<8>(matrix_coefficients)));
+                }
+            }
+            serializer.write(bits<1>(chroma_loc_info_present_flag));
+            serializer.write(bits<1>(timing_info_present_flag));
+            serializer.write(bits<1>(nal_hrd_parameters_present_flag));
+            serializer.write(bits<1>(vcl_hrd_parameters_present_flag));
+            serializer.write(bits<1>(pic_struct_present_flag));
+            serializer.write(bits<1>(bitstream_restriction_flag));
+        }
     }
 };
 
@@ -1100,8 +1148,27 @@ inline std::vector<std::uint8_t> make_hevc_nal(std::span<const std::byte> rbsp,
     return out;
 }
 
-inline std::vector<std::uint8_t> build_h264_headers(const VAPictureParameterBufferH264& pic) {
+inline std::uint8_t derive_h264_level_idc(std::uint32_t width,
+                                          std::uint32_t height) {
+    const std::uint64_t pixels = static_cast<std::uint64_t>(width) * static_cast<std::uint64_t>(height);
+    if (pixels <= 1280ull * 720ull) {
+        return 31;
+    }
+    if (pixels <= 1920ull * 1088ull) {
+        return 40;
+    }
+    if (pixels <= 3840ull * 2160ull) {
+        return 51;
+    }
+    return 52;
+}
+
+inline std::vector<std::uint8_t> build_h264_headers(const VAPictureParameterBufferH264& pic,
+                                                    std::uint32_t display_width,
+                                                    std::uint32_t display_height) {
     syntax::H264SpsSyntax sps{};
+    sps.level_idc = derive_h264_level_idc((pic.picture_width_in_mbs_minus1 + 1u) * 16u,
+                                          (pic.picture_height_in_mbs_minus1 + 1u) * 16u);
     sps.chroma_format_idc = pic.seq_fields.bits.chroma_format_idc;
     sps.residual_colour_transform_flag = pic.seq_fields.bits.residual_colour_transform_flag;
     sps.bit_depth_luma_minus8 = pic.bit_depth_luma_minus8;
@@ -1117,6 +1184,20 @@ inline std::vector<std::uint8_t> build_h264_headers(const VAPictureParameterBuff
     sps.frame_mbs_only_flag = pic.seq_fields.bits.frame_mbs_only_flag;
     sps.mb_adaptive_frame_field_flag = pic.seq_fields.bits.mb_adaptive_frame_field_flag;
     sps.direct_8x8_inference_flag = pic.seq_fields.bits.direct_8x8_inference_flag;
+
+    const std::uint32_t coded_width = (pic.picture_width_in_mbs_minus1 + 1u) * 16u;
+    const std::uint32_t coded_height = (pic.picture_height_in_mbs_minus1 + 1u) * 16u;
+    if (display_width > 0 && display_height > 0 &&
+        (display_width < coded_width || display_height < coded_height)) {
+        const std::uint32_t crop_unit_x = (pic.seq_fields.bits.chroma_format_idc == 0) ? 1u : 2u;
+        const std::uint32_t crop_unit_y = pic.seq_fields.bits.frame_mbs_only_flag ? 2u : 4u;
+        sps.frame_cropping_flag = 1;
+        sps.frame_crop_right_offset = (coded_width > display_width) ? (coded_width - display_width) / crop_unit_x : 0u;
+        sps.frame_crop_bottom_offset = (coded_height > display_height) ? (coded_height - display_height) / crop_unit_y : 0u;
+    }
+    sps.vui_parameters_present_flag = 1;
+    sps.video_signal_type_present_flag = 1;
+    sps.colour_description_present_flag = 1;
 
     syntax::H264PpsSyntax pps{};
     pps.entropy_coding_mode_flag = pic.pic_fields.bits.entropy_coding_mode_flag;
@@ -1235,6 +1316,12 @@ inline syntax::HevcProfileTierLevelSyntax make_hevc_profile_tier_level(std::uint
 }
 
 inline std::vector<std::uint8_t> build_hevc_headers(const VAPictureParameterBufferHEVC& pic) {
+    // VA-API only exposes the bit length of the final STRPS payload, not the
+    // actual short-term reference picture set syntax. Emitting fabricated RPS
+    // entries here produces an invalid SPS for streams that advertise STRPS.
+    // Keep the synthetic SPS conservative instead of serializing fake data.
+    const bool can_serialize_strps = pic.num_short_term_ref_pic_sets == 0;
+
     const std::uint8_t profile_idc = derive_hevc_profile_idc(pic);
     const std::uint8_t level_idc = derive_hevc_level_idc(pic.pic_width_in_luma_samples,
                                                          pic.pic_height_in_luma_samples);
@@ -1268,9 +1355,9 @@ inline std::vector<std::uint8_t> build_hevc_headers(const VAPictureParameterBuff
     sps.log2_min_pcm_luma_coding_block_size_minus3 = pic.log2_min_pcm_luma_coding_block_size_minus3;
     sps.log2_diff_max_min_pcm_luma_coding_block_size = pic.log2_diff_max_min_pcm_luma_coding_block_size;
     sps.pcm_loop_filter_disabled_flag = pic.pic_fields.bits.pcm_loop_filter_disabled_flag;
-    sps.num_short_term_ref_pic_sets = pic.num_short_term_ref_pic_sets;
-    sps.long_term_ref_pics_present_flag = pic.slice_parsing_fields.bits.long_term_ref_pics_present_flag;
-    sps.num_long_term_ref_pic_sps = pic.num_long_term_ref_pic_sps;
+    sps.num_short_term_ref_pic_sets = can_serialize_strps ? pic.num_short_term_ref_pic_sets : 0;
+    sps.long_term_ref_pics_present_flag = can_serialize_strps ? pic.slice_parsing_fields.bits.long_term_ref_pics_present_flag : 0;
+    sps.num_long_term_ref_pic_sps = can_serialize_strps ? pic.num_long_term_ref_pic_sps : 0;
     sps.sps_temporal_mvp_enabled_flag = pic.slice_parsing_fields.bits.sps_temporal_mvp_enabled_flag;
     sps.strong_intra_smoothing_enabled_flag = pic.pic_fields.bits.strong_intra_smoothing_enabled_flag;
 
