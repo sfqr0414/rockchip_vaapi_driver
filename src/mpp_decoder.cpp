@@ -492,6 +492,19 @@ bool MppDecoder::abandonStalledPendingSurface(VASurfaceID focus_surface, uint32_
         return false;
     }
 
+    uint64_t focus_submit_us = 0;
+    uint64_t focus_complete_us = 0;
+    {
+        std::lock_guard<std::mutex> lock(surface_mutex_);
+        auto it = surfaces_.find(focus_surface);
+        if (it != surfaces_.end()) {
+            focus_submit_us = it->second.last_submit_us.load(std::memory_order_acquire);
+            focus_complete_us = it->second.last_complete_us.load(std::memory_order_acquire);
+        }
+    }
+
+    const uint64_t now_us = steadyMicrosNow();
+    const uint64_t min_idle_us = static_cast<uint64_t>(min_idle_ms) * 1000ULL;
     bool should_abandon = false;
     uint64_t focus_job_id = 0;
 
@@ -501,7 +514,11 @@ bool MppDecoder::abandonStalledPendingSurface(VASurfaceID focus_surface, uint32_
             pending_surfaces_.size() == 1 &&
             pending_surface_pts_.size() == 1) {
             const auto& [job_id, surface_id] = pending_surfaces_.front();
-            if (surface_id == focus_surface) {
+            if (surface_id == focus_surface &&
+                focus_submit_us != 0 &&
+                now_us >= focus_submit_us &&
+                now_us - focus_submit_us >= min_idle_us &&
+                focus_complete_us <= focus_submit_us) {
                 dropPendingSurfaceLocked(focus_surface);
                 should_abandon = true;
                 focus_job_id = job_id;

@@ -475,6 +475,17 @@ struct CodecSessionState {
         ++startup_prime_external_publishes;
     }
 
+    void noteStartupPrimeAdoption(VAProfile profile) {
+        if (!isH264Profile(profile)) {
+            return;
+        }
+        const unsigned int max_tail = startupPrimeTailPicturesForProfile(profile);
+        if (max_tail == 0) {
+            return;
+        }
+        startup_prime_tail_pictures_remaining = std::min(max_tail, startup_prime_tail_pictures_remaining + 1);
+    }
+
     void noteSequenceHeaders(std::span<const uint8_t> extra_data) {
         if (!extra_data.empty()) {
             sequence_headers_sent = true;
@@ -1050,6 +1061,7 @@ struct SurfaceSyncResult {
 };
 
 constexpr uint32_t kSyncProbeMs = 1000;
+constexpr uint32_t kH264SyncProbeMs = 50;
 constexpr uint32_t kSyncTotalTimeoutMs = 60000;
 constexpr uint32_t kTailDrainTriggerMs = 3000;
 constexpr uint32_t kTailDrainIdleMs = 2000;
@@ -1176,6 +1188,7 @@ static bool tryAdoptStartupPrimeSurface(DriverState& driver,
 static SurfaceSyncResult waitForSurfaceSync(DriverState& driver, VASurfaceID surface) {
     const bool panic_recovery_enabled = envEnabledLocal("ROCKCHIP_VAAPI_PANIC_SYNC_RECOVERY");
     SurfaceSyncResult result;
+    const uint32_t sync_probe_ms = isH264Profile(driver.profile) ? kH264SyncProbeMs : kSyncProbeMs;
     uint32_t tail_drain_trigger_ms = kTailDrainTriggerMs;
     uint32_t tail_drain_abandon_ms = kTailDrainAbandonMs;
     if (h264NonRefFastDrainEnabled()) {
@@ -1187,8 +1200,9 @@ static SurfaceSyncResult waitForSurfaceSync(DriverState& driver, VASurfaceID sur
         }
     }
 
-    for (uint32_t waited_ms = 0; waited_ms < kSyncTotalTimeoutMs; waited_ms += kSyncProbeMs) {
-        result.ready = driver.decoder->waitSurfaceReady(surface, kSyncProbeMs);
+    const uint32_t sync_log_interval_ms = std::max<uint32_t>(kSyncProbeMs, sync_probe_ms);
+    for (uint32_t waited_ms = 0; waited_ms < kSyncTotalTimeoutMs; waited_ms += sync_probe_ms) {
+        result.ready = driver.decoder->waitSurfaceReady(surface, sync_probe_ms);
         if (result.ready) {
             break;
         }
@@ -1203,12 +1217,15 @@ static SurfaceSyncResult waitForSurfaceSync(DriverState& driver, VASurfaceID sur
             break;
         }
 
-        logSurfaceSyncProbe(surface, waited_ms + kSyncProbeMs, snapshot);
+        if (((waited_ms + sync_probe_ms) % sync_log_interval_ms) == 0) {
+            logSurfaceSyncProbe(surface, waited_ms + sync_probe_ms, snapshot);
+        }
 
         if (snapshot.dmabuf_fd < 0) {
             SurfaceSyncSnapshot adopted_snapshot;
             if (tryAdoptStartupPrimeSurface(driver, surface, adopted_snapshot)) {
-                driver.decoder->abandonStalledPendingSurface(surface, waited_ms + kSyncProbeMs);
+                driver.session.noteStartupPrimeAdoption(driver.profile);
+                driver.decoder->abandonStalledPendingSurface(surface, waited_ms + sync_probe_ms);
                 result.adopted = true;
                 result.adopted_snapshot = std::move(adopted_snapshot);
                 result.snapshot = std::move(snapshot);
@@ -1217,10 +1234,10 @@ static SurfaceSyncResult waitForSurfaceSync(DriverState& driver, VASurfaceID sur
             }
         }
 
-        if (waited_ms + kSyncProbeMs >= tail_drain_trigger_ms) {
+        if (waited_ms + sync_probe_ms >= tail_drain_trigger_ms) {
             driver.decoder->requestTailDrainEos(surface, kTailDrainIdleMs);
         }
-        if (waited_ms + kSyncProbeMs >= tail_drain_abandon_ms &&
+        if (waited_ms + sync_probe_ms >= tail_drain_abandon_ms &&
             driver.decoder->abandonTailPendingSurface(surface, kTailDrainAbandonMs)) {
             break;
         }
@@ -1229,7 +1246,7 @@ static SurfaceSyncResult waitForSurfaceSync(DriverState& driver, VASurfaceID sur
             util::log(util::stderr_sink, util::LogLevel::Warn,
                       "vaSyncSurface: panic recovery forcing ready surface={} after {} ms",
                       surface,
-                      waited_ms + kSyncProbeMs);
+                      waited_ms + sync_probe_ms);
             driver.decoder->forceSurfaceReady(surface);
             result.ready = true;
             break;
@@ -2483,6 +2500,8 @@ static VAStatus vaEndPicture(VADriverContextP ctx,
         if (prime_job.target_surface == VA_INVALID_ID) {
             prime_job.target_surface = VA_INVALID_ID;
             prime_job.discard_output = true;
+        } else {
+            d->decoder->resetSurface(prime_job.target_surface);
         }
         static std::atomic<int> prime_target_log_count{0};
         if (prime_target_log_count.fetch_add(1, std::memory_order_relaxed) < 12) {
@@ -2515,6 +2534,8 @@ static VAStatus vaEndPicture(VADriverContextP ctx,
         prime_job.target_surface = session.nextStartupPrimeSurface();
         if (prime_job.target_surface == VA_INVALID_ID) {
             prime_job.discard_output = true;
+        } else {
+            d->decoder->resetSurface(prime_job.target_surface);
         }
         static std::atomic<int> idr_prime_log_count{0};
         if (idr_prime_log_count.fetch_add(1, std::memory_order_relaxed) < 24) {
