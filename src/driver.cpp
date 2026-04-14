@@ -1208,6 +1208,7 @@ static SurfaceSyncResult waitForSurfaceSync(DriverState& driver, VASurfaceID sur
         if (snapshot.dmabuf_fd < 0) {
             SurfaceSyncSnapshot adopted_snapshot;
             if (tryAdoptStartupPrimeSurface(driver, surface, adopted_snapshot)) {
+                driver.decoder->abandonStalledPendingSurface(surface, waited_ms + kSyncProbeMs);
                 result.adopted = true;
                 result.adopted_snapshot = std::move(adopted_snapshot);
                 result.snapshot = std::move(snapshot);

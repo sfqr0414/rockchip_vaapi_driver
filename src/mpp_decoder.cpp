@@ -487,6 +487,43 @@ bool MppDecoder::requestTailDrainEos(VASurfaceID focus_surface, uint32_t min_idl
     return true;
 }
 
+bool MppDecoder::abandonStalledPendingSurface(VASurfaceID focus_surface, uint32_t min_idle_ms) {
+    if (focus_surface == VA_INVALID_ID) {
+        return false;
+    }
+
+    bool should_abandon = false;
+    uint64_t focus_job_id = 0;
+
+    {
+        std::lock_guard<std::mutex> lock(pending_mutex_);
+        if (pending_count_ == 1 &&
+            pending_surfaces_.size() == 1 &&
+            pending_surface_pts_.size() == 1) {
+            const auto& [job_id, surface_id] = pending_surfaces_.front();
+            if (surface_id == focus_surface) {
+                dropPendingSurfaceLocked(focus_surface);
+                should_abandon = true;
+                focus_job_id = job_id;
+            }
+        }
+    }
+
+    if (!should_abandon) {
+        return false;
+    }
+
+    tail_drain_eos_requested_.store(false, std::memory_order_relaxed);
+    setSurfaceState(focus_surface, false, false);
+    util::log(util::stderr_sink, util::LogLevel::Warn,
+              "mpp: abandoning adopted pending surface={} latest_job={} idle_ms={} {}",
+              focus_surface,
+              static_cast<unsigned long long>(focus_job_id),
+              static_cast<unsigned long long>(min_idle_ms),
+              getPendingQueueSummary(focus_surface));
+    return true;
+}
+
 bool MppDecoder::abandonTailPendingSurface(VASurfaceID focus_surface, uint32_t min_idle_ms) {
     if (focus_surface == VA_INVALID_ID) {
         return false;

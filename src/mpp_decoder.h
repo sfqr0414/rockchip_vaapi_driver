@@ -78,6 +78,7 @@ class MppDecoder {
     bool getSurfaceDebugInfo(VASurfaceID id, uint64_t& last_submitted_job_id, uint64_t& last_completed_job_id, uint64_t& last_submit_us, uint64_t& last_complete_us);
     std::string getPendingQueueSummary(VASurfaceID focus_surface = VA_INVALID_ID);
     bool requestTailDrainEos(VASurfaceID focus_surface, uint32_t min_idle_ms);
+    bool abandonStalledPendingSurface(VASurfaceID focus_surface, uint32_t min_idle_ms);
     bool abandonTailPendingSurface(VASurfaceID focus_surface, uint32_t min_idle_ms);
     void forceSurfaceReady(VASurfaceID surface);
     void resetSurface(VASurfaceID surface);
