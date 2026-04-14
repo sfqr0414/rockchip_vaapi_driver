@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Rockchip Firefox HW Decode
+Comment=Launch Firefox with the Rockchip VA-API profile and driver overrides
+Exec=/bin/bash -lc 'cd /home/pi/Repo/rockchip_vaapi_driver && ./tools/open_firefox_hwdecode.sh'
+Terminal=false
+Categories=AudioVideo;Video;
