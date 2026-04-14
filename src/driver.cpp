@@ -71,6 +71,10 @@ bool startupPrimingDisabled() {
     return envEnabledLocal("ROCKCHIP_VAAPI_DISABLE_STARTUP_PRIMING");
 }
 
+bool h264NonRefFastDrainEnabled() {
+    return envEnabledLocal("ROCKCHIP_VAAPI_H264_NONREF_FAST_DRAIN");
+}
+
 unsigned int envUnsignedClamped(const char* name,
                                 unsigned int fallback,
                                 unsigned int max_value) {
@@ -141,6 +145,46 @@ std::string describeH264Picture(const VAPictureH264& picture) {
            << "/flags=0x" << std::hex << picture.flags << std::dec
            << "/top=" << picture.TopFieldOrderCnt
            << "/bottom=" << picture.BottomFieldOrderCnt;
+    return stream.str();
+}
+
+struct H264PictureTraits {
+    bool valid = false;
+    bool idr = false;
+    bool reference_hint = false;
+    bool b_slice = false;
+    uint8_t slice_type = 0xff;
+};
+
+H264PictureTraits classifyH264Picture(const VAPictureParameterBufferH264& picture,
+                                      std::span<const uint8_t> slice_param_data,
+                                      uint32_t slice_param_count,
+                                      std::span<const uint8_t> frame_buffer) {
+    H264PictureTraits traits;
+    traits.idr = h264AccessUnitStartsWithIdr(frame_buffer);
+    traits.reference_hint = traits.idr;
+    if (slice_param_count == 0 || slice_param_data.size() < sizeof(VASliceParameterBufferH264)) {
+        return traits;
+    }
+
+    const auto* slices = reinterpret_cast<const VASliceParameterBufferH264*>(slice_param_data.data());
+    traits.slice_type = static_cast<uint8_t>(slices[0].slice_type);
+    traits.b_slice = (traits.slice_type % 5u) == 1u;
+    traits.reference_hint = traits.idr || !traits.b_slice;
+    traits.valid = true;
+    return traits;
+}
+
+std::string describeH264PictureTraits(const H264PictureTraits& traits) {
+    std::ostringstream stream;
+    stream << "idr=" << (traits.idr ? 1 : 0)
+           << " ref_hint=" << (traits.reference_hint ? 1 : 0)
+           << " b_slice=" << (traits.b_slice ? 1 : 0);
+    if (traits.valid) {
+        stream << " slice_type=" << static_cast<unsigned>(traits.slice_type);
+    } else {
+        stream << " slice_type=unknown";
+    }
     return stream.str();
 }
 
@@ -283,6 +327,9 @@ struct SurfaceState {
     MppDecoder::DecodedSurface surface;
     unique_fd dmabuf;
     uint64_t published_job_id = 0;
+    bool h264_nonreference_hint = false;
+    bool h264_b_slice_hint = false;
+    bool h264_reference_hint = false;
 
     void set_dmabuf(unique_fd fd) {
         dmabuf = std::move(fd);
@@ -369,8 +416,10 @@ struct PendingAv1Frame {
 struct CodecSessionState {
     bool sequence_headers_sent = false;
     unsigned int startup_prime_pictures_remaining = 0;
+    unsigned int startup_prime_tail_pictures_remaining = 0;
     std::vector<VASurfaceID> startup_prime_surfaces;
     size_t next_prime_surface_index = 0;
+    unsigned int startup_prime_external_publishes = 0;
     bool av1_sequence_enable_restoration = false;
     std::array<VASurfaceID, 8> av1_ref_frame_map{};
     bool av1_ref_frame_map_valid = false;
@@ -379,8 +428,10 @@ struct CodecSessionState {
     void beginContext(VAProfile profile) {
         sequence_headers_sent = false;
         startup_prime_pictures_remaining = startupPrimePicturesForProfile(profile);
+        startup_prime_tail_pictures_remaining = startupPrimeTailPicturesForProfile(profile);
         startup_prime_surfaces.clear();
         next_prime_surface_index = 0;
+        startup_prime_external_publishes = 0;
         av1_sequence_enable_restoration = false;
         av1_ref_frame_map.fill(VA_INVALID_SURFACE);
         av1_ref_frame_map_valid = false;
@@ -390,14 +441,37 @@ struct CodecSessionState {
     void endContext() {
         beginContext(VAProfileNone);
         startup_prime_pictures_remaining = 0;
+        startup_prime_tail_pictures_remaining = 0;
     }
 
     unsigned int consumeStartupPrimeCopies(VAProfile profile) {
-        if (!shouldPrimeStartup(profile) || startup_prime_pictures_remaining == 0) {
+        if (!shouldPrimeStartup(profile)) {
             return 0;
         }
-        --startup_prime_pictures_remaining;
-        return startupPrimeCopiesPerPicture(profile);
+
+        if (startup_prime_pictures_remaining > 0) {
+            --startup_prime_pictures_remaining;
+            unsigned int copies = startupPrimeCopiesPerPicture(profile);
+            if (isH264Profile(profile) &&
+                startup_prime_external_publishes >= startupPrimeCopyTaperThresholdForProfile(profile)) {
+                copies = std::min(copies, startupPrimeReducedCopiesPerPicture(profile));
+            }
+            return copies;
+        }
+
+        if (isH264Profile(profile) && startup_prime_tail_pictures_remaining > 0) {
+            --startup_prime_tail_pictures_remaining;
+            return 1;
+        }
+
+        return 0;
+    }
+
+    void noteExternalSurfacePublished(VAProfile profile) {
+        if (!shouldPrimeStartup(profile)) {
+            return;
+        }
+        ++startup_prime_external_publishes;
     }
 
     void noteSequenceHeaders(std::span<const uint8_t> extra_data) {
@@ -450,11 +524,32 @@ struct CodecSessionState {
         return 0;
     }
 
+    static unsigned int startupPrimeTailPicturesForProfile(VAProfile profile) {
+        if (isH264Profile(profile)) {
+            return envUnsignedClamped("ROCKCHIP_VAAPI_H264_TAIL_PRIME_PICTURES", 2, 8);
+        }
+        return 0;
+    }
+
     static bool shouldPrimeStartup(VAProfile profile) {
         if (startupPrimingDisabled()) {
             return false;
         }
         return isH264Profile(profile) || profile == VAProfileHEVCMain || profile == VAProfileHEVCMain10;
+    }
+
+    static unsigned int startupPrimeCopyTaperThresholdForProfile(VAProfile profile) {
+        if (isH264Profile(profile)) {
+            return 2;
+        }
+        return std::numeric_limits<unsigned int>::max();
+    }
+
+    static unsigned int startupPrimeReducedCopiesPerPicture(VAProfile profile) {
+        if (isH264Profile(profile)) {
+            return 1;
+        }
+        return startupPrimeCopiesPerPicture(profile);
     }
 };
 
@@ -1080,6 +1175,16 @@ static bool tryAdoptStartupPrimeSurface(DriverState& driver,
 static SurfaceSyncResult waitForSurfaceSync(DriverState& driver, VASurfaceID surface) {
     const bool panic_recovery_enabled = envEnabledLocal("ROCKCHIP_VAAPI_PANIC_SYNC_RECOVERY");
     SurfaceSyncResult result;
+    uint32_t tail_drain_trigger_ms = kTailDrainTriggerMs;
+    uint32_t tail_drain_abandon_ms = kTailDrainAbandonMs;
+    if (h264NonRefFastDrainEnabled()) {
+        std::lock_guard<std::mutex> lock(driver.lock);
+        const auto it = driver.surfaces.find(surface);
+        if (it != driver.surfaces.end() && it->second->h264_nonreference_hint) {
+            tail_drain_trigger_ms = std::min<uint32_t>(tail_drain_trigger_ms, 1000);
+            tail_drain_abandon_ms = std::min<uint32_t>(tail_drain_abandon_ms, 3000);
+        }
+    }
 
     for (uint32_t waited_ms = 0; waited_ms < kSyncTotalTimeoutMs; waited_ms += kSyncProbeMs) {
         result.ready = driver.decoder->waitSurfaceReady(surface, kSyncProbeMs);
@@ -1110,10 +1215,10 @@ static SurfaceSyncResult waitForSurfaceSync(DriverState& driver, VASurfaceID sur
             }
         }
 
-        if (waited_ms + kSyncProbeMs >= kTailDrainTriggerMs) {
+        if (waited_ms + kSyncProbeMs >= tail_drain_trigger_ms) {
             driver.decoder->requestTailDrainEos(surface, kTailDrainIdleMs);
         }
-        if (waited_ms + kSyncProbeMs >= kTailDrainAbandonMs &&
+        if (waited_ms + kSyncProbeMs >= tail_drain_abandon_ms &&
             driver.decoder->abandonTailPendingSurface(surface, kTailDrainAbandonMs)) {
             break;
         }
@@ -1129,7 +1234,7 @@ static SurfaceSyncResult waitForSurfaceSync(DriverState& driver, VASurfaceID sur
         }
     }
 
-    result.has_snapshot = captureSurfaceSyncSnapshot(driver, surface, result.snapshot, !result.ready) || result.has_snapshot;
+    result.has_snapshot = captureSurfaceSyncSnapshot(driver, surface, result.snapshot, true) || result.has_snapshot;
     if (!result.ready && result.has_snapshot && !result.snapshot.failed && result.snapshot.pending) {
         result.timed_out = true;
         logSurfaceSyncTimeout(surface, result.snapshot);
@@ -1139,7 +1244,8 @@ static SurfaceSyncResult waitForSurfaceSync(DriverState& driver, VASurfaceID sur
 
 static VAStatus publishSyncedSurface(DriverState& driver,
                                      VASurfaceID surface,
-                                     const SurfaceSyncSnapshot& snapshot) {
+                                     const SurfaceSyncSnapshot& snapshot,
+                                     bool adopted = false) {
     static std::atomic<int> sync_wait_log_count{0};
     if (sync_wait_log_count.fetch_add(1, std::memory_order_relaxed) < 3) {
         util::log(util::stderr_sink, util::LogLevel::Info,
@@ -1163,6 +1269,17 @@ static VAStatus publishSyncedSurface(DriverState& driver,
     it->second->surface.vertical_stride = snapshot.vertical_stride;
     it->second->set_dmabuf(std::move(driver_fd));
     it->second->published_job_id = snapshot.last_completed_job_id;
+    if (!adopted && !isInternalSurfaceId(surface)) {
+        driver.session.noteExternalSurfacePublished(driver.profile);
+        static std::atomic<int> prime_taper_log_count{0};
+        if (prime_taper_log_count.fetch_add(1, std::memory_order_relaxed) < 12) {
+            util::log(util::stderr_sink, util::LogLevel::Info,
+                      "vaSyncSurface: external publish surface={} job={} startup_prime_external_publishes={}",
+                      surface,
+                      static_cast<unsigned long long>(snapshot.last_completed_job_id),
+                      driver.session.startup_prime_external_publishes);
+        }
+    }
 
     static std::atomic<int> sync_ready_log_count{0};
     if (sync_ready_log_count.fetch_add(1, std::memory_order_relaxed) < 1) {
@@ -1355,7 +1472,7 @@ static VAStatus vaSyncSurface(VADriverContextP ctx, VASurfaceID surface) {
         return VA_STATUS_ERROR_DECODING_ERROR;
     }
     if (sync.adopted) {
-        return publishSyncedSurface(*d, surface, sync.adopted_snapshot);
+        return publishSyncedSurface(*d, surface, sync.adopted_snapshot, true);
     }
     if (sync.timed_out) {
         return VA_STATUS_ERROR_TIMEDOUT;
@@ -1363,7 +1480,7 @@ static VAStatus vaSyncSurface(VADriverContextP ctx, VASurfaceID surface) {
     if (!sync.ready && !sync.snapshot.failed && !sync.snapshot.pending) {
         SurfaceSyncSnapshot adopted_snapshot;
         if (sync.snapshot.dmabuf_fd < 0 && tryAdoptStartupPrimeSurface(*d, surface, adopted_snapshot)) {
-            return publishSyncedSurface(*d, surface, adopted_snapshot);
+            return publishSyncedSurface(*d, surface, adopted_snapshot, true);
         }
         util::log(util::stderr_sink, util::LogLevel::Info,
                   "vaSyncSurface: surface={} has no decoded output yet; treating idle sync as success",
@@ -1379,7 +1496,7 @@ static VAStatus vaSyncSurface(VADriverContextP ctx, VASurfaceID surface) {
         return sync.snapshot.failed ? VA_STATUS_ERROR_DECODING_ERROR : VA_STATUS_ERROR_INVALID_SURFACE;
     }
 
-    return publishSyncedSurface(*d, surface, sync.snapshot);
+    return publishSyncedSurface(*d, surface, sync.snapshot, false);
 }
 
 static VAStatus vaQueryConfigProfiles(VADriverContextP ctx,
@@ -2048,6 +2165,7 @@ static VAStatus vaEndPicture(VADriverContextP ctx,
     if (picture.frame_buffer.empty()) return VA_STATUS_ERROR_INVALID_BUFFER;
 
     picture.frame_extra_data.clear();
+    H264PictureTraits h264_traits;
     if (picture.decode_state.picture_param_buffer_id) {
         auto it = d->buffers.find(*picture.decode_state.picture_param_buffer_id);
         if (it != d->buffers.end()) {
@@ -2092,6 +2210,11 @@ static VAStatus vaEndPicture(VADriverContextP ctx,
                 case VAProfileH264Baseline:
                 case VAProfileH264Main:
                 case VAProfileH264High:
+                    h264_traits = classifyH264Picture(
+                        *reinterpret_cast<const VAPictureParameterBufferH264*>(picture_param_buffer.data.data()),
+                        current_slice_param_buffer ? current_slice_param_buffer->map() : std::span<const uint8_t>{},
+                        current_slice_param_buffer ? current_slice_param_buffer->num_elements : 0,
+                        picture.frame_buffer);
                     if (!session.sequence_headers_sent || h264AccessUnitStartsWithIdr(picture.frame_buffer)) {
                         picture.frame_extra_data = bitstream::build_h264_headers(
                             *reinterpret_cast<const VAPictureParameterBufferH264*>(picture_param_buffer.data.data()),
@@ -2111,6 +2234,7 @@ static VAStatus vaEndPicture(VADriverContextP ctx,
                                       h264.seq_fields.value,
                                       h264.pic_fields.value,
                                       summarizeH264ReferenceFrames(h264),
+                                      describeH264PictureTraits(h264_traits),
                                       summarizeH264SliceParams(current_slice_param_buffer->map(), current_slice_param_buffer->num_elements),
                                       current_iq_matrix_buffer ? summarizeH264IqMatrix(current_iq_matrix_buffer->map()) : std::string{"iq=absent"},
                                       summarizeBufferSizes(picture.decode_state.slice_param_buffer_ids, d->buffers),
@@ -2302,6 +2426,15 @@ static VAStatus vaEndPicture(VADriverContextP ctx,
     // should not be forced to flush per VA picture.
     job.eos = false;
     const bool h264_idr = isH264Profile(d->profile) && h264AccessUnitStartsWithIdr(job.bitstream);
+    if (isH264Profile(d->profile)) {
+        std::lock_guard<std::mutex> lock(d->lock);
+        auto surface_it = d->surfaces.find(picture.current_surface);
+        if (surface_it != d->surfaces.end()) {
+            surface_it->second->h264_b_slice_hint = h264_traits.b_slice;
+            surface_it->second->h264_reference_hint = h264_traits.reference_hint;
+            surface_it->second->h264_nonreference_hint = h264_traits.valid && !h264_traits.reference_hint;
+        }
+    }
 
     // Submit the actual render target first so Firefox can observe a real
     // output surface before startup priming copies occupy the queue.
