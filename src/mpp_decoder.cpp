@@ -398,7 +398,7 @@ std::string MppDecoder::getPendingQueueSummary(VASurfaceID focus_surface) {
     stream << "pending_count=" << pending_count_
            << " pending_surfaces=" << pending_surfaces_.size()
            << " tracked_pts=" << pending_surface_pts_.size()
-           << " discard_jobs=" << discard_output_job_ids_.size()
+            << " discard_jobs=" << discard_output_jobs_.size()
            << " payloads=" << pending_payloads_.size();
 
     if (!pending_surfaces_.empty()) {
@@ -519,7 +519,10 @@ bool MppDecoder::abandonStalledPendingSurface(VASurfaceID focus_surface, uint32_
                 now_us >= focus_submit_us &&
                 now_us - focus_submit_us >= min_idle_us &&
                 focus_complete_us <= focus_submit_us) {
-                dropPendingSurfaceLocked(focus_surface);
+                dropPendingSurfaceLocked(focus_surface,
+                                         DiscardOutputReason::AdoptedStaleTarget,
+                                         focus_surface,
+                                         job_id);
                 should_abandon = true;
                 focus_job_id = job_id;
             }
@@ -563,7 +566,10 @@ bool MppDecoder::abandonTailPendingSurface(VASurfaceID focus_surface, uint32_t m
                 last_progress_us != 0 &&
                 now_us >= last_progress_us &&
                 now_us - last_progress_us >= min_idle_us) {
-                dropPendingSurfaceLocked(focus_surface);
+                dropPendingSurfaceLocked(focus_surface,
+                                         DiscardOutputReason::TailDrainAbandon,
+                                         focus_surface,
+                                         job_id);
                 should_abandon = true;
                 focus_job_id = job_id;
             }
@@ -630,7 +636,10 @@ bool MppDecoder::enqueueJob(DecodeJob job) {
             lock.lock();
         }
         static std::atomic<int> dedupe_log_count{0};
-        if (dropPendingSurfaceLocked(job.target_surface) &&
+        if (dropPendingSurfaceLocked(job.target_surface,
+                                     DiscardOutputReason::ReplacedPendingSurface,
+                                     job.target_surface,
+                                     job.job_id) &&
             dedupe_log_count.fetch_add(1, std::memory_order_relaxed) < 8) {
             util::log(util::stderr_sink, util::LogLevel::Info,
                       "mpp: enqueueJob replaced older pending work for surface={} with job_id={}",
@@ -643,7 +652,11 @@ bool MppDecoder::enqueueJob(DecodeJob job) {
         pending_cv_.notify_all();
     } else if (job.discard_output) {
         std::lock_guard<std::mutex> lock(pending_mutex_);
-        discard_output_job_ids_.insert(job.job_id);
+        markDiscardOutputJobLocked(job.job_id,
+                                   DiscardOutputReason::ExplicitDiscardOutput,
+                                   job.target_surface,
+                                   job.target_surface,
+                                   job.job_id);
     }
 
     static std::atomic<int> enqueue_log_count{0};
@@ -675,7 +688,9 @@ std::vector<VASurfaceID> MppDecoder::failPendingSurfaces(VASurfaceID preferred_s
         std::lock_guard<std::mutex> lock(pending_mutex_);
         if (preferred_surface != VA_INVALID_ID) {
             failed_surfaces.push_back(preferred_surface);
-            dropPendingSurfaceLocked(preferred_surface);
+            dropPendingSurfaceLocked(preferred_surface,
+                                     DiscardOutputReason::FailPending,
+                                     preferred_surface);
         }
 
         for (const auto& pending : pending_surfaces_) {
@@ -687,7 +702,7 @@ std::vector<VASurfaceID> MppDecoder::failPendingSurfaces(VASurfaceID preferred_s
         }
 
         pending_surfaces_.clear();
-        discard_output_job_ids_.clear();
+        discard_output_jobs_.clear();
         pending_surface_pts_.clear();
         pending_payloads_.clear();
         pending_count_ = 0;
@@ -700,11 +715,62 @@ std::vector<VASurfaceID> MppDecoder::failPendingSurfaces(VASurfaceID preferred_s
     return failed_surfaces;
 }
 
-bool MppDecoder::dropPendingSurfaceLocked(VASurfaceID surface) {
+const char* MppDecoder::discardOutputReasonName(DiscardOutputReason reason) {
+    switch (reason) {
+        case DiscardOutputReason::ExplicitDiscardOutput:
+            return "explicit_discard_output";
+        case DiscardOutputReason::ReplacedPendingSurface:
+            return "replaced_pending_surface";
+        case DiscardOutputReason::AdoptedStaleTarget:
+            return "adopted_stale_target";
+        case DiscardOutputReason::TailDrainAbandon:
+            return "tail_drain_abandon";
+        case DiscardOutputReason::SurfaceDestroy:
+            return "surface_destroy";
+        case DiscardOutputReason::FailPending:
+            return "fail_pending";
+        case DiscardOutputReason::Unknown:
+        default:
+            return "unknown";
+    }
+}
+
+void MppDecoder::markDiscardOutputJobLocked(uint64_t job_id,
+                                            DiscardOutputReason reason,
+                                            VASurfaceID surface,
+                                            VASurfaceID trigger_surface,
+                                            uint64_t trigger_job_id) {
+    DiscardedJobInfo info;
+    info.reason = reason;
+    info.surface = surface;
+    info.trigger_surface = trigger_surface;
+    info.trigger_job_id = trigger_job_id;
+    info.recorded_at_us = steadyMicrosNow();
+    discard_output_jobs_[job_id] = info;
+}
+
+bool MppDecoder::takeDiscardOutputJobLocked(uint64_t job_id, DiscardedJobInfo& info) {
+    const auto it = discard_output_jobs_.find(job_id);
+    if (it == discard_output_jobs_.end()) {
+        return false;
+    }
+    info = it->second;
+    discard_output_jobs_.erase(it);
+    return true;
+}
+
+bool MppDecoder::dropPendingSurfaceLocked(VASurfaceID surface,
+                                          DiscardOutputReason reason,
+                                          VASurfaceID trigger_surface,
+                                          uint64_t trigger_job_id) {
     bool removed = false;
     for (auto it = pending_surfaces_.begin(); it != pending_surfaces_.end();) {
         if (it->second == surface) {
-            discard_output_job_ids_.insert(it->first);
+            markDiscardOutputJobLocked(it->first,
+                                       reason,
+                                       it->second,
+                                       trigger_surface,
+                                       trigger_job_id == 0 ? it->first : trigger_job_id);
             pending_surface_pts_.erase(it->first);
             pending_payloads_.erase(it->first);
             it = pending_surfaces_.erase(it);
@@ -726,7 +792,8 @@ bool MppDecoder::dropPendingSurfaceLocked(VASurfaceID surface) {
 bool MppDecoder::dropPendingJobLocked(uint64_t job_id, VASurfaceID* surface) {
     auto surface_it = pending_surface_pts_.find(job_id);
     if (surface_it == pending_surface_pts_.end()) {
-        discard_output_job_ids_.erase(job_id);
+        DiscardedJobInfo discarded_info;
+        takeDiscardOutputJobLocked(job_id, discarded_info);
         return false;
     }
 
@@ -909,7 +976,9 @@ void MppDecoder::destroySurface(VASurfaceID surface) {
 
     {
         std::lock_guard<std::mutex> lock(pending_mutex_);
-        dropPendingSurfaceLocked(surface);
+        dropPendingSurfaceLocked(surface,
+                                 DiscardOutputReason::SurfaceDestroy,
+                                 surface);
     }
 }
 
@@ -1272,14 +1341,49 @@ void MppDecoder::outputThreadMain(std::stop_token st) {
             if (surface_id == VA_INVALID_ID) {
                 if (frame_pts > 0) {
                     const uint64_t frame_job_id = static_cast<uint64_t>(frame_pts);
-                    if (discard_output_job_ids_.erase(frame_job_id) > 0) {
+                    DiscardedJobInfo discarded_info;
+                    if (takeDiscardOutputJobLocked(frame_job_id, discarded_info)) {
                         pending_payloads_.erase(frame_job_id);
+                        const uint64_t now_us = steadyMicrosNow();
+                        const uint64_t age_ms = discarded_info.recorded_at_us == 0 || now_us < discarded_info.recorded_at_us
+                                                   ? 0
+                                                   : (now_us - discarded_info.recorded_at_us) / 1000ULL;
+                        std::ostringstream discard_summary;
+                        discard_summary << "pending_count=" << pending_count_
+                                        << " pending_surfaces=" << pending_surfaces_.size()
+                                        << " tracked_pts=" << pending_surface_pts_.size()
+                                        << " discard_jobs=" << discard_output_jobs_.size()
+                                        << " payloads=" << pending_payloads_.size();
+                        if (!pending_surfaces_.empty()) {
+                            discard_summary << " queue=[";
+                            size_t index = 0;
+                            for (const auto& pending : pending_surfaces_) {
+                                if (index > 0) {
+                                    discard_summary << ",";
+                                }
+                                discard_summary << pending.first << ":" << pending.second;
+                                ++index;
+                                if (index >= 8) {
+                                    if (pending_surfaces_.size() > index) {
+                                        discard_summary << ",...";
+                                    }
+                                    break;
+                                }
+                            }
+                            discard_summary << "]";
+                        }
                         static std::atomic<int> discard_log_count{0};
                         if (discard_log_count.fetch_add(1, std::memory_order_relaxed) < 8) {
                             util::log(util::stderr_sink, util::LogLevel::Info,
-                                      "mpp: outputThread discarded priming frame job_id={} pts={}",
+                                      "mpp: outputThread discarded frame job_id={} pts={} reason={} surface={} trigger_surface={} trigger_job={} age_ms={} {}",
                                       static_cast<unsigned long long>(frame_job_id),
-                                      static_cast<long long>(frame_pts));
+                                      static_cast<long long>(frame_pts),
+                                      discardOutputReasonName(discarded_info.reason),
+                                      discarded_info.surface,
+                                      discarded_info.trigger_surface,
+                                      static_cast<unsigned long long>(discarded_info.trigger_job_id),
+                                      static_cast<unsigned long long>(age_ms),
+                                      discard_summary.str());
                         }
                         continue;
                     }

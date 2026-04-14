@@ -87,12 +87,40 @@ class MppDecoder {
     void shutdown();
 
    private:
+    enum class DiscardOutputReason {
+        Unknown,
+        ExplicitDiscardOutput,
+        ReplacedPendingSurface,
+        AdoptedStaleTarget,
+        TailDrainAbandon,
+        SurfaceDestroy,
+        FailPending,
+    };
+
+    struct DiscardedJobInfo {
+        DiscardOutputReason reason = DiscardOutputReason::Unknown;
+        VASurfaceID surface = VA_INVALID_ID;
+        VASurfaceID trigger_surface = VA_INVALID_ID;
+        uint64_t trigger_job_id = 0;
+        uint64_t recorded_at_us = 0;
+    };
+
     void inputThreadMain(std::stop_token st);
     void outputThreadMain(std::stop_token st);
     void setSurfaceState(VASurfaceID surface, bool ready, bool failed);
     std::vector<VASurfaceID> failPendingSurfaces(VASurfaceID preferred_surface = VA_INVALID_ID);
+    static const char* discardOutputReasonName(DiscardOutputReason reason);
+    void markDiscardOutputJobLocked(uint64_t job_id,
+                                    DiscardOutputReason reason,
+                                    VASurfaceID surface,
+                                    VASurfaceID trigger_surface = VA_INVALID_ID,
+                                    uint64_t trigger_job_id = 0);
+    bool takeDiscardOutputJobLocked(uint64_t job_id, DiscardedJobInfo& info);
     bool dropPendingJobLocked(uint64_t job_id, VASurfaceID* surface = nullptr);
-    bool dropPendingSurfaceLocked(VASurfaceID surface);
+    bool dropPendingSurfaceLocked(VASurfaceID surface,
+                                  DiscardOutputReason reason = DiscardOutputReason::Unknown,
+                                  VASurfaceID trigger_surface = VA_INVALID_ID,
+                                  uint64_t trigger_job_id = 0);
     VASurfaceID dropOldestPendingSurfaceLocked();
 
     CodecProfile profile_{CodecProfile::Unknown};
@@ -110,7 +138,7 @@ class MppDecoder {
 
     std::unordered_map<VASurfaceID, SurfaceInfo> surfaces_;
     std::deque<std::pair<uint64_t, VASurfaceID>> pending_surfaces_;
-    std::unordered_set<uint64_t> discard_output_job_ids_;
+    std::unordered_map<uint64_t, DiscardedJobInfo> discard_output_jobs_;
     std::unordered_map<uint64_t, VASurfaceID> pending_surface_pts_;
     std::deque<MppPacket> pending_packets_;
     std::unordered_map<uint64_t, std::shared_ptr<std::vector<uint8_t>>> pending_payloads_;
