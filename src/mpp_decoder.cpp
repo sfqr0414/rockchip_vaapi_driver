@@ -47,6 +47,7 @@ bool av1ExportAs10BitEnabled() {
 }
 
 bool h264ImmediateOutEnabled() {
+    // Hidden diagnostic knob; not part of the default H.264 decode path.
     return envEnabled("ROCKCHIP_VAAPI_H264_IMMEDIATE_OUT");
 }
 

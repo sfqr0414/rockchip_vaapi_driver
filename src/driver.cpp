@@ -67,10 +67,12 @@ bool av1CorrectionEnabled() {
 }
 
 bool startupPrimingDisabled() {
+    // Hidden diagnostic escape hatch; the default path keeps startup priming enabled.
     return envEnabledLocal("ROCKCHIP_VAAPI_DISABLE_STARTUP_PRIMING");
 }
 
 unsigned int h264IdrPrimeCopies() {
+    // Hidden diagnostic knob for non-standard H.264 streams; the default main path uses 0.
     const char* value = std::getenv("ROCKCHIP_VAAPI_H264_IDR_PRIME_COPIES");
     if (!value || !*value) {
         return 0;
@@ -921,6 +923,177 @@ static DriverState* toDriver(VADriverContextP ctx) {
     return reinterpret_cast<DriverState*>(ctx->pDriverData);
 }
 
+struct SurfaceSyncSnapshot {
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t stride = 0;
+    int dmabuf_fd = -1;
+    bool failed = false;
+    bool pending = false;
+    uint64_t last_submitted_job_id = 0;
+    uint64_t last_completed_job_id = 0;
+    uint64_t last_submit_us = 0;
+    uint64_t last_complete_us = 0;
+    std::string pending_summary;
+};
+
+struct SurfaceSyncResult {
+    bool ready = false;
+    bool has_snapshot = false;
+    bool timed_out = false;
+    SurfaceSyncSnapshot snapshot;
+};
+
+constexpr uint32_t kSyncProbeMs = 1000;
+constexpr uint32_t kSyncTotalTimeoutMs = 60000;
+constexpr uint32_t kTailDrainTriggerMs = 3000;
+constexpr uint32_t kTailDrainIdleMs = 2000;
+constexpr uint32_t kTailDrainAbandonMs = 8000;
+
+static bool isTrackedSurface(DriverState& driver, VASurfaceID surface) {
+    std::lock_guard<std::mutex> lock(driver.lock);
+    return driver.surfaces.find(surface) != driver.surfaces.end();
+}
+
+static bool captureSurfaceSyncSnapshot(DriverState& driver,
+                                       VASurfaceID surface,
+                                       SurfaceSyncSnapshot& snapshot,
+                                       bool include_debug) {
+    if (!driver.decoder->getSurfaceInfo(surface,
+                                        snapshot.width,
+                                        snapshot.height,
+                                        snapshot.stride,
+                                        snapshot.dmabuf_fd,
+                                        snapshot.failed,
+                                        snapshot.pending)) {
+        return false;
+    }
+
+    if (include_debug) {
+        driver.decoder->getSurfaceDebugInfo(surface,
+                                            snapshot.last_submitted_job_id,
+                                            snapshot.last_completed_job_id,
+                                            snapshot.last_submit_us,
+                                            snapshot.last_complete_us);
+        snapshot.pending_summary = driver.decoder->getPendingQueueSummary(surface);
+    }
+    return true;
+}
+
+static void logSurfaceSyncProbe(VASurfaceID surface,
+                                uint32_t elapsed_ms,
+                                const SurfaceSyncSnapshot& snapshot) {
+    const uint64_t now_us = steadyMicrosNow();
+    util::log(util::stderr_sink, util::LogLevel::Warn,
+              "vaSyncSurface: probe stall surface={} elapsed_ms={} submitted_job={} completed_job={} since_submit_ms={} since_complete_ms={} {}",
+              surface,
+              elapsed_ms,
+              static_cast<unsigned long long>(snapshot.last_submitted_job_id),
+              static_cast<unsigned long long>(snapshot.last_completed_job_id),
+              snapshot.last_submit_us == 0 ? 0ull : static_cast<unsigned long long>((now_us - snapshot.last_submit_us) / 1000),
+              snapshot.last_complete_us == 0 ? 0ull : static_cast<unsigned long long>((now_us - snapshot.last_complete_us) / 1000),
+              snapshot.pending_summary);
+}
+
+static void logSurfaceSyncTimeout(VASurfaceID surface, const SurfaceSyncSnapshot& snapshot) {
+    const uint64_t now_us = steadyMicrosNow();
+    util::log(util::stderr_sink, util::LogLevel::Warn,
+              "vaSyncSurface: surface={} waitSurfaceReady timed out submitted_job={} completed_job={} since_submit_ms={} since_complete_ms={} {}",
+              surface,
+              static_cast<unsigned long long>(snapshot.last_submitted_job_id),
+              static_cast<unsigned long long>(snapshot.last_completed_job_id),
+              snapshot.last_submit_us == 0 ? 0ull : static_cast<unsigned long long>((now_us - snapshot.last_submit_us) / 1000),
+              snapshot.last_complete_us == 0 ? 0ull : static_cast<unsigned long long>((now_us - snapshot.last_complete_us) / 1000),
+              snapshot.pending_summary);
+}
+
+static SurfaceSyncResult waitForSurfaceSync(DriverState& driver, VASurfaceID surface) {
+    const bool panic_recovery_enabled = envEnabledLocal("ROCKCHIP_VAAPI_PANIC_SYNC_RECOVERY");
+    SurfaceSyncResult result;
+
+    for (uint32_t waited_ms = 0; waited_ms < kSyncTotalTimeoutMs; waited_ms += kSyncProbeMs) {
+        result.ready = driver.decoder->waitSurfaceReady(surface, kSyncProbeMs);
+        if (result.ready) {
+            break;
+        }
+
+        SurfaceSyncSnapshot snapshot;
+        if (!captureSurfaceSyncSnapshot(driver, surface, snapshot, true)) {
+            break;
+        }
+        if (snapshot.failed || !snapshot.pending) {
+            result.snapshot = std::move(snapshot);
+            result.has_snapshot = true;
+            break;
+        }
+
+        logSurfaceSyncProbe(surface, waited_ms + kSyncProbeMs, snapshot);
+
+        if (waited_ms + kSyncProbeMs >= kTailDrainTriggerMs) {
+            driver.decoder->requestTailDrainEos(surface, kTailDrainIdleMs);
+        }
+        if (waited_ms + kSyncProbeMs >= kTailDrainAbandonMs &&
+            driver.decoder->abandonTailPendingSurface(surface, kTailDrainAbandonMs)) {
+            break;
+        }
+
+        if (panic_recovery_enabled) {
+            util::log(util::stderr_sink, util::LogLevel::Warn,
+                      "vaSyncSurface: panic recovery forcing ready surface={} after {} ms",
+                      surface,
+                      waited_ms + kSyncProbeMs);
+            driver.decoder->forceSurfaceReady(surface);
+            result.ready = true;
+            break;
+        }
+    }
+
+    result.has_snapshot = captureSurfaceSyncSnapshot(driver, surface, result.snapshot, !result.ready) || result.has_snapshot;
+    if (!result.ready && result.has_snapshot && !result.snapshot.failed && result.snapshot.pending) {
+        result.timed_out = true;
+        logSurfaceSyncTimeout(surface, result.snapshot);
+    }
+    return result;
+}
+
+static VAStatus publishSyncedSurface(DriverState& driver,
+                                     VASurfaceID surface,
+                                     const SurfaceSyncSnapshot& snapshot) {
+    static std::atomic<int> sync_wait_log_count{0};
+    if (sync_wait_log_count.fetch_add(1, std::memory_order_relaxed) < 3) {
+        util::log(util::stderr_sink, util::LogLevel::Info,
+                  "vaSyncSurface: waiting surface={}", surface);
+    }
+
+    std::lock_guard<std::mutex> lock(driver.lock);
+    const auto it = driver.surfaces.find(surface);
+    if (it == driver.surfaces.end()) {
+        return VA_STATUS_ERROR_INVALID_SURFACE;
+    }
+
+    unique_fd driver_fd{dup(snapshot.dmabuf_fd)};
+    if (!driver_fd) {
+        return VA_STATUS_ERROR_ALLOCATION_FAILED;
+    }
+
+    it->second->surface.width = snapshot.width;
+    it->second->surface.height = snapshot.height;
+    it->second->surface.stride = snapshot.stride;
+    it->second->set_dmabuf(std::move(driver_fd));
+
+    static std::atomic<int> sync_ready_log_count{0};
+    if (sync_ready_log_count.fetch_add(1, std::memory_order_relaxed) < 1) {
+        util::log(util::stderr_sink, util::LogLevel::Info,
+                  "vaSyncSurface: surface={} ready w={} h={} stride={} fd={}",
+                  surface,
+                  snapshot.width,
+                  snapshot.height,
+                  snapshot.stride,
+                  it->second->surface.dmabuf_fd);
+    }
+    return VA_STATUS_SUCCESS;
+}
+
 static bool isSupportedProfile(VAProfile profile) {
     switch (profile) {
         case VAProfileH264ConstrainedBaseline:
@@ -1081,163 +1254,40 @@ static VAStatus vaDestroySurfaces(VADriverContextP ctx,
 static VAStatus vaSyncSurface(VADriverContextP ctx, VASurfaceID surface) {
     auto* d = toDriver(ctx);
     if (!d) return VA_STATUS_ERROR_INVALID_CONTEXT;
-    {
-        std::lock_guard<std::mutex> lock(d->lock);
-        const auto it = d->surfaces.find(surface);
-        if (it == d->surfaces.end()) {
-            util::log(util::stderr_sink, util::LogLevel::Warn,
-                      "vaSyncSurface: surface={} not tracked", surface);
-            return VA_STATUS_SUCCESS;
-        }
-    }
-
-    // Wait for MPP to report either completion or failure. Avoid an extra
-    // ready-only wait path so failed frames do not deadlock callers.
-    constexpr uint32_t kSyncProbeMs = 1000;
-    constexpr uint32_t kSyncTotalTimeoutMs = 60000;
-    constexpr uint32_t kTailDrainTriggerMs = 3000;
-    constexpr uint32_t kTailDrainIdleMs = 2000;
-    constexpr uint32_t kTailDrainAbandonMs = 8000;
-    const bool panic_recovery_enabled = envEnabledLocal("ROCKCHIP_VAAPI_PANIC_SYNC_RECOVERY");
-
-    bool ready = false;
-    for (uint32_t waited_ms = 0; waited_ms < kSyncTotalTimeoutMs; waited_ms += kSyncProbeMs) {
-        ready = d->decoder->waitSurfaceReady(surface, kSyncProbeMs);
-        if (ready) {
-            break;
-        }
-
-        uint32_t probe_width = 0;
-        uint32_t probe_height = 0;
-        uint32_t probe_stride = 0;
-        int probe_fd = -1;
-        bool probe_failed = false;
-        bool probe_pending = false;
-        if (!d->decoder->getSurfaceInfo(surface, probe_width, probe_height, probe_stride, probe_fd, probe_failed, probe_pending)) {
-            break;
-        }
-        if (probe_failed || !probe_pending) {
-            break;
-        }
-
-        uint64_t last_submitted_job_id = 0;
-        uint64_t last_completed_job_id = 0;
-        uint64_t last_submit_us = 0;
-        uint64_t last_complete_us = 0;
-        d->decoder->getSurfaceDebugInfo(surface,
-                                        last_submitted_job_id,
-                                        last_completed_job_id,
-                                        last_submit_us,
-                                        last_complete_us);
-        const uint64_t now_us = steadyMicrosNow();
+    if (!isTrackedSurface(*d, surface)) {
         util::log(util::stderr_sink, util::LogLevel::Warn,
-                  "vaSyncSurface: probe stall surface={} elapsed_ms={} submitted_job={} completed_job={} since_submit_ms={} since_complete_ms={} {}",
-                  surface,
-                  waited_ms + kSyncProbeMs,
-                  static_cast<unsigned long long>(last_submitted_job_id),
-                  static_cast<unsigned long long>(last_completed_job_id),
-                  last_submit_us == 0 ? 0ull : static_cast<unsigned long long>((now_us - last_submit_us) / 1000),
-                  last_complete_us == 0 ? 0ull : static_cast<unsigned long long>((now_us - last_complete_us) / 1000),
-                  d->decoder->getPendingQueueSummary(surface));
-
-        if (waited_ms + kSyncProbeMs >= kTailDrainTriggerMs) {
-            d->decoder->requestTailDrainEos(surface, kTailDrainIdleMs);
-        }
-        if (waited_ms + kSyncProbeMs >= kTailDrainAbandonMs &&
-            d->decoder->abandonTailPendingSurface(surface, kTailDrainAbandonMs)) {
-            break;
-        }
-
-        if (panic_recovery_enabled) {
-            util::log(util::stderr_sink, util::LogLevel::Warn,
-                      "vaSyncSurface: panic recovery forcing ready surface={} after {} ms",
-                      surface,
-                      waited_ms + kSyncProbeMs);
-            d->decoder->forceSurfaceReady(surface);
-            ready = true;
-            break;
-        }
+                  "vaSyncSurface: surface={} not tracked", surface);
+        return VA_STATUS_SUCCESS;
     }
 
-    uint32_t width = 0, height = 0, stride = 0;
-    int fd = -1;
-    bool failed = false;
-    bool pending = false;
-    if (d->decoder->getSurfaceInfo(surface, width, height, stride, fd, failed, pending)) {
-        if (!ready && failed) {
-            util::log(util::stderr_sink, util::LogLevel::Warn,
-                      "vaSyncSurface: surface={} completed with decode failure", surface);
-            return VA_STATUS_ERROR_DECODING_ERROR;
-        }
-
-        if (!ready && !failed && pending) {
-            uint64_t last_submitted_job_id = 0;
-            uint64_t last_completed_job_id = 0;
-            uint64_t last_submit_us = 0;
-            uint64_t last_complete_us = 0;
-            d->decoder->getSurfaceDebugInfo(surface,
-                                            last_submitted_job_id,
-                                            last_completed_job_id,
-                                            last_submit_us,
-                                            last_complete_us);
-            const uint64_t now_us = steadyMicrosNow();
-            util::log(util::stderr_sink, util::LogLevel::Warn,
-                      "vaSyncSurface: surface={} waitSurfaceReady timed out submitted_job={} completed_job={} since_submit_ms={} since_complete_ms={} {}",
-                      surface,
-                      static_cast<unsigned long long>(last_submitted_job_id),
-                      static_cast<unsigned long long>(last_completed_job_id),
-                      last_submit_us == 0 ? 0ull : static_cast<unsigned long long>((now_us - last_submit_us) / 1000),
-                      last_complete_us == 0 ? 0ull : static_cast<unsigned long long>((now_us - last_complete_us) / 1000),
-                      d->decoder->getPendingQueueSummary(surface));
-            return VA_STATUS_ERROR_TIMEDOUT;
-        }
-
-        if (!ready && !failed && !pending) {
-            util::log(util::stderr_sink, util::LogLevel::Info,
-                      "vaSyncSurface: surface={} has no decoded output yet; treating idle sync as success",
-                      surface);
-            return VA_STATUS_SUCCESS;
-        }
-
-        if (failed || fd < 0) {
-            util::log(util::stderr_sink, util::LogLevel::Warn,
-                      "vaSyncSurface: surface={} failed={} fd={}", surface, (int)failed, fd);
-            return failed ? VA_STATUS_ERROR_DECODING_ERROR : VA_STATUS_ERROR_INVALID_SURFACE;
-        }
-
-        {
-    static std::atomic<int> sync_wait_log_count{0};
-    if (sync_wait_log_count.fetch_add(1, std::memory_order_relaxed) < 3) {
+    const SurfaceSyncResult sync = waitForSurfaceSync(*d, surface);
+    if (!sync.has_snapshot) {
+        return VA_STATUS_SUCCESS;
+    }
+    if (!sync.ready && sync.snapshot.failed) {
+        util::log(util::stderr_sink, util::LogLevel::Warn,
+                  "vaSyncSurface: surface={} completed with decode failure", surface);
+        return VA_STATUS_ERROR_DECODING_ERROR;
+    }
+    if (sync.timed_out) {
+        return VA_STATUS_ERROR_TIMEDOUT;
+    }
+    if (!sync.ready && !sync.snapshot.failed && !sync.snapshot.pending) {
         util::log(util::stderr_sink, util::LogLevel::Info,
-                  "vaSyncSurface: waiting surface={}", surface);
+                  "vaSyncSurface: surface={} has no decoded output yet; treating idle sync as success",
+                  surface);
+        return VA_STATUS_SUCCESS;
+    }
+    if (sync.snapshot.failed || sync.snapshot.dmabuf_fd < 0) {
+        util::log(util::stderr_sink, util::LogLevel::Warn,
+                  "vaSyncSurface: surface={} failed={} fd={}",
+                  surface,
+                  static_cast<int>(sync.snapshot.failed),
+                  sync.snapshot.dmabuf_fd);
+        return sync.snapshot.failed ? VA_STATUS_ERROR_DECODING_ERROR : VA_STATUS_ERROR_INVALID_SURFACE;
     }
 
-            std::lock_guard<std::mutex> lock(d->lock);
-            const auto it = d->surfaces.find(surface);
-            if (it == d->surfaces.end()) {
-                return VA_STATUS_ERROR_INVALID_SURFACE;
-            }
-
-            unique_fd driver_fd{dup(fd)};
-            if (!driver_fd) {
-                return VA_STATUS_ERROR_ALLOCATION_FAILED;
-            }
-
-            it->second->surface.width = width;
-            it->second->surface.height = height;
-            it->second->surface.stride = stride;
-            it->second->set_dmabuf(std::move(driver_fd));
-
-            static std::atomic<int> sync_ready_log_count{0};
-            if (sync_ready_log_count.fetch_add(1, std::memory_order_relaxed) < 1) {
-                util::log(util::stderr_sink, util::LogLevel::Info,
-                          "vaSyncSurface: surface={} ready w={} h={} stride={} fd={}",
-                          surface, width, height, stride, it->second->surface.dmabuf_fd);
-            }
-        }
-    }
-
-    return VA_STATUS_SUCCESS;
+    return publishSyncedSurface(*d, surface, sync.snapshot);
 }
 
 static VAStatus vaQueryConfigProfiles(VADriverContextP ctx,
