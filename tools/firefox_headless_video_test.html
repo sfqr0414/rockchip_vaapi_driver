@@ -103,6 +103,14 @@
     const restartOnEnded = restartOnEndedParam === '1' || restartOnEndedParam === 'true';
     const seekEnabled = Number.isFinite(seekAt) && Number.isFinite(seekTo) && seekAt >= 0 && seekTo >= 0;
     const recentEvents = [];
+    const decodeTelemetry = {
+      available: false,
+      active: false,
+      interruptDelta: 0,
+      matchingLines: [],
+      updatedAt: null,
+      seenActive: false,
+    };
     let lastPostedAt = 0;
     let seekTriggered = false;
     let seekCompleted = false;
@@ -126,6 +134,9 @@
         ? quality.totalFrameDelay.toFixed(3)
         : 'n/a';
       const error = video.error ? `${video.error.code}: ${video.error.message || 'media error'}` : 'none';
+      const interruptSources = decodeTelemetry.matchingLines.length
+        ? decodeTelemetry.matchingLines.join(' | ')
+        : 'none';
       status.textContent = [
         `src: ${sourceUrl}`,
         `readyState: ${video.readyState}`,
@@ -142,6 +153,10 @@
         `seekTriggered: ${seekTriggered}`,
         `seekCompleted: ${seekCompleted}`,
         `seekTarget: ${seekEnabled ? seekTo.toFixed(3) : 'n/a'}`,
+        `hardwareDecodeActive: ${decodeTelemetry.active}`,
+        `hardwareDecodeSeen: ${decodeTelemetry.seenActive}`,
+        `interruptDelta: ${decodeTelemetry.interruptDelta}`,
+        `interruptSources: ${interruptSources}`,
         `restartOnEnded: ${restartOnEnded}`,
         `error: ${error}`,
         extra,
@@ -172,6 +187,10 @@
           seekTriggered,
           seekCompleted,
           seekTarget: seekEnabled ? Number(seekTo.toFixed(3)) : null,
+          hardwareDecodeActive: decodeTelemetry.active,
+          hardwareDecodeSeen: decodeTelemetry.seenActive,
+          interruptDelta: decodeTelemetry.interruptDelta,
+          interruptSources: decodeTelemetry.matchingLines,
           restartOnEnded,
           error,
           events: [...recentEvents]
@@ -196,6 +215,24 @@
         note('play() ok');
       } catch (error) {
         note(`play() failed: ${error && error.message ? error.message : error}`);
+      }
+    }
+
+    async function refreshDecodeTelemetry() {
+      try {
+        const response = await fetch('/__telemetry__', { cache: 'no-store' });
+        if (!response.ok) {
+          return;
+        }
+        const payload = await response.json();
+        decodeTelemetry.available = Boolean(payload.available);
+        decodeTelemetry.active = Boolean(payload.active);
+        decodeTelemetry.interruptDelta = Number(payload.interrupt_delta || 0);
+        decodeTelemetry.matchingLines = Array.isArray(payload.matching_lines) ? payload.matching_lines : [];
+        decodeTelemetry.updatedAt = payload.updated_at || null;
+        decodeTelemetry.seenActive = decodeTelemetry.seenActive || decodeTelemetry.active;
+        renderStatus();
+      } catch {
       }
     }
 
@@ -256,6 +293,8 @@
 
     setInterval(() => renderStatus(), 250);
     setInterval(maybeTriggerSeek, 100);
+    setInterval(refreshDecodeTelemetry, 500);
+    refreshDecodeTelemetry();
     ensurePlayback();
   </script>
 </body>

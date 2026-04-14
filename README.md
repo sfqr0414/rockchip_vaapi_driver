@@ -28,6 +28,14 @@ export MOZ_ENABLE_WAYLAND=1
 firefox
 ```
 
+For a persistent local Firefox profile with the recommended hardware-decode prefs already applied, use:
+
+```bash
+./tools/open_firefox_hwdecode.sh
+```
+
+The matching pref template lives in `tools/firefox_hwdecode_user.js`, and `tools/rockchip-firefox-hwdecode.desktop` provides a clickable desktop launcher for this workspace checkout.
+
 ## Notes
 
 - This implementation is **a minimal skeleton** that demonstrates the required structure (VA-API DDI entry points, atomic sync queue, DMA-BUF export). It includes a stubbed MPP implementation so it can build on systems without Rockchip MPP installed.

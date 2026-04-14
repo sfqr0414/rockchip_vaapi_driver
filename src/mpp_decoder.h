@@ -25,6 +25,7 @@ class MppDecoder {
         uint32_t width = 0;
         uint32_t height = 0;
         uint32_t stride = 0;
+        uint32_t vertical_stride = 0;
         bool is_10bit = false;
     };
 
@@ -64,7 +65,14 @@ class MppDecoder {
 
     bool allocateSurface(VASurfaceID id, DecodedSurface& out, int width, int height);
     bool updateSurfaceResolution(VASurfaceID id, int width, int height);
-    bool getSurfaceInfo(VASurfaceID id, uint32_t& width, uint32_t& height, uint32_t& stride, int& dmabuf_fd, bool& failed, bool& pending);
+    bool getSurfaceInfo(VASurfaceID id,
+                        uint32_t& width,
+                        uint32_t& height,
+                        uint32_t& stride,
+                        uint32_t& vertical_stride,
+                        int& dmabuf_fd,
+                        bool& failed,
+                        bool& pending);
     bool getSurfaceState(VASurfaceID id, bool& ready, bool& failed);
     bool waitSurfaceReady(VASurfaceID surface, uint32_t timeout_ms = 60000);
     bool getSurfaceDebugInfo(VASurfaceID id, uint64_t& last_submitted_job_id, uint64_t& last_completed_job_id, uint64_t& last_submit_us, uint64_t& last_complete_us);

@@ -8,6 +8,7 @@ profile_dir=$(mktemp -d /tmp/rockchip-firefox-profile.XXXXXX)
 server_state_dir=/tmp/rockchip-firefox-http-server
 mkdir -p "$server_state_dir"
 status_file="$server_state_dir/playback-status.jsonl"
+telemetry_file="$server_state_dir/decode-telemetry.json"
 
 pick_drm_device() {
 	if [[ -n "${MOZ_DRM_DEVICE:-}" ]]; then
@@ -49,16 +50,19 @@ start_http_server() {
 	local port=$1
 	local server_log="$server_state_dir/server.log"
 	: >"$status_file"
+	rm -f "$telemetry_file"
 	nohup python3 "$repo_dir/tools/firefox_playback_server.py" \
 		--bind 127.0.0.1 \
 		--port "$port" \
 		--directory "$repo_dir" \
-		--status-file "$status_file" >"$server_log" 2>&1 &
+		--status-file "$status_file" \
+		--telemetry-file "$telemetry_file" >"$server_log" 2>&1 &
 	local server_pid=$!
 	echo "$server_pid" >"$server_state_dir/pid"
 	echo "$port" >"$server_state_dir/port"
 	echo "$server_log" >"$server_state_dir/log"
 	echo "$status_file" >"$server_state_dir/status_file"
+	echo "$telemetry_file" >"$server_state_dir/telemetry_file"
 
 	for _ in $(seq 1 50); do
 		if curl -fsS "http://127.0.0.1:$port/" >/dev/null 2>&1; then
@@ -158,5 +162,6 @@ printf 'PROFILE=%s\n' "$profile_dir"
 printf 'URL=%s\n' "$target_url"
 printf 'HTTP_SERVER=%s\n' "http://127.0.0.1:$server_port/"
 printf 'STATUS_FILE=%s\n' "$status_file"
+printf 'TELEMETRY_FILE=%s\n' "$telemetry_file"
 
 "$firefox_bin" --new-instance --no-remote -profile "$profile_dir" "$target_url"

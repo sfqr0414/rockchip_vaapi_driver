@@ -660,19 +660,18 @@ static bool isImageBackingBuffer(const DriverState* d, VABufferID buf_id) {
 }
 
 static uint64_t surfaceTotalSizeBytes(const MppDecoder::DecodedSurface& surf) {
-    const uint32_t stride = surf.stride ? surf.stride : alignTo(surf.width, 64);
-    if (!surf.is_10bit) {
-        return static_cast<uint64_t>(stride) * surf.height * 3 / 2;
-    }
-
-    const uint32_t aligned_h = alignTo(surf.height, 8);
-    return static_cast<uint64_t>(stride) * aligned_h * 3;
+    const uint32_t pitch_bytes = surf.stride * (surf.is_10bit ? 2u : 1u);
+    const uint32_t aligned_h = std::max(surf.vertical_stride,
+                                        surf.is_10bit ? alignTo(surf.height, 8) : surf.height);
+    const uint32_t uv_height = (aligned_h + 1) / 2;
+    return static_cast<uint64_t>(pitch_bytes) * (aligned_h + uv_height);
 }
 
 static bool imageLayoutMatchesSurface(const DriverState::ImageState& image_state,
                                       const MppDecoder::DecodedSurface& surf) {
     const uint32_t bytes_per_row = surf.stride * (surf.is_10bit ? 2u : 1u);
-    const uint32_t aligned_h = surf.is_10bit ? alignTo(surf.height, 8) : surf.height;
+    const uint32_t aligned_h = std::max(surf.vertical_stride,
+                                        surf.is_10bit ? alignTo(surf.height, 8) : surf.height);
     const uint32_t y_size = bytes_per_row * aligned_h;
     const uint32_t expected_fourcc = surf.is_10bit ? VA_FOURCC_P010 : VA_FOURCC_NV12;
 
@@ -927,6 +926,7 @@ struct SurfaceSyncSnapshot {
     uint32_t width = 0;
     uint32_t height = 0;
     uint32_t stride = 0;
+    uint32_t vertical_stride = 0;
     int dmabuf_fd = -1;
     bool failed = false;
     bool pending = false;
@@ -963,6 +963,7 @@ static bool captureSurfaceSyncSnapshot(DriverState& driver,
                                         snapshot.width,
                                         snapshot.height,
                                         snapshot.stride,
+                                        snapshot.vertical_stride,
                                         snapshot.dmabuf_fd,
                                         snapshot.failed,
                                         snapshot.pending)) {
@@ -1079,6 +1080,7 @@ static VAStatus publishSyncedSurface(DriverState& driver,
     it->second->surface.width = snapshot.width;
     it->second->surface.height = snapshot.height;
     it->second->surface.stride = snapshot.stride;
+    it->second->surface.vertical_stride = snapshot.vertical_stride;
     it->second->set_dmabuf(std::move(driver_fd));
 
     static std::atomic<int> sync_ready_log_count{0};
@@ -1209,6 +1211,7 @@ static VAStatus vaCreateSurfaces1(VADriverContextP ctx,
         state->surface.width = static_cast<uint32_t>(width);
         state->surface.height = static_cast<uint32_t>(height);
         state->surface.stride = alignTo(state->surface.width, 64);
+        state->surface.vertical_stride = wants_10bit ? alignTo(state->surface.height, 8) : state->surface.height;
         state->surface.is_10bit = wants_10bit;
 
         if (!d->decoder->allocateSurface(id, state->surface, width, height)) {
@@ -2364,18 +2367,13 @@ static VAStatus vaExportSurfaceHandle(VADriverContextP ctx,
         return VA_STATUS_ERROR_INVALID_SURFACE;
     }
     const uint32_t stride = surf.stride ? surf.stride : alignTo(surf.width, 64);
-    const uint32_t aligned_h = surf.is_10bit ? alignTo(surf.height, 8) : surf.height;
+    const uint32_t aligned_h = std::max(surf.vertical_stride,
+                                        surf.is_10bit ? alignTo(surf.height, 8) : surf.height);
     const uint32_t bytes_per_row = stride * (surf.is_10bit ? 2u : 1u);
     const uint32_t y_size = bytes_per_row * aligned_h;
     const uint32_t uv_offset = y_size;
-
-    uint64_t total_size;
-    if (!surf.is_10bit) {
-        total_size = static_cast<uint64_t>(stride) * surf.height * 3 / 2;
-    } else {
-        uint32_t aligned_h = ((surf.height + 7) / 8) * 8;
-        total_size = static_cast<uint64_t>(stride) * aligned_h * 3;
-    }
+    const uint32_t uv_height = (aligned_h + 1) / 2;
+    const uint64_t total_size = static_cast<uint64_t>(bytes_per_row) * (aligned_h + uv_height);
 
     desc->fourcc = surf.is_10bit ? VA_FOURCC_P010 : VA_FOURCC_NV12;
     desc->width = surf.width;
@@ -2538,10 +2536,11 @@ static VAStatus vaDeriveImage(VADriverContextP ctx,
     fmt.blue_mask = 0;
     fmt.alpha_mask = 0;
 
-    uint32_t pitch = ((surf.width + 63) / 64) * 64 * (is_10bit ? 2u : 1u);
-    uint32_t aligned_h = is_10bit ? alignTo(surf.height, 8) : surf.height;
+    uint32_t pitch = surf.stride * (is_10bit ? 2u : 1u);
+    uint32_t aligned_h = std::max(surf.vertical_stride,
+                                  is_10bit ? alignTo(surf.height, 8) : surf.height);
     uint32_t y_size = pitch * aligned_h;
-    uint32_t uv_height = aligned_h / 2;
+    uint32_t uv_height = (aligned_h + 1) / 2;
     uint32_t total_size = y_size + pitch * uv_height;
 
     VABufferID buf_id = d->next_buffer_id++;
@@ -2730,8 +2729,10 @@ static VAStatus vaGetImage(VADriverContextP ctx,
 
     // Fallback path for cropped or layout-mismatched reads.
     uint32_t surf_pitch = surf.is_10bit ? surf.stride * 2 : surf.stride;
-    uint32_t surf_y_size = surf_pitch * surf.height;
-    uint32_t surf_total_size = surf_y_size + surf_pitch * ((surf.height + 1) / 2);
+    uint32_t surf_aligned_h = std::max(surf.vertical_stride,
+                                       surf.is_10bit ? alignTo(surf.height, 8) : surf.height);
+    uint32_t surf_y_size = surf_pitch * surf_aligned_h;
+    uint32_t surf_total_size = surf_y_size + surf_pitch * ((surf_aligned_h + 1) / 2);
 
     static std::atomic<int> get_image_mapdmabuf_log_count{0};
     if (get_image_mapdmabuf_log_count.fetch_add(1, std::memory_order_relaxed) < 1) {
@@ -2848,8 +2849,9 @@ static VAStatus vaPutImage(VADriverContextP ctx,
     uint32_t img_uv_pitch = image_state.pitches[1];
 
     uint32_t surf_pitch = surf.stride;
-    uint32_t surf_y_size = surf_pitch * surf.height;
-    uint32_t surf_total_size = surf_y_size + surf_pitch * ((surf.height + 1) / 2);
+    uint32_t surf_aligned_h = std::max(surf.vertical_stride, surf.height);
+    uint32_t surf_y_size = surf_pitch * surf_aligned_h;
+    uint32_t surf_total_size = surf_y_size + surf_pitch * ((surf_aligned_h + 1) / 2);
 
     auto surface_mapping = MappedDmabuf::map(surf.dmabuf_fd, surf_total_size, PROT_READ | PROT_WRITE);
     if (!surface_mapping) {

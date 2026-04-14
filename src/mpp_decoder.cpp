@@ -307,6 +307,7 @@ bool MppDecoder::allocateSurface(VASurfaceID id, DecodedSurface& out, int width,
     ds.width = static_cast<uint32_t>(width);
     ds.height = static_cast<uint32_t>(height);
     ds.stride = stride;
+    ds.vertical_stride = wants_10bit ? alignUp(static_cast<uint32_t>(height), 8) : static_cast<uint32_t>(height);
     ds.is_10bit = wants_10bit;
     ds.dmabuf_fd = -1;
 
@@ -330,16 +331,27 @@ bool MppDecoder::updateSurfaceResolution(VASurfaceID id, int width, int height) 
     it->second.surface.width = static_cast<uint32_t>(width);
     it->second.surface.height = static_cast<uint32_t>(height);
     it->second.surface.stride = stride;
+    it->second.surface.vertical_stride = it->second.surface.is_10bit
+                                             ? alignUp(static_cast<uint32_t>(height), 8)
+                                             : static_cast<uint32_t>(height);
     return true;
 }
 
-bool MppDecoder::getSurfaceInfo(VASurfaceID id, uint32_t& width, uint32_t& height, uint32_t& stride, int& dmabuf_fd, bool& failed, bool& pending) {
+bool MppDecoder::getSurfaceInfo(VASurfaceID id,
+                                uint32_t& width,
+                                uint32_t& height,
+                                uint32_t& stride,
+                                uint32_t& vertical_stride,
+                                int& dmabuf_fd,
+                                bool& failed,
+                                bool& pending) {
     std::lock_guard<std::mutex> lock(surface_mutex_);
     auto it = surfaces_.find(id);
     if (it == surfaces_.end()) return false;
     width = it->second.surface.width;
     height = it->second.surface.height;
     stride = it->second.surface.stride;
+    vertical_stride = it->second.surface.vertical_stride;
     dmabuf_fd = it->second.surface.dmabuf_fd;
     failed = it->second.failed.load();
     pending = it->second.in_flight.load();
@@ -1346,6 +1358,9 @@ void MppDecoder::outputThreadMain(std::stop_token st) {
                     it->second.surface.width = output_width;
                     it->second.surface.height = output_height;
                     it->second.surface.stride = published_stride;
+                    it->second.surface.vertical_stride = stable_export_enabled_
+                                                             ? output_height
+                                                             : (src_ver_stride ? src_ver_stride : output_height);
                     it->second.in_flight.store(false);
                     it->second.failed.store(false);
                     it->second.ready.store(true);
