@@ -71,19 +71,25 @@ bool startupPrimingDisabled() {
     return envEnabledLocal("ROCKCHIP_VAAPI_DISABLE_STARTUP_PRIMING");
 }
 
-unsigned int h264IdrPrimeCopies() {
-    // Hidden diagnostic knob for non-standard H.264 streams; the default main path uses 0.
-    const char* value = std::getenv("ROCKCHIP_VAAPI_H264_IDR_PRIME_COPIES");
+unsigned int envUnsignedClamped(const char* name,
+                                unsigned int fallback,
+                                unsigned int max_value) {
+    const char* value = std::getenv(name);
     if (!value || !*value) {
-        return 0;
+        return fallback;
     }
 
     char* end = nullptr;
     unsigned long parsed = std::strtoul(value, &end, 10);
     if (end == value || (end && *end != '\0')) {
-        return 0;
+        return fallback;
     }
-    return static_cast<unsigned int>(std::min<unsigned long>(parsed, 8));
+    return static_cast<unsigned int>(std::min<unsigned long>(parsed, max_value));
+}
+
+unsigned int h264IdrPrimeCopies() {
+    // Hidden diagnostic knob for non-standard H.264 streams; the default main path uses 0.
+    return envUnsignedClamped("ROCKCHIP_VAAPI_H264_IDR_PRIME_COPIES", 0, 8);
 }
 
 bool isH264Profile(VAProfile profile) {
@@ -276,6 +282,7 @@ namespace impl {
 struct SurfaceState {
     MppDecoder::DecodedSurface surface;
     unique_fd dmabuf;
+    uint64_t published_job_id = 0;
 
     void set_dmabuf(unique_fd fd) {
         dmabuf = std::move(fd);
@@ -415,7 +422,7 @@ struct CodecSessionState {
 
     static unsigned int startupPrimePicturesForProfile(VAProfile profile) {
         if (isH264Profile(profile)) {
-            return 6;
+            return envUnsignedClamped("ROCKCHIP_VAAPI_H264_STARTUP_PRIME_PICTURES", 6, 12);
         }
         if (profile == VAProfileHEVCMain || profile == VAProfileHEVCMain10) {
             return 4;
@@ -425,7 +432,7 @@ struct CodecSessionState {
 
     static unsigned int startupPrimeCopiesPerPicture(VAProfile profile) {
         if (isH264Profile(profile)) {
-            return 3;
+            return envUnsignedClamped("ROCKCHIP_VAAPI_H264_STARTUP_PRIME_COPIES", 3, 6);
         }
         if (profile == VAProfileHEVCMain || profile == VAProfileHEVCMain10) {
             return 1;
@@ -940,8 +947,10 @@ struct SurfaceSyncSnapshot {
 struct SurfaceSyncResult {
     bool ready = false;
     bool has_snapshot = false;
+    bool adopted = false;
     bool timed_out = false;
     SurfaceSyncSnapshot snapshot;
+    SurfaceSyncSnapshot adopted_snapshot;
 };
 
 constexpr uint32_t kSyncProbeMs = 1000;
@@ -1008,6 +1017,66 @@ static void logSurfaceSyncTimeout(VASurfaceID surface, const SurfaceSyncSnapshot
               snapshot.pending_summary);
 }
 
+static bool tryAdoptStartupPrimeSurface(DriverState& driver,
+                                        VASurfaceID target_surface,
+                                        SurfaceSyncSnapshot& adopted_snapshot) {
+    uint64_t target_published_job_id = 0;
+    {
+        std::lock_guard<std::mutex> lock(driver.lock);
+        const auto target_it = driver.surfaces.find(target_surface);
+        if (target_it != driver.surfaces.end()) {
+            target_published_job_id = target_it->second->published_job_id;
+        }
+    }
+
+    bool found_candidate = false;
+    SurfaceSyncSnapshot best_candidate;
+    VASurfaceID best_prime_surface = VA_INVALID_ID;
+    for (VASurfaceID prime_surface : driver.session.startup_prime_surfaces) {
+        if (prime_surface == VA_INVALID_ID || prime_surface == target_surface) {
+            continue;
+        }
+
+        SurfaceSyncSnapshot candidate;
+        if (!captureSurfaceSyncSnapshot(driver, prime_surface, candidate, true)) {
+            continue;
+        }
+        if (candidate.failed || candidate.pending || candidate.dmabuf_fd < 0) {
+            continue;
+        }
+        if (candidate.last_completed_job_id <= target_published_job_id) {
+            continue;
+        }
+
+        if (!found_candidate || candidate.last_completed_job_id > best_candidate.last_completed_job_id) {
+            found_candidate = true;
+            best_candidate = std::move(candidate);
+            best_prime_surface = prime_surface;
+        }
+    }
+
+    if (!found_candidate) {
+        return false;
+    }
+
+    adopted_snapshot = std::move(best_candidate);
+    static std::atomic<int> adopt_log_count{0};
+    if (adopt_log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
+        util::log(util::stderr_sink, util::LogLevel::Info,
+                  "vaSyncSurface: adopting startup-prime surface={} for target_surface={} prime_job={} target_job={} w={} h={} stride={} vstride={} fd={}",
+                  best_prime_surface,
+                  target_surface,
+                  static_cast<unsigned long long>(adopted_snapshot.last_completed_job_id),
+                  static_cast<unsigned long long>(target_published_job_id),
+                  adopted_snapshot.width,
+                  adopted_snapshot.height,
+                  adopted_snapshot.stride,
+                  adopted_snapshot.vertical_stride,
+                  adopted_snapshot.dmabuf_fd);
+    }
+    return true;
+}
+
 static SurfaceSyncResult waitForSurfaceSync(DriverState& driver, VASurfaceID surface) {
     const bool panic_recovery_enabled = envEnabledLocal("ROCKCHIP_VAAPI_PANIC_SYNC_RECOVERY");
     SurfaceSyncResult result;
@@ -1029,6 +1098,17 @@ static SurfaceSyncResult waitForSurfaceSync(DriverState& driver, VASurfaceID sur
         }
 
         logSurfaceSyncProbe(surface, waited_ms + kSyncProbeMs, snapshot);
+
+        if (snapshot.dmabuf_fd < 0) {
+            SurfaceSyncSnapshot adopted_snapshot;
+            if (tryAdoptStartupPrimeSurface(driver, surface, adopted_snapshot)) {
+                result.adopted = true;
+                result.adopted_snapshot = std::move(adopted_snapshot);
+                result.snapshot = std::move(snapshot);
+                result.has_snapshot = true;
+                break;
+            }
+        }
 
         if (waited_ms + kSyncProbeMs >= kTailDrainTriggerMs) {
             driver.decoder->requestTailDrainEos(surface, kTailDrainIdleMs);
@@ -1082,12 +1162,14 @@ static VAStatus publishSyncedSurface(DriverState& driver,
     it->second->surface.stride = snapshot.stride;
     it->second->surface.vertical_stride = snapshot.vertical_stride;
     it->second->set_dmabuf(std::move(driver_fd));
+    it->second->published_job_id = snapshot.last_completed_job_id;
 
     static std::atomic<int> sync_ready_log_count{0};
     if (sync_ready_log_count.fetch_add(1, std::memory_order_relaxed) < 1) {
         util::log(util::stderr_sink, util::LogLevel::Info,
-                  "vaSyncSurface: surface={} ready w={} h={} stride={} fd={}",
+                  "vaSyncSurface: surface={} ready job={} w={} h={} stride={} fd={}",
                   surface,
+                  static_cast<unsigned long long>(snapshot.last_completed_job_id),
                   snapshot.width,
                   snapshot.height,
                   snapshot.stride,
@@ -1272,10 +1354,17 @@ static VAStatus vaSyncSurface(VADriverContextP ctx, VASurfaceID surface) {
                   "vaSyncSurface: surface={} completed with decode failure", surface);
         return VA_STATUS_ERROR_DECODING_ERROR;
     }
+    if (sync.adopted) {
+        return publishSyncedSurface(*d, surface, sync.adopted_snapshot);
+    }
     if (sync.timed_out) {
         return VA_STATUS_ERROR_TIMEDOUT;
     }
     if (!sync.ready && !sync.snapshot.failed && !sync.snapshot.pending) {
+        SurfaceSyncSnapshot adopted_snapshot;
+        if (sync.snapshot.dmabuf_fd < 0 && tryAdoptStartupPrimeSurface(*d, surface, adopted_snapshot)) {
+            return publishSyncedSurface(*d, surface, adopted_snapshot);
+        }
         util::log(util::stderr_sink, util::LogLevel::Info,
                   "vaSyncSurface: surface={} has no decoded output yet; treating idle sync as success",
                   surface);
@@ -2214,6 +2303,15 @@ static VAStatus vaEndPicture(VADriverContextP ctx,
     job.eos = false;
     const bool h264_idr = isH264Profile(d->profile) && h264AccessUnitStartsWithIdr(job.bitstream);
 
+    // Submit the actual render target first so Firefox can observe a real
+    // output surface before startup priming copies occupy the queue.
+    MppDecoder::DecodeJob display_job = job;
+    if (!d->decoder->enqueueJob(std::move(display_job))) {
+        util::log(util::stderr_sink, util::LogLevel::Error,
+                  "vaEndPicture: enqueueJob failed for surface={}", picture.current_surface);
+        return VA_STATUS_ERROR_ALLOCATION_FAILED;
+    }
+
     const unsigned int startup_prime_copies = session.consumeStartupPrimeCopies(d->profile);
     for (unsigned int copy_index = 0; copy_index < startup_prime_copies; ++copy_index) {
         MppDecoder::DecodeJob prime_job;
@@ -2273,13 +2371,6 @@ static VAStatus vaEndPicture(VADriverContextP ctx,
                       idr_prime_copies);
             return VA_STATUS_ERROR_ALLOCATION_FAILED;
         }
-    }
-
-    // Submit the complete frame to the decoder thread (which will feed MPP).
-    if (!d->decoder->enqueueJob(std::move(job))) {
-        util::log(util::stderr_sink, util::LogLevel::Error,
-                  "vaEndPicture: enqueueJob failed for surface={}", picture.current_surface);
-        return VA_STATUS_ERROR_ALLOCATION_FAILED;
     }
 
     return VA_STATUS_SUCCESS;
