@@ -97,8 +97,10 @@
     const sourceUrl = new URL(videoPath, window.location.href).href;
     const seekAtParam = params.get('seekAt');
     const seekToParam = params.get('seekTo');
+    const restartOnEndedParam = params.get('restartOnEnded');
     const seekAt = seekAtParam === null ? Number.NaN : Number(seekAtParam);
     const seekTo = seekToParam === null ? Number.NaN : Number(seekToParam);
+    const restartOnEnded = restartOnEndedParam === '1' || restartOnEndedParam === 'true';
     const seekEnabled = Number.isFinite(seekAt) && Number.isFinite(seekTo) && seekAt >= 0 && seekTo >= 0;
     const recentEvents = [];
     let lastPostedAt = 0;
@@ -140,6 +142,7 @@
         `seekTriggered: ${seekTriggered}`,
         `seekCompleted: ${seekCompleted}`,
         `seekTarget: ${seekEnabled ? seekTo.toFixed(3) : 'n/a'}`,
+        `restartOnEnded: ${restartOnEnded}`,
         `error: ${error}`,
         extra,
         `events: ${recentEvents.join(', ')}`
@@ -169,6 +172,7 @@
           seekTriggered,
           seekCompleted,
           seekTarget: seekEnabled ? Number(seekTo.toFixed(3)) : null,
+          restartOnEnded,
           error,
           events: [...recentEvents]
         });
@@ -227,7 +231,7 @@
     ].forEach((eventName) => {
       video.addEventListener(eventName, () => {
         note(eventName);
-        if (eventName === 'ended') {
+        if (eventName === 'ended' && restartOnEnded) {
           video.currentTime = 0;
           ensurePlayback();
         }

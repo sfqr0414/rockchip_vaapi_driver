@@ -3,6 +3,7 @@
 set -euo pipefail
 
 repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+build_dir=${ROCKCHIP_VAAPI_BUILD_DIR:-$repo_dir/build}
 profile_dir=$(mktemp -d /tmp/rockchip-firefox-profile.XXXXXX)
 server_state_dir=/tmp/rockchip-firefox-http-server
 mkdir -p "$server_state_dir"
@@ -142,6 +143,7 @@ sed -i \
 
 export MOZ_ENABLE_WAYLAND=${MOZ_ENABLE_WAYLAND:-1}
 export MOZ_DISABLE_RDD_SANDBOX=${MOZ_DISABLE_RDD_SANDBOX:-1}
+export LIBVA_DRIVERS_PATH=${LIBVA_DRIVERS_PATH:-$build_dir}
 export LIBVA_DRIVER_NAME=${LIBVA_DRIVER_NAME:-rockchip}
 export ROCKCHIP_VAAPI_AV1_EXPORT_P010=${ROCKCHIP_VAAPI_AV1_EXPORT_P010:-1}
 export MOZ_DRM_DEVICE=$drm_device

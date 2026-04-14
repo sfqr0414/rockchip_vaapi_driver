@@ -63,6 +63,7 @@ def compute_summary(samples):
         "last_readyState": last.get("readyState"),
         "last_paused": last.get("paused"),
         "last_ended": last.get("ended"),
+        "ended_seen": any(bool(sample.get("ended")) for sample in samples),
         "last_error": last.get("error"),
         "last_events": last.get("events"),
         "seek_enabled": any(bool(sample.get("seekEnabled")) for sample in samples),
