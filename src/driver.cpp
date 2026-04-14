@@ -327,6 +327,7 @@ struct SurfaceState {
     MppDecoder::DecodedSurface surface;
     unique_fd dmabuf;
     uint64_t published_job_id = 0;
+    uint32_t external_publish_count = 0;
     bool h264_nonreference_hint = false;
     bool h264_b_slice_hint = false;
     bool h264_reference_hint = false;
@@ -444,7 +445,7 @@ struct CodecSessionState {
         startup_prime_tail_pictures_remaining = 0;
     }
 
-    unsigned int consumeStartupPrimeCopies(VAProfile profile) {
+    unsigned int consumeStartupPrimeCopies(VAProfile profile, bool reused_external_surface) {
         if (!shouldPrimeStartup(profile)) {
             return 0;
         }
@@ -459,7 +460,7 @@ struct CodecSessionState {
             return copies;
         }
 
-        if (isH264Profile(profile) && startup_prime_tail_pictures_remaining > 0) {
+        if (isH264Profile(profile) && reused_external_surface && startup_prime_tail_pictures_remaining > 0) {
             --startup_prime_tail_pictures_remaining;
             return 1;
         }
@@ -526,7 +527,7 @@ struct CodecSessionState {
 
     static unsigned int startupPrimeTailPicturesForProfile(VAProfile profile) {
         if (isH264Profile(profile)) {
-            return envUnsignedClamped("ROCKCHIP_VAAPI_H264_TAIL_PRIME_PICTURES", 2, 8);
+            return envUnsignedClamped("ROCKCHIP_VAAPI_H264_TAIL_PRIME_PICTURES", 4, 8);
         }
         return 0;
     }
@@ -1270,13 +1271,15 @@ static VAStatus publishSyncedSurface(DriverState& driver,
     it->second->set_dmabuf(std::move(driver_fd));
     it->second->published_job_id = snapshot.last_completed_job_id;
     if (!adopted && !isInternalSurfaceId(surface)) {
+        ++it->second->external_publish_count;
         driver.session.noteExternalSurfacePublished(driver.profile);
         static std::atomic<int> prime_taper_log_count{0};
         if (prime_taper_log_count.fetch_add(1, std::memory_order_relaxed) < 12) {
             util::log(util::stderr_sink, util::LogLevel::Info,
-                      "vaSyncSurface: external publish surface={} job={} startup_prime_external_publishes={}",
+                      "vaSyncSurface: external publish surface={} job={} publish_count={} startup_prime_external_publishes={}",
                       surface,
                       static_cast<unsigned long long>(snapshot.last_completed_job_id),
+                      it->second->external_publish_count,
                       driver.session.startup_prime_external_publishes);
         }
     }
@@ -2166,6 +2169,7 @@ static VAStatus vaEndPicture(VADriverContextP ctx,
 
     picture.frame_extra_data.clear();
     H264PictureTraits h264_traits;
+    bool h264_references_reused_external_surface = false;
     if (picture.decode_state.picture_param_buffer_id) {
         auto it = d->buffers.find(*picture.decode_state.picture_param_buffer_id);
         if (it != d->buffers.end()) {
@@ -2215,6 +2219,22 @@ static VAStatus vaEndPicture(VADriverContextP ctx,
                         current_slice_param_buffer ? current_slice_param_buffer->map() : std::span<const uint8_t>{},
                         current_slice_param_buffer ? current_slice_param_buffer->num_elements : 0,
                         picture.frame_buffer);
+                    {
+                        const auto& h264 = *reinterpret_cast<const VAPictureParameterBufferH264*>(picture_param_buffer.data.data());
+                        std::lock_guard<std::mutex> lock(d->lock);
+                        for (const auto& ref : h264.ReferenceFrames) {
+                            if ((ref.flags & VA_PICTURE_H264_INVALID) != 0 ||
+                                ref.picture_id == VA_INVALID_SURFACE ||
+                                isInternalSurfaceId(ref.picture_id)) {
+                                continue;
+                            }
+                            auto surface_it = d->surfaces.find(ref.picture_id);
+                            if (surface_it != d->surfaces.end() && surface_it->second->external_publish_count > 0) {
+                                h264_references_reused_external_surface = true;
+                                break;
+                            }
+                        }
+                    }
                     if (!session.sequence_headers_sent || h264AccessUnitStartsWithIdr(picture.frame_buffer)) {
                         picture.frame_extra_data = bitstream::build_h264_headers(
                             *reinterpret_cast<const VAPictureParameterBufferH264*>(picture_param_buffer.data.data()),
@@ -2436,6 +2456,16 @@ static VAStatus vaEndPicture(VADriverContextP ctx,
         }
     }
 
+    bool reused_external_surface = false;
+    {
+        std::lock_guard<std::mutex> lock(d->lock);
+        auto surface_it = d->surfaces.find(picture.current_surface);
+        if (surface_it != d->surfaces.end() && !isInternalSurfaceId(picture.current_surface)) {
+            reused_external_surface = surface_it->second->external_publish_count > 0;
+        }
+    }
+    const bool high_risk_external_bridge = reused_external_surface || h264_references_reused_external_surface;
+
     // Submit the actual render target first so Firefox can observe a real
     // output surface before startup priming copies occupy the queue.
     MppDecoder::DecodeJob display_job = job;
@@ -2445,7 +2475,7 @@ static VAStatus vaEndPicture(VADriverContextP ctx,
         return VA_STATUS_ERROR_ALLOCATION_FAILED;
     }
 
-    const unsigned int startup_prime_copies = session.consumeStartupPrimeCopies(d->profile);
+    const unsigned int startup_prime_copies = session.consumeStartupPrimeCopies(d->profile, high_risk_external_bridge);
     for (unsigned int copy_index = 0; copy_index < startup_prime_copies; ++copy_index) {
         MppDecoder::DecodeJob prime_job;
         prime_job.target_surface = session.nextStartupPrimeSurface();
@@ -2456,11 +2486,13 @@ static VAStatus vaEndPicture(VADriverContextP ctx,
         static std::atomic<int> prime_target_log_count{0};
         if (prime_target_log_count.fetch_add(1, std::memory_order_relaxed) < 12) {
             util::log(util::stderr_sink, util::LogLevel::Info,
-                      "vaEndPicture: priming copy={}/{} current_surface={} prime_surface={} discard_output={}",
+                      "vaEndPicture: priming copy={}/{} current_surface={} prime_surface={} reused_external={} reused_ref={} discard_output={}",
                       copy_index + 1,
                       startup_prime_copies,
                       picture.current_surface,
                       prime_job.target_surface,
+                      reused_external_surface ? 1 : 0,
+                      h264_references_reused_external_surface ? 1 : 0,
                       prime_job.discard_output ? 1 : 0);
         }
         prime_job.bitstream = job.bitstream;
