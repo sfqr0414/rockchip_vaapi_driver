@@ -69,6 +69,8 @@ class MppDecoder {
     bool waitSurfaceReady(VASurfaceID surface, uint32_t timeout_ms = 60000);
     bool getSurfaceDebugInfo(VASurfaceID id, uint64_t& last_submitted_job_id, uint64_t& last_completed_job_id, uint64_t& last_submit_us, uint64_t& last_complete_us);
     std::string getPendingQueueSummary(VASurfaceID focus_surface = VA_INVALID_ID);
+    bool requestTailDrainEos(VASurfaceID focus_surface, uint32_t min_idle_ms);
+    bool abandonTailPendingSurface(VASurfaceID focus_surface, uint32_t min_idle_ms);
     void forceSurfaceReady(VASurfaceID surface);
     void resetSurface(VASurfaceID surface);
     void releaseSurface(VASurfaceID surface);
@@ -92,6 +94,7 @@ class MppDecoder {
     std::atomic<bool> running_{false};
     std::atomic<bool> eos_sent_{false};
     std::atomic<bool> eos_seen_{false};
+    std::atomic<bool> tail_drain_eos_requested_{false};
 
     std::jthread input_thread_;
     std::jthread output_thread_;

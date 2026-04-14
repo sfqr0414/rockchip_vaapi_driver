@@ -418,6 +418,105 @@ std::string MppDecoder::getPendingQueueSummary(VASurfaceID focus_surface) {
     return stream.str();
 }
 
+bool MppDecoder::requestTailDrainEos(VASurfaceID focus_surface, uint32_t min_idle_ms) {
+    if (focus_surface == VA_INVALID_ID || !running_.load(std::memory_order_relaxed)) {
+        return false;
+    }
+
+    bool expected = false;
+    if (!tail_drain_eos_requested_.compare_exchange_strong(expected, true, std::memory_order_relaxed)) {
+        return false;
+    }
+
+    const uint64_t now_us = steadyMicrosNow();
+    const uint64_t min_idle_us = static_cast<uint64_t>(min_idle_ms) * 1000ULL;
+    bool should_submit = false;
+    uint64_t focus_job_id = 0;
+
+    {
+        std::lock_guard<std::mutex> lock(pending_mutex_);
+        if (!eos_sent_.load(std::memory_order_relaxed) &&
+            pending_count_ == 1 &&
+            pending_surfaces_.size() == 1 &&
+            pending_surface_pts_.size() == 1) {
+            const auto& [job_id, surface_id] = pending_surfaces_.front();
+            const uint64_t last_enqueue_us = last_enqueue_us_.load(std::memory_order_relaxed);
+            const uint64_t last_progress_us = last_progress_us_.load(std::memory_order_relaxed);
+            if (surface_id == focus_surface &&
+                last_enqueue_us != 0 &&
+                last_progress_us != 0 &&
+                now_us >= last_enqueue_us &&
+                now_us >= last_progress_us &&
+                now_us - last_enqueue_us >= min_idle_us &&
+                now_us - last_progress_us >= min_idle_us) {
+                DecodeJob eos;
+                eos.target_surface = focus_surface;
+                eos.eos = true;
+                input_queue_.push(eos);
+                last_enqueue_us_.store(now_us, std::memory_order_relaxed);
+                should_submit = true;
+                focus_job_id = job_id;
+            }
+        }
+    }
+
+    if (!should_submit) {
+        tail_drain_eos_requested_.store(false, std::memory_order_relaxed);
+        return false;
+    }
+
+    util::log(util::stderr_sink, util::LogLevel::Warn,
+              "mpp: tail-drain EOS queued for surface={} latest_job={} idle_ms={} {}",
+              focus_surface,
+              static_cast<unsigned long long>(focus_job_id),
+              static_cast<unsigned long long>(min_idle_ms),
+              getPendingQueueSummary(focus_surface));
+    return true;
+}
+
+bool MppDecoder::abandonTailPendingSurface(VASurfaceID focus_surface, uint32_t min_idle_ms) {
+    if (focus_surface == VA_INVALID_ID) {
+        return false;
+    }
+
+    const uint64_t now_us = steadyMicrosNow();
+    const uint64_t min_idle_us = static_cast<uint64_t>(min_idle_ms) * 1000ULL;
+    bool should_abandon = false;
+    uint64_t focus_job_id = 0;
+
+    {
+        std::lock_guard<std::mutex> lock(pending_mutex_);
+        if (eos_sent_.load(std::memory_order_relaxed) &&
+            pending_count_ == 1 &&
+            pending_surfaces_.size() == 1 &&
+            pending_surface_pts_.size() == 1) {
+            const auto& [job_id, surface_id] = pending_surfaces_.front();
+            const uint64_t last_progress_us = last_progress_us_.load(std::memory_order_relaxed);
+            if (surface_id == focus_surface &&
+                last_progress_us != 0 &&
+                now_us >= last_progress_us &&
+                now_us - last_progress_us >= min_idle_us) {
+                dropPendingSurfaceLocked(focus_surface);
+                should_abandon = true;
+                focus_job_id = job_id;
+            }
+        }
+    }
+
+    if (!should_abandon) {
+        return false;
+    }
+
+    setSurfaceState(focus_surface, false, false);
+    util::log(util::stderr_sink, util::LogLevel::Warn,
+              "mpp: abandoning tail pending surface={} latest_job={} idle_ms={} after EOS {}",
+              focus_surface,
+              static_cast<unsigned long long>(focus_job_id),
+              static_cast<unsigned long long>(min_idle_ms),
+              getPendingQueueSummary(focus_surface));
+    return true;
+}
+
 bool MppDecoder::enqueueJob(DecodeJob job) {
     if (!session_) return false;
 
@@ -427,6 +526,7 @@ bool MppDecoder::enqueueJob(DecodeJob job) {
     if (running_.compare_exchange_strong(expected, true)) {
         eos_sent_.store(false, std::memory_order_relaxed);
         eos_seen_.store(false, std::memory_order_relaxed);
+        tail_drain_eos_requested_.store(false, std::memory_order_relaxed);
         last_progress_us_.store(steadyMicrosNow(), std::memory_order_relaxed);
         input_thread_ = std::jthread([this](std::stop_token st){ inputThreadMain(st); });
         output_thread_ = std::jthread([this](std::stop_token st){ outputThreadMain(st); });
@@ -758,6 +858,7 @@ void MppDecoder::shutdown() {
     }
 
     running_ = false;
+    tail_drain_eos_requested_.store(false, std::memory_order_relaxed);
 
     if (!eos_sent_) {
         DecodeJob eos;
@@ -905,8 +1006,24 @@ void MppDecoder::inputThreadMain(std::stop_token st) {
                           "mpp: inputThread EOS submitted={}", submitted ? 1 : 0);
             }
             eos_sent_ = true;
+            if (submitted && job.target_surface != VA_INVALID_ID) {
+                for (int attempt = 0; attempt < 200; ++attempt) {
+                    {
+                        std::lock_guard<std::mutex> lock(pending_mutex_);
+                        if (pending_count_ == 0) {
+                            break;
+                        }
+                    }
+                    if (abandonTailPendingSurface(job.target_surface, 2000)) {
+                        break;
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                }
+            }
             continue;
         }
+
+        tail_drain_eos_requested_.store(false, std::memory_order_relaxed);
 
         if (!job.extra_data.empty()) {
             diagnostic_payload.reserve(job.extra_data.size() + job.bitstream.size());

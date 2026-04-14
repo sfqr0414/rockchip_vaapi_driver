@@ -1095,6 +1095,9 @@ static VAStatus vaSyncSurface(VADriverContextP ctx, VASurfaceID surface) {
     // ready-only wait path so failed frames do not deadlock callers.
     constexpr uint32_t kSyncProbeMs = 1000;
     constexpr uint32_t kSyncTotalTimeoutMs = 60000;
+    constexpr uint32_t kTailDrainTriggerMs = 3000;
+    constexpr uint32_t kTailDrainIdleMs = 2000;
+    constexpr uint32_t kTailDrainAbandonMs = 8000;
     const bool panic_recovery_enabled = envEnabledLocal("ROCKCHIP_VAAPI_PANIC_SYNC_RECOVERY");
 
     bool ready = false;
@@ -1136,6 +1139,14 @@ static VAStatus vaSyncSurface(VADriverContextP ctx, VASurfaceID surface) {
                   last_submit_us == 0 ? 0ull : static_cast<unsigned long long>((now_us - last_submit_us) / 1000),
                   last_complete_us == 0 ? 0ull : static_cast<unsigned long long>((now_us - last_complete_us) / 1000),
                   d->decoder->getPendingQueueSummary(surface));
+
+        if (waited_ms + kSyncProbeMs >= kTailDrainTriggerMs) {
+            d->decoder->requestTailDrainEos(surface, kTailDrainIdleMs);
+        }
+        if (waited_ms + kSyncProbeMs >= kTailDrainAbandonMs &&
+            d->decoder->abandonTailPendingSurface(surface, kTailDrainAbandonMs)) {
+            break;
+        }
 
         if (panic_recovery_enabled) {
             util::log(util::stderr_sink, util::LogLevel::Warn,
