@@ -128,14 +128,16 @@ bool createStableExportBuffer(MppDecoder::SurfaceInfo& surface_info,
                               uint32_t width,
                               uint32_t height,
                               bool is_10bit) {
-    if (drm_fd < 0 || is_10bit) {
+    if (drm_fd < 0) {
         return false;
     }
 
+    const uint32_t aligned_height = is_10bit ? alignUp(height, 8) : height;
+    const uint32_t uv_height = (aligned_height + 1) / 2;
     drm_mode_create_dumb create = {};
     create.width = alignUp(width, 64);
-    create.height = height + height / 2;
-    create.bpp = 8;
+    create.height = aligned_height + uv_height;
+    create.bpp = is_10bit ? 16 : 8;
     if (drmIoctl(drm_fd, DRM_IOCTL_MODE_CREATE_DUMB, &create) != 0) {
         return false;
     }
@@ -201,15 +203,60 @@ bool copyFrameToStableExport(void* dst_map,
                              uint32_t height,
                              uint32_t src_stride_bytes,
                              uint32_t src_ver_stride,
-                             const uint8_t* src_base) {
+                             const uint8_t* src_base,
+                             bool is_10bit,
+                             bool src_is_10bit) {
     if (!dst_map || !src_base || width == 0 || height == 0) {
         return false;
     }
 
+    const uint32_t aligned_height = is_10bit ? alignUp(height, 8) : height;
     uint8_t* dst_y = static_cast<uint8_t*>(dst_map);
-    uint8_t* dst_uv = dst_y + static_cast<size_t>(dst_pitch) * height;
+    uint8_t* dst_uv = dst_y + static_cast<size_t>(dst_pitch) * aligned_height;
     const uint8_t* src_y = src_base;
     const uint8_t* src_uv = src_base + static_cast<size_t>(src_stride_bytes) * src_ver_stride;
+
+    if (is_10bit) {
+        if (src_is_10bit) {
+            // MPP_FMT_YUV420SP_10BIT is Rockchip's packed 10-bit layout (no gap),
+            // while VA exposes P010. Expand each row before publishing the surface.
+            const size_t packed_row_bytes = ((static_cast<size_t>(width) + 3) / 4) * 5;
+            for (uint32_t row = 0; row < height; ++row) {
+                auto* dst_row = reinterpret_cast<uint16_t*>(dst_y + static_cast<size_t>(row) * dst_pitch);
+                const auto src_row = std::span<const uint8_t>(src_y + static_cast<size_t>(row) * src_stride_bytes,
+                                                              std::min(packed_row_bytes, static_cast<size_t>(src_stride_bytes)));
+                unpackPacked10RowLE(src_row, dst_row, width);
+            }
+            for (uint32_t row = 0; row < height / 2; ++row) {
+                auto* dst_row = reinterpret_cast<uint16_t*>(dst_uv + static_cast<size_t>(row) * dst_pitch);
+                const auto src_row = std::span<const uint8_t>(src_uv + static_cast<size_t>(row) * src_stride_bytes,
+                                                              std::min(packed_row_bytes, static_cast<size_t>(src_stride_bytes)));
+                unpackPacked10RowLE(src_row, dst_row, width);
+            }
+            return true;
+        }
+
+        // 8-bit MPP output published on a 10-bit VA surface: widen to P010.
+        for (uint32_t row = 0; row < height; ++row) {
+            auto* dst_row = reinterpret_cast<uint16_t*>(dst_y + static_cast<size_t>(row) * dst_pitch);
+            const uint8_t* src_row = src_y + static_cast<size_t>(row) * src_stride_bytes;
+            for (uint32_t col = 0; col < width; ++col) {
+                dst_row[col] = static_cast<uint16_t>(src_row[col]) << 8;
+            }
+        }
+        for (uint32_t row = 0; row < height / 2; ++row) {
+            auto* dst_row = reinterpret_cast<uint16_t*>(dst_uv + static_cast<size_t>(row) * dst_pitch);
+            const uint8_t* src_row = src_uv + static_cast<size_t>(row) * src_stride_bytes;
+            for (uint32_t col = 0; col < width; ++col) {
+                dst_row[col] = static_cast<uint16_t>(src_row[col]) << 8;
+            }
+        }
+        return true;
+    }
+
+    if (src_is_10bit) {
+        return false;
+    }
 
     for (uint32_t row = 0; row < height; ++row) {
         std::memcpy(dst_y + static_cast<size_t>(row) * dst_pitch,
@@ -236,7 +283,8 @@ bool MppDecoder::initialize(CodecProfile profile, int width, int height, int drm
     if (session_initialized_) return true;
 
     stable_export_enabled_ = envEnabled("ROCKCHIP_VAAPI_STABLE_EXPORT") ||
-                             (profile == CodecProfile::HEVC && !envEnabled("ROCKCHIP_VAAPI_DISABLE_STABLE_EXPORT"));
+                             ((profile == CodecProfile::HEVC || profile == CodecProfile::AV1) &&
+                              !envEnabled("ROCKCHIP_VAAPI_DISABLE_STABLE_EXPORT"));
 
     struct stat stat_buf = {};
     if (drm_fd < 0 || fstat(drm_fd, &stat_buf) != 0 || !S_ISCHR(stat_buf.st_mode) || major(stat_buf.st_rdev) != 226 || minor(stat_buf.st_rdev) < 128) {
@@ -383,8 +431,12 @@ bool MppDecoder::getSurfaceDebugInfo(VASurfaceID id,
 }
 
 std::string MppDecoder::getPendingQueueSummary(VASurfaceID focus_surface) {
-    std::ostringstream stream;
     std::lock_guard<std::mutex> lock(pending_mutex_);
+    return buildPendingQueueSummaryLocked(focus_surface);
+}
+
+std::string MppDecoder::buildPendingQueueSummaryLocked(VASurfaceID focus_surface) const {
+    std::ostringstream stream;
 
     size_t focus_matches = 0;
     uint64_t focus_latest_job_id = 0;
@@ -1398,7 +1450,7 @@ void MppDecoder::outputThreadMain(std::stop_token st) {
                             util::log(util::stderr_sink, util::LogLevel::Warn,
                                       "mpp: orphan frame pts={} has no pending surface match {}",
                                       static_cast<long long>(frame_pts),
-                                      getPendingQueueSummary());
+                                      buildPendingQueueSummaryLocked(VA_INVALID_ID));
                         }
                     }
                 }
@@ -1413,7 +1465,7 @@ void MppDecoder::outputThreadMain(std::stop_token st) {
                               "mpp: outputThread fallback-mapped frame pts={} to oldest pending surface={} {}",
                               static_cast<long long>(frame_pts),
                               surface_id,
-                              getPendingQueueSummary(surface_id));
+                              buildPendingQueueSummaryLocked(surface_id));
                 }
             }
         }
@@ -1467,10 +1519,13 @@ void MppDecoder::outputThreadMain(std::stop_token st) {
                                                             output_height,
                                                             src_stride_bytes,
                                                             src_ver_stride,
-                                                            frame_ptr);
+                                                            frame_ptr,
+                                                            it->second.surface.is_10bit,
+                                                            MPP_FRAME_FMT_IS_YUV_10BIT(frame_fmt) != 0);
                         if (export_ok) {
                             it->second.surface.dmabuf_fd = it->second.dmabuf.get();
-                            published_stride = it->second.export_pitch;
+                            published_stride = it->second.export_pitch /
+                                               (it->second.surface.is_10bit ? 2u : 1u);
                         }
 
                         static std::atomic<int> stable_copy_log_count{0};
@@ -1517,7 +1572,7 @@ void MppDecoder::outputThreadMain(std::stop_token st) {
                     it->second.surface.height = output_height;
                     it->second.surface.stride = published_stride;
                     it->second.surface.vertical_stride = stable_export_enabled_
-                                                             ? output_height
+                                                             ? (it->second.surface.is_10bit ? alignUp(output_height, 8) : output_height)
                                                              : (src_ver_stride ? src_ver_stride : output_height);
                     it->second.in_flight.store(false);
                     it->second.failed.store(false);

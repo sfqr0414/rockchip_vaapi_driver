@@ -109,6 +109,7 @@ class MppDecoder {
     void outputThreadMain(std::stop_token st);
     void setSurfaceState(VASurfaceID surface, bool ready, bool failed);
     std::vector<VASurfaceID> failPendingSurfaces(VASurfaceID preferred_surface = VA_INVALID_ID);
+    std::string buildPendingQueueSummaryLocked(VASurfaceID focus_surface) const;
     static const char* discardOutputReasonName(DiscardOutputReason reason);
     void markDiscardOutputJobLocked(uint64_t job_id,
                                     DiscardOutputReason reason,
