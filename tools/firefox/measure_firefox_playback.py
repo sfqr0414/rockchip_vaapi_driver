@@ -160,6 +160,28 @@ def read_status_lines(status_file: Path):
     return lines
 
 
+
+def process_group_cpu_seconds(pgid: int) -> float:
+    """Sum CPU time of the Firefox process group without waiting for exit."""
+    ticks = os.sysconf("SC_CLK_TCK")
+    total = 0
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            stat = (entry / "stat").read_text(encoding="utf-8", errors="ignore")
+            end = stat.rfind(")")
+            if end < 0:
+                continue
+            fields = stat[end + 2:].split()
+            if len(fields) < 13 or int(fields[2]) != pgid:
+                continue
+            total += int(fields[11]) + int(fields[12])
+        except (OSError, ValueError):
+            continue
+    return total / ticks
+
+
 def display_snapshot():
     """Record the compositor output so dropped-frame reports can be attributed."""
     snapshot = {
@@ -342,6 +364,7 @@ def main() -> int:
             time.sleep(0.2)
 
         summary = compute_summary(samples)
+        summary["browser_cpu_seconds"] = round(process_group_cpu_seconds(process.pid), 2)
         summary["display"] = display_snapshot()
         interrupt_info = interrupt_sampler.stop()
         summary.update(
