@@ -120,6 +120,9 @@ def clear_harness_processes() -> None:
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+    # Give the previous Firefox/RDD/GPU process group time to release the
+    # DRM device and Wayland surfaces before the next decoder starts.
+    time.sleep(2.0)
 
 
 def read_status_lines(status_file: Path):

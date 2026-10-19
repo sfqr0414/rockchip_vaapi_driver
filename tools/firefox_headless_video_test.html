@@ -349,7 +349,12 @@
       }
     }
 
-    video.src = sourceUrl;
+    // Let the GPU/RDD process publish gfxVars before the first decoder is
+    // created. Starting immediately can make Firefox cache HEVC as "no HW".
+    setTimeout(() => {
+      video.src = sourceUrl;
+      ensurePlayback();
+    }, 5000);
 
     [
       'loadstart',
@@ -397,7 +402,6 @@
     setInterval(maybeTriggerSeek, 100);
     setInterval(refreshDecodeTelemetry, 500);
     refreshDecodeTelemetry();
-    ensurePlayback();
   </script>
 </body>
 </html>
