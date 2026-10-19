@@ -3,7 +3,15 @@
 set -euo pipefail
 
 repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-build_dir=${ROCKCHIP_VAAPI_BUILD_DIR:-$repo_dir/build}
+if [[ -n "${ROCKCHIP_VAAPI_BUILD_DIR:-}" ]]; then
+	build_dir=$ROCKCHIP_VAAPI_BUILD_DIR
+elif [[ -f "$repo_dir/build-work/rockchip_drv_video.so" ]]; then
+	# Prefer the writable development build.  The historical build/ directory
+	# can be root-owned and then silently keeps an old driver.
+	build_dir=$repo_dir/build-work
+else
+	build_dir=$repo_dir/build
+fi
 profile_dir=${ROCKCHIP_FIREFOX_PROFILE_DIR:-$HOME/.config/rockchip-firefox-hwdecode-profile}
 
 pick_drm_device() {
