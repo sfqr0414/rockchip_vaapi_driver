@@ -12,6 +12,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+from urllib.parse import quote
 
 try:
     from selenium import webdriver
@@ -167,7 +168,10 @@ def main():
     env.setdefault("LIBVA_DRM_DEVICE", env["MOZ_DRM_DEVICE"])
 
     server, _ = start_http_server(repo_dir)
-    url = f"http://127.0.0.1:{server.server_address[1]}/tools/firefox/firefox_headless_video_test.html"
+    url = (
+        f"http://127.0.0.1:{server.server_address[1]}/tools/firefox/"
+        f"firefox_headless_video_test.html?video={quote(args.video)}"
+    )
 
     service = Service(executable_path=geckodriver_path, log_output=subprocess.DEVNULL, env=env)
     options = build_options(args, profile_dir)
@@ -175,12 +179,21 @@ def main():
     try:
         driver = webdriver.Firefox(service=service, options=options)
         driver.get(url)
+        # The page delays assigning video.src until Firefox has published its
+        # gfxVars.  Waiting here keeps the benchmark from sampling an empty
+        # element and reporting a false zero-frame result.
+        ready_deadline = time.monotonic() + 12.0
+        while time.monotonic() < ready_deadline:
+            state = driver.execute_script(
+                "const v=document.getElementById('sample');"
+                "return {ready:v.readyState, error:v.error && v.error.code};")
+            if state["ready"] >= 2 or state["error"]:
+                break
+            time.sleep(0.25)
         driver.execute_script(
-            "document.getElementById('sample').src = arguments[0]; return true;",
-            f"http://127.0.0.1:{server.server_address[1]}/{args.video}",
-        )
-        driver.execute_script("return document.getElementById('sample').play();")
-        time.sleep(1.0)
+            "const v=document.getElementById('sample');"
+            "const p=v.play(); if (p) p.catch(() => {}); return true;")
+        time.sleep(0.5)
         samples = collect_samples(driver, args.duration, args.interval)
         print(json.dumps(summarize(samples), indent=2))
     finally:
