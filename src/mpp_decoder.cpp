@@ -8,6 +8,7 @@ extern "C" {
 
 #include <drm/drm.h>
 #include <drm/drm_mode.h>
+#include <linux/dma-buf.h>
 #include <xf86drm.h>
 }
 
@@ -134,7 +135,8 @@ bool createStableExportBuffer(MppDecoder::SurfaceInfo& surface_info,
                               int drm_fd,
                               uint32_t width,
                               uint32_t height,
-                              bool is_10bit) {
+                              bool is_10bit,
+                              bool cacheable = false) {
     if (drm_fd < 0) {
         return false;
     }
@@ -145,6 +147,10 @@ bool createStableExportBuffer(MppDecoder::SurfaceInfo& surface_info,
     create.width = alignUp(width, 64);
     create.height = aligned_height + uv_height;
     create.bpp = is_10bit ? 16 : 8;
+    // Rockchip DRM dumb buffers are uncached by default.  The external P010
+    // pool is read and written by the CPU after the VPU writes it, so request
+    // cacheable memory and bracket the in-place expansion with DMA-BUF syncs.
+    if (cacheable) create.flags = 1u << 1;
     if (drmIoctl(drm_fd, DRM_IOCTL_MODE_CREATE_DUMB, &create) != 0) {
         return false;
     }
@@ -286,11 +292,208 @@ bool copyFrameToStableExport(void* dst_map,
     return true;
 }
 
+void unpackPacked10RowReverse(const uint8_t* src, uint16_t* dst, uint32_t sample_count) {
+    uint32_t full = sample_count & ~3u;
+    for (uint32_t sample = full; sample >= 4; sample -= 4) {
+        const uint32_t base = sample - 4;
+        const size_t src_index = static_cast<size_t>(base / 4) * 5;
+        std::uint64_t packed = 0;
+        std::memcpy(&packed, src + src_index, 5);
+        dst[base] = static_cast<uint16_t>((packed & 0x3FFu) << 6);
+        dst[base + 1] = static_cast<uint16_t>(((packed >> 10) & 0x3FFu) << 6);
+        dst[base + 2] = static_cast<uint16_t>(((packed >> 20) & 0x3FFu) << 6);
+        dst[base + 3] = static_cast<uint16_t>(((packed >> 30) & 0x3FFu) << 6);
+    }
+    for (uint32_t sample = sample_count; sample > full; --sample) {
+        const uint32_t index = sample - 1;
+        const size_t byte_index = (static_cast<size_t>(index) * 10) / 8;
+        const uint8_t bit_offset = static_cast<uint8_t>((index * 2) & 7u);
+        const uint16_t packed = static_cast<uint16_t>((src[byte_index] >> bit_offset) |
+                                                       (src[byte_index + 1] << (8 - bit_offset)));
+        dst[index] = static_cast<uint16_t>((packed & 0x03FFu) << 6);
+    }
+}
+
+// The in-place expansion is intentionally single-threaded because its P010
+// destination overlaps the packed source.  Copy the packed frame to a small
+// reusable scratch area first when parallelism is more valuable than avoiding
+// that one CPU-side read: the output is still the same imported DMA-BUF.
+bool expandPacked10FromScratch(const uint8_t* src_base,
+                               uint32_t src_stride_bytes,
+                               uint32_t src_ver_stride,
+                               std::vector<uint8_t>& scratch,
+                               uint8_t* dst_map,
+                               uint32_t dst_pitch,
+                               uint32_t width,
+                               uint32_t height) {
+    const size_t packed_size = static_cast<size_t>(src_stride_bytes) * src_ver_stride;
+    if (!src_base || !dst_map || !packed_size) return false;
+    try {
+        scratch.resize(packed_size);
+    } catch (const std::bad_alloc&) {
+        return false;
+    }
+    std::memcpy(scratch.data(), src_base, packed_size);
+    return copyFrameToStableExport(dst_map, dst_pitch, width, height,
+                                   src_stride_bytes, src_ver_stride,
+                                   scratch.data(), true, true);
+}
+
+// Expand Rockchip packed 10-bit to P010 inside a single DMA-BUF.  The P010
+// layout is larger than the packed layout, so process UV first and both planes
+// bottom-up; every write then lands only on already-consumed source rows.
+bool syncDmaBuf(int fd, uint64_t flags) {
+    if (fd < 0) return false;
+    dma_buf_sync sync = {};
+    sync.flags = flags;
+    return ::ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync) == 0;
+}
+
+bool expandPacked10InPlace(uint8_t* base,
+                           uint32_t pitch,
+                           uint32_t width,
+                           uint32_t height,
+                           uint32_t src_stride_bytes,
+                           uint32_t src_ver_stride) {
+    if (!base || !pitch || !width || !height || !src_stride_bytes || !src_ver_stride) {
+        return false;
+    }
+    const uint32_t aligned_height = alignUp(height, 8);
+    uint8_t* src_uv = base + static_cast<size_t>(src_stride_bytes) * src_ver_stride;
+    uint8_t* dst_uv = base + static_cast<size_t>(pitch) * aligned_height;
+
+    for (uint32_t row = height / 2; row > 0; --row) {
+        const uint32_t plane_row = row - 1;
+        unpackPacked10RowReverse(src_uv + static_cast<size_t>(plane_row) * src_stride_bytes,
+                                 reinterpret_cast<uint16_t*>(dst_uv + static_cast<size_t>(plane_row) * pitch),
+                                 width);
+    }
+    for (uint32_t row = height; row > 0; --row) {
+        const uint32_t plane_row = row - 1;
+        unpackPacked10RowReverse(base + static_cast<size_t>(plane_row) * src_stride_bytes,
+                                 reinterpret_cast<uint16_t*>(base + static_cast<size_t>(plane_row) * pitch),
+                                 width);
+    }
+    return true;
+}
+
 }  // namespace
 
 MppDecoder::MppDecoder() { mpp_set_log_level(MPP_LOG_ERROR); }
 
 MppDecoder::~MppDecoder() { shutdown(); }
+
+bool MppDecoder::setupExternalP010Buffers(int drm_fd, uint32_t width, uint32_t height) {
+    if (profile_ != CodecProfile::AV1 || !av1ExportAs10BitEnabled() ||
+        !envEnabled("ROCKCHIP_VAAPI_EXTERNAL_P010")) {
+        return false;
+    }
+
+    destroyExternalP010Buffers();
+    if (!export_drm_fd_) {
+        auto export_fd = openStableExportDrmFd();
+        if (export_fd) {
+            export_drm_fd_ = std::move(*export_fd);
+        }
+    }
+    drm_fd_ = export_drm_fd_.get();
+    if (drm_fd_ < 0) {
+        drm_fd_ = drm_fd;
+    }
+    MppBufferGroup group = nullptr;
+    if (mpp_buffer_group_get_external(&group, MPP_BUFFER_TYPE_DRM) != MPP_OK || !group) {
+        util::log(util::stderr_sink, util::LogLevel::Warn,
+                  "mpp: external P010 buffer group creation failed");
+        return false;
+    }
+
+    constexpr uint32_t kExternalBufferCount = 20;
+    external_p010_buffers_.reserve(kExternalBufferCount);
+    for (uint32_t index = 0; index < kExternalBufferCount; ++index) {
+        MppDecoder::SurfaceInfo temporary;
+        if (!createStableExportBuffer(temporary, drm_fd_, width, height, true, true)) {
+            util::log(util::stderr_sink, util::LogLevel::Warn,
+                      "mpp: external P010 buffer {} allocation failed", index);
+            break;
+        }
+
+        MppBufferInfo info = {};
+        info.type = MPP_BUFFER_TYPE_DRM;
+        info.size = temporary.export_size;
+        info.fd = temporary.dmabuf.get();
+        info.index = static_cast<int>(index);
+        if (mpp_buffer_commit(group, &info) != MPP_OK) {
+            destroyStableExportBuffer(temporary, drm_fd_);
+            util::log(util::stderr_sink, util::LogLevel::Warn,
+                      "mpp: external P010 buffer {} import failed", index);
+            break;
+        }
+
+        ExternalP010Buffer buffer;
+        buffer.dmabuf = std::move(temporary.dmabuf);
+        buffer.map = temporary.export_map;
+        buffer.size = temporary.export_size;
+        buffer.pitch = temporary.export_pitch;
+        buffer.handle = temporary.export_handle;
+        temporary.export_map = nullptr;
+        temporary.export_size = 0;
+        temporary.export_pitch = 0;
+        temporary.export_handle = 0;
+        external_p010_buffers_.push_back(std::move(buffer));
+    }
+
+    if (external_p010_buffers_.size() != kExternalBufferCount) {
+        for (auto& buffer : external_p010_buffers_) {
+            if (buffer.map) munmap(buffer.map, buffer.size);
+            drm_mode_destroy_dumb destroy = {};
+            destroy.handle = buffer.handle;
+            if (drm_fd_ >= 0 && buffer.handle) {
+                drmIoctl(drm_fd_, DRM_IOCTL_MODE_DESTROY_DUMB, &destroy);
+            }
+        }
+        external_p010_buffers_.clear();
+        mpp_buffer_group_put(group);
+        return false;
+    }
+
+    group_ = group;
+    MppBufferGroup param = group_;
+    MppCtx ctx = session_->ctx();
+    MppApi* api = session_->api();
+    if (!api || api->control(ctx, MPP_DEC_SET_EXT_BUF_GROUP, param) != MPP_OK) {
+        util::log(util::stderr_sink, util::LogLevel::Warn,
+                  "mpp: MPP_DEC_SET_EXT_BUF_GROUP failed");
+        destroyExternalP010Buffers();
+        return false;
+    }
+
+    external_p010_enabled_ = true;
+    util::log(util::stderr_sink, util::LogLevel::Info,
+              "mpp: external P010 buffers active count={} width={} height={} pitch={}",
+              external_p010_buffers_.size(), width, height,
+              external_p010_buffers_.empty() ? 0 : external_p010_buffers_.front().pitch);
+    return true;
+}
+
+void MppDecoder::destroyExternalP010Buffers() {
+    external_p010_enabled_ = false;
+    if (group_) {
+        mpp_buffer_group_put(group_);
+        group_ = nullptr;
+    }
+    for (auto& buffer : external_p010_buffers_) {
+        if (buffer.map) {
+            munmap(buffer.map, buffer.size);
+            buffer.map = nullptr;
+        }
+        if (drm_fd_ >= 0 && buffer.handle) {
+            drm_mode_destroy_dumb destroy = {};
+            destroy.handle = buffer.handle;
+            drmIoctl(drm_fd_, DRM_IOCTL_MODE_DESTROY_DUMB, &destroy);
+        }
+    }
+    external_p010_buffers_.clear();
+}
 
 bool MppDecoder::initialize(CodecProfile profile, int width, int height, int drm_fd) {
     std::scoped_lock lock(init_mutex_);
@@ -355,6 +558,12 @@ bool MppDecoder::initialize(CodecProfile profile, int width, int height, int drm
 
     MppPollType nonblock = MPP_POLL_NON_BLOCK;
     api->control(ctx, MPP_SET_OUTPUT_TIMEOUT, &nonblock);
+
+    // Keep the decoder's 10-bit output in P010-sized imported DMA-BUFs.  This
+    // is opt-in until the external-group path has been validated against every
+    // AV1 seek/flush sequence.
+    setupExternalP010Buffers(drm_fd, static_cast<uint32_t>(width), static_cast<uint32_t>(height));
+
     session_initialized_ = true;
     return true;
 }
@@ -1268,6 +1477,8 @@ void MppDecoder::shutdown() {
         api->reset(session->ctx());
     }
 
+    destroyExternalP010Buffers();
+
     {
         std::scoped_lock lock(init_mutex_);
         session_.reset();
@@ -1645,7 +1856,53 @@ void MppDecoder::outputThreadMain(std::stop_token st) {
                 const bool use_stable_export = (stable_export_enabled_ ||
                                                 MPP_FRAME_FMT_IS_YUV_10BIT(frame_fmt) != 0) &&
                                                mpp_buf && output_width > 0 && output_height > 0 && !is_error;
-                if (use_stable_export) {
+                const bool use_external_p010 = external_p010_enabled_ &&
+                                               MPP_FRAME_FMT_IS_YUV_10BIT(frame_fmt) != 0 &&
+                                               mpp_buf && output_width > 0 && output_height > 0 && !is_error;
+                bool external_exported = false;
+                if (use_external_p010) {
+                    const int pool_index = mpp_buffer_get_index(mpp_buf);
+                    if (pool_index >= 0 &&
+                        static_cast<size_t>(pool_index) < external_p010_buffers_.size()) {
+                        auto& pool = external_p010_buffers_[static_cast<size_t>(pool_index)];
+                        const bool synced = syncDmaBuf(pool.dmabuf.get(),
+                                                       DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ |
+                                                           DMA_BUF_SYNC_WRITE);
+                        const bool use_scratch = envEnabled("ROCKCHIP_VAAPI_EXTERNAL_P010_SCRATCH");
+                        const bool convert_ok = pool.map &&
+                            (use_scratch
+                                 ? expandPacked10FromScratch(static_cast<const uint8_t*>(pool.map),
+                                                             src_stride_bytes, src_ver_stride,
+                                                             p010_expand_scratch_,
+                                                             static_cast<uint8_t*>(pool.map),
+                                                             pool.pitch, output_width, output_height)
+                                 : expandPacked10InPlace(static_cast<uint8_t*>(pool.map), pool.pitch,
+                                                         output_width, output_height,
+                                                         src_stride_bytes, src_ver_stride));
+                        if (synced) {
+                            syncDmaBuf(pool.dmabuf.get(),
+                                       DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ | DMA_BUF_SYNC_WRITE);
+                        }
+                        if (convert_ok) {
+                            const int output_fd = mpp_buffer_get_fd(mpp_buf);
+                            mpp_buffer_inc_ref(mpp_buf);
+                            it->second.buffer.reset(mpp_buf);
+                            it->second.dmabuf.reset(output_fd >= 0 ? dup(output_fd) : -1);
+                            it->second.surface.dmabuf_fd = it->second.dmabuf.get();
+                            published_stride = pool.pitch / 2u;
+                            export_ok = it->second.surface.dmabuf_fd >= 0;
+                            external_exported = export_ok;
+                            static std::atomic<int> external_log_count{0};
+                            if (external_log_count.fetch_add(1, std::memory_order_relaxed) < 4) {
+                                util::log(util::stderr_sink, util::LogLevel::Info,
+                                          "mpp: external P010 in-place surface={} pool={} fd={} pitch={} src_stride={}",
+                                          surface_id, pool_index, it->second.surface.dmabuf_fd,
+                                          pool.pitch, src_stride_bytes);
+                            }
+                        }
+                    }
+                }
+                if (!external_exported && use_stable_export) {
                     if (!it->second.export_map) {
                         if (!export_drm_fd_) {
                             auto export_fd = openStableExportDrmFd();

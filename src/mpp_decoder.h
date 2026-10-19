@@ -155,6 +155,24 @@ class MppDecoder {
     unique_fd export_drm_fd_;
     bool stable_export_enabled_ = false;
 
+    // AV1 10-bit MPP frames can be allocated directly in P010-sized DMA-BUFs.
+    // MPP writes its packed 10-bit layout into the front of each buffer and the
+    // export path expands it in place, so the VA surface and the MPP output
+    // remain the same DMA-BUF (no second frame allocation/copy).
+    struct ExternalP010Buffer {
+        unique_fd dmabuf;
+        void* map = nullptr;
+        size_t size = 0;
+        uint32_t pitch = 0;
+        uint32_t handle = 0;
+    };
+    bool setupExternalP010Buffers(int drm_fd, uint32_t width, uint32_t height);
+    void destroyExternalP010Buffers();
+    std::vector<ExternalP010Buffer> external_p010_buffers_;
+    std::vector<uint8_t> p010_expand_scratch_;
+    int drm_fd_ = -1;
+    bool external_p010_enabled_ = false;
+
     std::mutex surface_mutex_;
     std::mutex pending_mutex_;
     std::condition_variable_any pending_cv_;

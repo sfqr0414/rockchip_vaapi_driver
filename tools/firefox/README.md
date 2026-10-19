@@ -48,3 +48,23 @@ that conversion across up to four cores.  There is no extra full-frame
 memcpy: the conversion lands directly in the exported DMA-BUF that Firefox
 consumes.  Keeping P010 is required for correct colours and sharpness; the
 old NV12 fallback produced black/blurred AV1 output on the test stream.
+
+### Optional imported P010 buffers
+
+For experiments with a literal single-buffer AV1 path, set
+`ROCKCHIP_VAAPI_EXTERNAL_P010=1`.  The decoder then imports twenty P010-sized
+cacheable DMA-BUFs into an MPP external buffer group.  MPP writes its packed
+10-bit frame into the front of one imported buffer and the bridge expands it
+in place before exporting that same descriptor.  The result is bit-exact with
+software P010 (verified with `cmp`), and no second frame-sized DMA-BUF is
+allocated.
+
+The in-place expansion is serial because its P010 destination overlaps the
+packed source.  Set `ROCKCHIP_VAAPI_EXTERNAL_P010_SCRATCH=1` to copy the packed
+frame to a reusable scratch area and expand in parallel; this is faster but
+adds one CPU-side copy.  The imported path remains opt-in: on this board the
+external-group scheduling overhead makes it slower than the default direct MPP
+buffer export, so the default remains the faster path.
+
+The default AV1 10-bit path still uses MPP's packed output buffer and expands
+it directly into the exported DMA-BUF, with no extra full-frame DMA-BUF copy.
