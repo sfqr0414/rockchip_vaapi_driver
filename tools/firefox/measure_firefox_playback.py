@@ -113,9 +113,18 @@ class InterruptSampler:
 
 
 def clear_harness_processes() -> None:
-    # Kill the previous probe's whole process group first.  A surviving RDD
-    # child keeps the VA-API/DRM device busy; the next Firefox then silently
-    # falls back to software for AV1 even though vaInitialize succeeded.
+    # Kill the previous probe's whole process group and the HTTP server first.
+    # A surviving RDD child keeps the VA-API/DRM device busy, and a stale
+    # server can keep serving an old telemetry port/file; either one makes the
+    # next Firefox silently fall back to software despite vaInitialize success.
+    server_pid_file = Path("/tmp/rockchip-firefox-http-server/pid")
+    if server_pid_file.exists():
+        try:
+            server_pid = int(server_pid_file.read_text(encoding="utf-8").strip())
+            subprocess.run(["kill", "-TERM", str(server_pid)], check=False,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except (OSError, ValueError):
+            pass
     pid_file = Path("/tmp/rockchip-firefox-http-server/probe.pid")
     if pid_file.exists():
         try:
