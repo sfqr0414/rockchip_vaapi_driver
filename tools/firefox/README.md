@@ -44,9 +44,11 @@ AV1 10-bit is different.  The public MPP ABI emits Rockchip's packed
 `MPP_FMT_YUV420SP_10BIT` layout; it does not expose a P010 output mode on this
 SoC.  The bridge therefore expands packed 10-bit to P010 on the export path
 (bit-exact with the software decoder, verified by PSNR/cmp) and parallelizes
-that conversion across up to four cores.  There is no extra full-frame
-memcpy: the conversion lands directly in the exported DMA-BUF that Firefox
-consumes.  Keeping P010 is required for correct colours and sharpness; the
+that conversion across the available cores (capped at eight).  The export
+DMA-BUF is allocated cacheable and bracketed with `DMA_BUF_IOCTL_SYNC`, which
+removed the uncached-write stall that used to make 1080p AV1 10-bit slower
+than software decode.  There is no extra full-frame memcpy: the conversion
+lands directly in the exported DMA-BUF that Firefox consumes.  Keeping P010 is required for correct colours and sharpness; the
 old NV12 fallback produced black/blurred AV1 output on the test stream.
 
 ### Optional imported P010 buffers
@@ -68,3 +70,29 @@ buffer export, so the default remains the faster path.
 
 The default AV1 10-bit path still uses MPP's packed output buffer and expands
 it directly into the exported DMA-BUF, with no extra full-frame DMA-BUF copy.
+
+### RGA P010 on RK3588
+
+The RGA API exposes `RK_FORMAT_P010` (and `DRM_FORMAT_P010`) in librga
+1.10.6, but the RK3588 RGA3/RGA2 hardware on this board rejects it: the
+1.10.6 changelog recommends RGA driver 1.3.13 or newer (minimum 1.2.4), while
+the installed kernel driver is 1.3.7.  A minimal `imcvtcolor(..., P010)` probe
+returns `Unsupported function: dst unsupported this format, format =
+0x4000`, and a legacy/`imcopy` P010 probe fails in the RGA job submission
+(`rga: ... no core match` / `submit failed`).  The bridge therefore keeps the
+verified CPU expansion as the default and never claims a hardware RGA P010
+path that this kernel cannot execute.  Re-test the probe after upgrading the
+RGA kernel driver to 1.3.13+.
+
+### AV1 8-bit web streams and hidden frames
+
+Bilibili's AV1 player emits `show_frame=0` reference frames before displayable
+frames.  MPP decodes those frames but deliberately returns no displayable
+frame for them.  `vaSyncSurface` still runs for every VA surface, so treating
+the hidden surface as pending deadlocked after the first group of pictures
+(`completed_job=0`).  The bridge now completes hidden-frame syncs with a valid
+black export buffer, which satisfies FFmpeg's `vaExportSurfaceHandle` check
+without publishing a fake display frame; MPP keeps the real reference pixels
+internally.  Bit depth is selected from the VA surfaces created by the client,
+not from the AV1 profile: AV1 Profile0 is used for both 8-bit and 10-bit, and
+forcing 10-bit MPP output on an 8-bit stream also stalled.
