@@ -120,6 +120,13 @@ target_link_libraries(rockchip_drv_video PRIVATE
 target_link_libraries(rockchip_drv_video PRIVATE ${MPP_LIB})
 target_link_libraries(test_mpp_decode PRIVATE ${MPP_LIB})
 
+include(CTest)
+if(BUILD_TESTING)
+    add_test(NAME slice_framing COMMAND test_slice_framing)
+    add_test(NAME mpp_boundary
+        COMMAND bash ${CMAKE_SOURCE_DIR}/tools/check_mpp_boundary.sh ${CMAKE_SOURCE_DIR})
+endif()
+
 # Fail the build if anything in the bridge starts depending on MPP internals.
 add_custom_target(check-mpp-boundary
     COMMAND bash ${CMAKE_SOURCE_DIR}/tools/check_mpp_boundary.sh ${CMAKE_SOURCE_DIR}
