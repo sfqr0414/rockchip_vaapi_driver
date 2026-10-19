@@ -52,6 +52,7 @@ class MppDecoder {
         std::vector<uint8_t> bitstream;
         std::vector<uint8_t> extra_data;
         bool eos = false;
+        bool idr = false;
         bool discard_output = false;
         uint64_t job_id = 0;
     };
@@ -85,6 +86,10 @@ class MppDecoder {
     void releaseSurface(VASurfaceID surface);
     void destroySurface(VASurfaceID surface);
     void shutdown();
+    // Reset the MPP bitstream state while keeping allocated VA surfaces alive.
+    // FFmpeg's VA-API flush does not tear down the decoder; after a seek MPP
+    // can keep waiting for stale DPB references and never output the keyframe.
+    void flushStream();
 
    private:
     enum class DiscardOutputReason {

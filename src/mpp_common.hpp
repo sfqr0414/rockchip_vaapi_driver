@@ -390,18 +390,32 @@ inline constexpr size_t kMaxInFlightJobs = 64;
 inline void unpackPacked10RowLE(std::span<const uint8_t> src,
                                 uint16_t* dst,
                                 size_t sample_count) {
-    for (size_t sample = 0; sample < sample_count; ++sample) {
-        const size_t src_index = (sample * 10) / 8;
+    // Rockchip NV12_10BIT packs four 10-bit samples into five bytes. Decode
+    // four samples at a time; the scalar path handles the row remainder.
+    size_t sample = 0;
+    size_t src_index = 0;
+    for (; sample + 3 < sample_count && src_index + 5 <= src.size();
+         sample += 4, src_index += 5) {
+        const uint32_t b0 = src[src_index];
+        const uint32_t b1 = src[src_index + 1];
+        const uint32_t b2 = src[src_index + 2];
+        const uint32_t b3 = src[src_index + 3];
+        const uint32_t b4 = src[src_index + 4];
+        dst[sample] = static_cast<uint16_t>((b0 | ((b1 & 0x03u) << 8)) << 6);
+        dst[sample + 1] = static_cast<uint16_t>(((b1 >> 2) | ((b2 & 0x0Fu) << 6)) << 6);
+        dst[sample + 2] = static_cast<uint16_t>(((b2 >> 4) | ((b3 & 0x3Fu) << 4)) << 6);
+        dst[sample + 3] = static_cast<uint16_t>(((b3 >> 6) | (b4 << 2)) << 6);
+    }
+    for (; sample < sample_count; ++sample) {
+        const size_t index = (sample * 10) / 8;
         const uint8_t bit_offset = static_cast<uint8_t>((sample * 2) & 7u);
-        if (src_index + 1 >= src.size()) {
+        if (index + 1 >= src.size()) {
             dst[sample] = 0;
             continue;
         }
-
-        const uint16_t packed = static_cast<uint16_t>((src[src_index] >> bit_offset) |
-                                                       (src[src_index + 1] << (8 - bit_offset)));
-        const uint16_t value8 = static_cast<uint16_t>((packed & 0x03FFu) >> 2);
-        dst[sample] = static_cast<uint16_t>(value8 << 8);
+        const uint16_t packed = static_cast<uint16_t>((src[index] >> bit_offset) |
+                                                       (src[index + 1] << (8 - bit_offset)));
+        dst[sample] = static_cast<uint16_t>((packed & 0x03FFu) << 6);
     }
 }
 

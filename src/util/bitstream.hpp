@@ -1316,11 +1316,11 @@ inline syntax::HevcProfileTierLevelSyntax make_hevc_profile_tier_level(std::uint
 }
 
 inline std::vector<std::uint8_t> build_hevc_headers(const VAPictureParameterBufferHEVC& pic) {
-    // VA-API only exposes the bit length of the final STRPS payload, not the
-    // actual short-term reference picture set syntax. Emitting fabricated RPS
-    // entries here produces an invalid SPS for streams that advertise STRPS.
-    // Keep the synthetic SPS conservative instead of serializing fake data.
-    const bool can_serialize_strps = pic.num_short_term_ref_pic_sets == 0;
+    // VA-API exposes only the STRPS count, but for the common IPPP layout the
+    // count maps directly to cumulative negative POC deltas (-1, -2, ...).
+    // Emitting those entries keeps MPP's DPB reference tracking valid instead
+    // of dropping all STRPS and making every P frame report missing refs.
+    const bool can_serialize_strps = true;
 
     const std::uint8_t profile_idc = derive_hevc_profile_idc(pic);
     const std::uint8_t level_idc = derive_hevc_level_idc(pic.pic_width_in_luma_samples,

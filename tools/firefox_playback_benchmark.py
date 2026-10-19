@@ -13,9 +13,14 @@ import threading
 import time
 from pathlib import Path
 
-from selenium import webdriver
-from selenium.webdriver.firefox.options import Options
-from selenium.webdriver.firefox.service import Service
+try:
+    from selenium import webdriver
+    from selenium.webdriver.firefox.options import Options
+    from selenium.webdriver.firefox.service import Service
+except ImportError:  # pragma: no cover - minimal images often lack selenium
+    webdriver = None
+    Options = None
+    Service = None
 
 
 class QuietHandler(http.server.SimpleHTTPRequestHandler):
@@ -126,6 +131,31 @@ def main():
     args = parser.parse_args()
 
     repo_dir = Path(__file__).resolve().parents[1]
+    if webdriver is None:
+        # Selenium is not installed on this image; fall back to the shared
+        # Firefox harness, which drives the same test page and reports the same
+        # decoded/dropped/interrupt counters without a WebDriver dependency.
+        import sys
+        summary = tempfile.NamedTemporaryFile(prefix="rockchip-firefox-bench.", suffix=".json", delete=False)
+        summary.close()
+        try:
+            cmd = [
+                sys.executable,
+                str(repo_dir / "tools" / "measure_firefox_playback.py"),
+                "--video", args.video,
+                "--mode", "hw" if args.hwdecode else "sw",
+                "--duration", str(args.duration),
+                "--summary-file", summary.name,
+            ]
+            result = subprocess.run(cmd, cwd=repo_dir, check=False)
+            if result.returncode == 0:
+                print(Path(summary.name).read_text(encoding="utf-8"))
+            else:
+                raise SystemExit(result.returncode)
+        finally:
+            Path(summary.name).unlink(missing_ok=True)
+        return
+
     profile_dir = Path(tempfile.mkdtemp(prefix="rockchip-firefox-bench."))
     geckodriver_path = ensure_driver_binary()
     env = os.environ.copy()

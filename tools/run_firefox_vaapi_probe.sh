@@ -31,8 +31,12 @@ pick_drm_device() {
 drm_device=$(pick_drm_device)
 vaapi_enabled=${FIREFOX_VAAPI_ENABLED:-true}
 force_zero_copy=${FIREFOX_VAAPI_FORCE_ZERO_COPY:-true}
+case "$force_zero_copy" in
+	1|true|yes|on) force_zero_copy=1 ;;
+	*) force_zero_copy=0 ;;
+esac
 hwdecode_enabled=${FIREFOX_HWDECODE_ENABLED:-true}
-test_video=${FIREFOX_TEST_VIDEO:-Test Jellyfin 1080p AVC 20M.mp4}
+test_video=${FIREFOX_TEST_VIDEO:-videos/Test Jellyfin 1080p AVC 20M.mp4}
 seek_at=${FIREFOX_TEST_SEEK_AT:-}
 seek_to=${FIREFOX_TEST_SEEK_TO:-}
 
@@ -125,6 +129,7 @@ if [[ -n "$seek_to" ]]; then
 fi
 
 cat >"$profile_dir/user.js" <<'EOF'
+user_pref("media.ffmpeg.enabled", true);
 user_pref("media.ffmpeg.vaapi.enabled", __VAAPI_ENABLED__);
 user_pref("media.ffmpeg.vaapi.force-surface-zero-copy", __FORCE_ZERO_COPY__);
 user_pref("media.ffmpeg.dmabuf-textures.enabled", true);

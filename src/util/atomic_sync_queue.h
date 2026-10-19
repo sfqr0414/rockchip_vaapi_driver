@@ -70,6 +70,33 @@ namespace util {
         AtomicSyncQueue(const AtomicSyncQueue&) = delete;
         AtomicSyncQueue& operator=(const AtomicSyncQueue&) = delete;
 
+        // Re-arm a queue after shutdown()/join. The caller must guarantee that
+        // no producer or consumer is still running.
+        void reset() noexcept {
+            uint64_t h = head_.load(std::memory_order_acquire);
+            uint64_t t = tail_.load(std::memory_order_acquire);
+            while (h != t) {
+                uint32_t lap = uint32_t(h >> 32);
+                uint32_t idx = uint32_t(h);
+                Slot& slot = buffer_[idx];
+                if (slot.turn.load(std::memory_order_acquire) == lap * 2 + 1) {
+                    T* ptr = std::launder(reinterpret_cast<T*>(slot.data));
+                    std::destroy_at(ptr);
+                }
+                if (++idx == Capacity) {
+                    idx = 0;
+                    ++lap;
+                }
+                h = (static_cast<uint64_t>(lap) << 32) | idx;
+            }
+            for (size_t i = 0; i < Capacity; ++i) {
+                buffer_[i].turn.store(0, std::memory_order_relaxed);
+            }
+            head_.store(0, std::memory_order_relaxed);
+            tail_.store(0, std::memory_order_relaxed);
+            shutdown_.store(false, std::memory_order_release);
+        }
+
         void shutdown() noexcept {
             bool expected = false;
             if (shutdown_.compare_exchange_strong(expected, true, std::memory_order_release, std::memory_order_relaxed)) {

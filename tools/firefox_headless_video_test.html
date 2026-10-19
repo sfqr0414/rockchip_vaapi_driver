@@ -93,8 +93,10 @@
     const restartButton = document.getElementById('restart');
     const params = new URLSearchParams(window.location.search);
     const requestedVideo = params.get('video');
-    const videoPath = requestedVideo ? `../videos/${requestedVideo}` : '../videos/Test Jellyfin 1080p AVC 20M.mp4';
-    const sourceUrl = new URL(videoPath, window.location.href).href;
+    const videoPath = requestedVideo || 'videos/Test Jellyfin 1080p AVC 20M.mp4';
+    // The test page is served from /tools/, while --video paths are relative
+    // to the HTTP server root (the repository directory).
+    const sourceUrl = new URL(videoPath.replace(/^\/+/, ''), window.location.origin + '/').href;
     const seekAtParam = params.get('seekAt');
     const seekToParam = params.get('seekTo');
     const restartOnEndedParam = params.get('restartOnEnded');
@@ -114,6 +116,90 @@
     let lastPostedAt = 0;
     let seekTriggered = false;
     let seekCompleted = false;
+    let presentedVideoFrames = 0;
+    let lastPresentedAt = null;
+    const pictureCanvas = document.createElement('canvas');
+    pictureCanvas.width = 320;
+    pictureCanvas.height = 180;
+    const pictureContext = pictureCanvas.getContext('2d', { willReadFrequently: true });
+    const pictureSample = {
+      samples: 0,
+      meanLuma: null,
+      meanRed: null,
+      meanGreen: null,
+      meanBlue: null,
+      nonBlackRatio: null,
+      sharpness: null,
+      hash: null,
+    };
+
+    function samplePresentedPicture() {
+      if (!pictureContext || video.videoWidth === 0 || video.videoHeight === 0) {
+        return;
+      }
+      try {
+        pictureContext.drawImage(video, 0, 0, pictureCanvas.width, pictureCanvas.height);
+        const pixels = pictureContext.getImageData(0, 0, pictureCanvas.width, pictureCanvas.height).data;
+        let lumaSum = 0;
+        let redSum = 0;
+        let greenSum = 0;
+        let blueSum = 0;
+        let nonBlack = 0;
+        let hash = 2166136261;
+        for (let index = 0; index < pixels.length; index += 4) {
+          const luma = (pixels[index] * 77 + pixels[index + 1] * 150 + pixels[index + 2] * 29) >> 8;
+          lumaSum += luma;
+          redSum += pixels[index];
+          greenSum += pixels[index + 1];
+          blueSum += pixels[index + 2];
+          if (luma > 16) {
+            nonBlack++;
+          }
+          hash ^= luma;
+          hash = Math.imul(hash, 16777619);
+        }
+        const pixelCount = pictureCanvas.width * pictureCanvas.height;
+        let gradientSum = 0;
+        for (let y = 0; y < pictureCanvas.height; ++y) {
+          for (let x = 0; x < pictureCanvas.width; ++x) {
+            const index = (y * pictureCanvas.width + x) * 4;
+            const luma = (pixels[index] * 77 + pixels[index + 1] * 150 + pixels[index + 2] * 29) >> 8;
+            if (x + 1 < pictureCanvas.width) {
+              const right = (pixels[index + 4] * 77 + pixels[index + 5] * 150 + pixels[index + 6] * 29) >> 8;
+              gradientSum += Math.abs(luma - right);
+            }
+            if (y + 1 < pictureCanvas.height) {
+              const belowIndex = index + pictureCanvas.width * 4;
+              const below = (pixels[belowIndex] * 77 + pixels[belowIndex + 1] * 150 + pixels[belowIndex + 2] * 29) >> 8;
+              gradientSum += Math.abs(luma - below);
+            }
+          }
+        }
+        pictureSample.samples++;
+        pictureSample.meanLuma = Number((lumaSum / pixelCount).toFixed(3));
+        pictureSample.meanRed = Number((redSum / pixelCount).toFixed(3));
+        pictureSample.meanGreen = Number((greenSum / pixelCount).toFixed(3));
+        pictureSample.meanBlue = Number((blueSum / pixelCount).toFixed(3));
+        pictureSample.nonBlackRatio = Number((nonBlack / pixelCount).toFixed(4));
+        pictureSample.sharpness = Number((gradientSum / pixelCount).toFixed(3));
+        pictureSample.hash = hash >>> 0;
+      } catch {
+      }
+    }
+
+    function countPresentedFrame(now, metadata) {
+      presentedVideoFrames++;
+      lastPresentedAt = now;
+      if (presentedVideoFrames === 1 || presentedVideoFrames % 15 === 0) {
+        samplePresentedPicture();
+      }
+      if (video.requestVideoFrameCallback) {
+        video.requestVideoFrameCallback(countPresentedFrame);
+      }
+    }
+    if (video.requestVideoFrameCallback) {
+      video.requestVideoFrameCallback(countPresentedFrame);
+    }
 
     async function postStatus(payload) {
       try {
@@ -147,6 +233,13 @@
         `duration: ${Number.isFinite(video.duration) ? video.duration.toFixed(3) : 'n/a'}`,
         `resolution: ${video.videoWidth}x${video.videoHeight}`,
         `decodedVideoFrames: ${decoded}`,
+        `presentedVideoFrames: ${presentedVideoFrames}`,
+        `pictureSamples: ${pictureSample.samples}`,
+        `pictureMeanLuma: ${pictureSample.meanLuma === null ? 'n/a' : pictureSample.meanLuma}`,
+        `pictureMeanRGB: ${pictureSample.meanRed === null ? 'n/a' : `${pictureSample.meanRed}/${pictureSample.meanGreen}/${pictureSample.meanBlue}`}`,
+        `pictureNonBlackRatio: ${pictureSample.nonBlackRatio === null ? 'n/a' : pictureSample.nonBlackRatio}`,
+        `pictureSharpness: ${pictureSample.sharpness === null ? 'n/a' : pictureSample.sharpness}`,
+        `pictureHash: ${pictureSample.hash === null ? 'n/a' : pictureSample.hash}`,
         `droppedVideoFrames: ${dropped}`,
         `totalFrameDelay: ${frameDelay}`,
         `seekEnabled: ${seekEnabled}`,
@@ -179,6 +272,15 @@
           videoWidth: video.videoWidth,
           videoHeight: video.videoHeight,
           decodedVideoFrames: quality ? quality.totalVideoFrames : null,
+          presentedVideoFrames,
+          pictureSamples: pictureSample.samples,
+          pictureMeanLuma: pictureSample.meanLuma,
+          pictureMeanRed: pictureSample.meanRed,
+          pictureMeanGreen: pictureSample.meanGreen,
+          pictureMeanBlue: pictureSample.meanBlue,
+          pictureNonBlackRatio: pictureSample.nonBlackRatio,
+          pictureSharpness: pictureSample.sharpness,
+          pictureHash: pictureSample.hash,
           droppedVideoFrames: quality ? quality.droppedVideoFrames : null,
           totalFrameDelay: quality && typeof quality.totalFrameDelay === 'number'
             ? Number(quality.totalFrameDelay.toFixed(3))

@@ -58,17 +58,15 @@ bool envDisabledLocal(const char* name) {
     return std::strcmp(value, "0") == 0 || std::strcmp(value, "false") == 0 || std::strcmp(value, "no") == 0;
 }
 
-bool av1ExportAs10BitEnabled() {
-    return !envDisabledLocal("ROCKCHIP_VAAPI_AV1_EXPORT_P010");
-}
-
 bool av1CorrectionEnabled() {
     return envEnabledLocal("ROCKCHIP_VAAPI_AV1_CORRECTION");
 }
 
 bool startupPrimingDisabled() {
-    // Hidden diagnostic escape hatch; the default path keeps startup priming enabled.
-    return envEnabledLocal("ROCKCHIP_VAAPI_DISABLE_STARTUP_PRIMING");
+    // Startup priming duplicates frames into scratch surfaces and confuses
+    // Firefox's surface pool; keep it off by default. It can still be enabled
+    // explicitly for diagnostic runs on streams that need a warm-up picture.
+    return !envEnabledLocal("ROCKCHIP_VAAPI_ENABLE_STARTUP_PRIMING");
 }
 
 bool h264NonRefFastDrainEnabled() {
@@ -1741,19 +1739,26 @@ static VAStatus vaQuerySurfaceAttributes(VADriverContextP ctx,
     if (!d) return VA_STATUS_ERROR_INVALID_CONTEXT;
     std::lock_guard<std::mutex> lock(d->lock);
     uint32_t config_rt_format = VA_RT_FORMAT_YUV420;
+    VAProfile config_profile = VAProfileNone;
     if (config_id != VA_INVALID_ID) {
         auto config_it = d->configs.find(config_id);
         if (config_it == d->configs.end()) return VA_STATUS_ERROR_INVALID_CONFIG;
         config_rt_format = config_it->second.rt_format;
+        config_profile = config_it->second.profile;
     }
 
-    const bool uses_10bit_output = rtFormatRequires10BitSurface(config_rt_format);
     static uint64_t linear_modifier = DRM_FORMAT_MOD_LINEAR;
     static VADRMFormatModifierList linear_modifier_list = {
         .num_modifiers = 1,
         .modifiers = &linear_modifier,
     };
-    constexpr unsigned int kSupportedCount = 3;
+    // AV1 Profile0 covers 8-bit and 10-bit streams; expose P010 as well so
+    // FFmpeg creates a real 10-bit surface for the 10-bit test file. MPP
+    // emits Rockchip packed 10-bit and the decoder converts it to P010.
+    const bool expose_p010 = config_profile == VAProfileAV1Profile0 ||
+                             config_profile == VAProfileHEVCMain10;
+    const unsigned int pixel_format_count = expose_p010 ? 2u : 1u;
+    const unsigned int kSupportedCount = 2u + pixel_format_count;
     if (!attrib_list) {
         *num_attribs = kSupportedCount;
         return VA_STATUS_SUCCESS;
@@ -1764,23 +1769,33 @@ static VAStatus vaQuerySurfaceAttributes(VADriverContextP ctx,
         return VA_STATUS_ERROR_MAX_NUM_EXCEEDED;
     }
 
-    attrib_list[0].type = VASurfaceAttribPixelFormat;
-    attrib_list[0].flags = VA_SURFACE_ATTRIB_GETTABLE | VA_SURFACE_ATTRIB_SETTABLE;
-    attrib_list[0].value.type = VAGenericValueTypeInteger;
-    attrib_list[0].value.value.i = uses_10bit_output ? VA_FOURCC_P010 : VA_FOURCC_NV12;
-
-    attrib_list[1].type = VASurfaceAttribMemoryType;
-    attrib_list[1].flags = VA_SURFACE_ATTRIB_GETTABLE | VA_SURFACE_ATTRIB_SETTABLE;
-    attrib_list[1].value.type = VAGenericValueTypeInteger;
-    attrib_list[1].value.value.i = VA_SURFACE_ATTRIB_MEM_TYPE_VA | VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME;
-    if (kExposePrime2Export) {
-        attrib_list[1].value.value.i |= VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2;
+    unsigned int attr_index = 0;
+    attrib_list[attr_index].type = VASurfaceAttribPixelFormat;
+    attrib_list[attr_index].flags = VA_SURFACE_ATTRIB_GETTABLE | VA_SURFACE_ATTRIB_SETTABLE;
+    attrib_list[attr_index].value.type = VAGenericValueTypeInteger;
+    attrib_list[attr_index].value.value.i = VA_FOURCC_NV12;
+    ++attr_index;
+    if (expose_p010) {
+        attrib_list[attr_index].type = VASurfaceAttribPixelFormat;
+        attrib_list[attr_index].flags = VA_SURFACE_ATTRIB_GETTABLE | VA_SURFACE_ATTRIB_SETTABLE;
+        attrib_list[attr_index].value.type = VAGenericValueTypeInteger;
+        attrib_list[attr_index].value.value.i = VA_FOURCC_P010;
+        ++attr_index;
     }
+    attrib_list[attr_index].type = VASurfaceAttribMemoryType;
+    attrib_list[attr_index].flags = VA_SURFACE_ATTRIB_GETTABLE | VA_SURFACE_ATTRIB_SETTABLE;
+    attrib_list[attr_index].value.type = VAGenericValueTypeInteger;
+    attrib_list[attr_index].value.value.i = VA_SURFACE_ATTRIB_MEM_TYPE_VA | VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME;
+    if (kExposePrime2Export) {
+        attrib_list[attr_index].value.value.i |= VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2;
+    }
+    ++attr_index;
 
-    attrib_list[2].type = VASurfaceAttribDRMFormatModifiers;
-    attrib_list[2].flags = VA_SURFACE_ATTRIB_GETTABLE;
-    attrib_list[2].value.type = VAGenericValueTypePointer;
-    attrib_list[2].value.value.p = &linear_modifier_list;
+    attrib_list[attr_index].type = VASurfaceAttribDRMFormatModifiers;
+    attrib_list[attr_index].flags = VA_SURFACE_ATTRIB_GETTABLE;
+    attrib_list[attr_index].value.type = VAGenericValueTypePointer;
+    attrib_list[attr_index].value.value.p = &linear_modifier_list;
+    ++attr_index;
 
     *num_attribs = kSupportedCount;
     return VA_STATUS_SUCCESS;
@@ -1837,7 +1852,7 @@ static VAStatus vaCreateContext(VADriverContextP ctx,
         return VA_STATUS_ERROR_INVALID_CONFIG;
     }
     const auto& config = config_it->second;
-    if (num_render_targets <= 0 || !render_targets) {
+    if (num_render_targets < 0 || (num_render_targets > 0 && !render_targets)) {
         util::log(util::stderr_sink, util::LogLevel::Warn, "vaCreateContext: invalid render targets count={} ptr={}",
               num_render_targets, static_cast<const void*>(render_targets));
         return VA_STATUS_ERROR_INVALID_PARAMETER;
@@ -2286,8 +2301,10 @@ static VAStatus vaEndPicture(VADriverContextP ctx,
                     break;
                 case VAProfileHEVCMain:
                 case VAProfileHEVCMain10:
-                    picture.frame_extra_data = bitstream::build_hevc_headers(
-                        *reinterpret_cast<const VAPictureParameterBufferHEVC*>(picture_param_buffer.data.data()));
+                    if (!session.sequence_headers_sent) {
+                        picture.frame_extra_data = bitstream::build_hevc_headers(
+                            *reinterpret_cast<const VAPictureParameterBufferHEVC*>(picture_param_buffer.data.data()));
+                    }
                     break;
                 case VAProfileAV1Profile0: {
                     const auto& av1_pic = *reinterpret_cast<const VADecPictureParameterBufferAV1*>(picture_param_buffer.data.data());
@@ -2457,13 +2474,21 @@ static VAStatus vaEndPicture(VADriverContextP ctx,
     }
 
     MppDecoder::DecodeJob job;
+    const bool h264_idr = isH264Profile(d->profile) && h264AccessUnitStartsWithIdr(picture.frame_buffer);
     job.target_surface = picture.current_surface;
+    job.idr = h264_idr;
     job.bitstream = std::move(picture.frame_buffer);
     job.extra_data = std::move(picture.frame_extra_data);
+    // AV1 sequence-header OBUs must travel with the frame OBU in a single
+    // packet. Sending them as MPP extra-data produces a 1x1 metadata frame
+    // that Firefox cannot import as a VA surface.
+    if (d->profile == VAProfileAV1Profile0 && !job.extra_data.empty()) {
+        job.bitstream.insert(job.bitstream.begin(), job.extra_data.begin(), job.extra_data.end());
+        job.extra_data.clear();
+    }
     // Do NOT set EOS here; the decoder will take packets as a stream and
     // should not be forced to flush per VA picture.
     job.eos = false;
-    const bool h264_idr = isH264Profile(d->profile) && h264AccessUnitStartsWithIdr(job.bitstream);
     if (isH264Profile(d->profile)) {
         std::lock_guard<std::mutex> lock(d->lock);
         auto surface_it = d->surfaces.find(picture.current_surface);
@@ -2602,6 +2627,18 @@ static VAStatus vaQuerySurfaceError(VADriverContextP ctx,
     return error_status;
 }
 
+static unique_fd createZeroDmabuf(size_t size) {
+    int fd = memfd_create("rockchip-vaapi-zero", MFD_CLOEXEC);
+    if (fd < 0) {
+        return {};
+    }
+    if (ftruncate(fd, static_cast<off_t>(size)) != 0) {
+        close(fd);
+        return {};
+    }
+    return unique_fd{fd};
+}
+
 static VAStatus vaExportSurfaceHandle(VADriverContextP ctx,
                                       VASurfaceID surface,
                                       uint32_t mem_type,
@@ -2610,6 +2647,31 @@ static VAStatus vaExportSurfaceHandle(VADriverContextP ctx,
     if (!ctx) return VA_STATUS_ERROR_INVALID_CONTEXT;
     auto* d = toDriver(ctx);
     if (!d) return VA_STATUS_ERROR_INVALID_CONTEXT;
+
+    // FFmpeg calls vaExportSurfaceHandle immediately after vaEndPicture, often
+    // before MPP has attached the decoded buffer. vaSyncSurface can report an
+    // idle surface in that window; wait for the pending decode explicitly so
+    // the first frame is not rejected and Firefox does not fall back to
+    // software decoding.
+    if (d->decoder) {
+        uint64_t submitted_job = 0;
+        uint64_t completed_job = 0;
+        uint64_t submit_us = 0;
+        uint64_t complete_us = 0;
+        if (d->decoder->getSurfaceDebugInfo(surface, submitted_job, completed_job,
+                                            submit_us, complete_us) &&
+            submitted_job > completed_job) {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(5000);
+            while (std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                if (!d->decoder->getSurfaceDebugInfo(surface, submitted_job, completed_job,
+                                                     submit_us, complete_us) ||
+                    completed_job >= submitted_job) {
+                    break;
+                }
+            }
+        }
+    }
 
     VAStatus sync_status = vaSyncSurface(ctx, surface);
     if (sync_status != VA_STATUS_SUCCESS) {
@@ -2641,9 +2703,6 @@ static VAStatus vaExportSurfaceHandle(VADriverContextP ctx,
     std::memset(desc, 0, sizeof(*desc));
 
     const auto& surf = it->second->surface;
-    if (surf.dmabuf_fd < 0) {
-        return VA_STATUS_ERROR_INVALID_SURFACE;
-    }
     const uint32_t stride = surf.stride ? surf.stride : alignTo(surf.width, 64);
     const uint32_t aligned_h = std::max(surf.vertical_stride,
                                         surf.is_10bit ? alignTo(surf.height, 8) : surf.height);
@@ -2653,11 +2712,24 @@ static VAStatus vaExportSurfaceHandle(VADriverContextP ctx,
     const uint32_t uv_height = (aligned_h + 1) / 2;
     const uint64_t total_size = static_cast<uint64_t>(bytes_per_row) * (aligned_h + uv_height);
 
+    unique_fd zero_dmabuf;
+    int source_fd = surf.dmabuf_fd;
+    if (source_fd < 0) {
+        // A seek can make FFmpeg probe a freshly-created surface before the
+        // first decode lands. Return a valid black DMA-BUF instead of failing;
+        // otherwise Firefox marks the whole decoder as software-only.
+        zero_dmabuf = createZeroDmabuf(static_cast<size_t>(total_size));
+        source_fd = zero_dmabuf.get();
+    }
+    if (source_fd < 0) {
+        return VA_STATUS_ERROR_INVALID_SURFACE;
+    }
+
     desc->fourcc = surf.is_10bit ? VA_FOURCC_P010 : VA_FOURCC_NV12;
     desc->width = surf.width;
     desc->height = surf.height;
     desc->num_objects = 1;
-    unique_fd exported_fd{dup(surf.dmabuf_fd)};
+    unique_fd exported_fd{dup(source_fd)};
     if (!exported_fd) {
         return VA_STATUS_ERROR_ALLOCATION_FAILED;
     }

@@ -51,6 +51,13 @@ bool h264ImmediateOutEnabled() {
     return envEnabled("ROCKCHIP_VAAPI_H264_IMMEDIATE_OUT");
 }
 
+bool mppSplitParseEnabled() {
+    // VA-API submits one complete access unit per vaEndPicture. The fast parser
+    // treats the packet as a complete frame instead of waiting for the next
+    // access unit delimiter, which keeps vaSyncSurface from stalling.
+    return envEnabled("ROCKCHIP_VAAPI_MPP_SPLIT_PARSE");
+}
+
 bool isInternalSurfaceId(VASurfaceID surface_id) {
     return surface_id >= 0x40000000u;
 }
@@ -281,10 +288,14 @@ bool MppDecoder::initialize(CodecProfile profile, int width, int height, int drm
     std::scoped_lock lock(init_mutex_);
     profile_ = profile;
     if (session_initialized_) return true;
+    // shutdown() leaves the queue latched closed. A seek may destroy and
+    // recreate the VA context, so re-arm it before decoding can resume.
+    input_queue_.reset();
 
-    stable_export_enabled_ = envEnabled("ROCKCHIP_VAAPI_STABLE_EXPORT") ||
-                             ((profile == CodecProfile::HEVC || profile == CodecProfile::AV1) &&
-                              !envEnabled("ROCKCHIP_VAAPI_DISABLE_STABLE_EXPORT"));
+    // The default path exports MPP's NV12 DMA-BUF directly (zero copy). The
+    // opt-in stable-export path allocates a separate linear buffer and is kept
+    // for debugging formats that cannot be imported directly.
+    stable_export_enabled_ = envEnabled("ROCKCHIP_VAAPI_STABLE_EXPORT");
 
     struct stat stat_buf = {};
     if (drm_fd < 0 || fstat(drm_fd, &stat_buf) != 0 || !S_ISCHR(stat_buf.st_mode) || major(stat_buf.st_rdev) != 226 || minor(stat_buf.st_rdev) < 128) {
@@ -310,27 +321,26 @@ bool MppDecoder::initialize(CodecProfile profile, int width, int height, int drm
     static std::atomic<int> init_log_count{0};
     if (init_log_count.fetch_add(1, std::memory_order_relaxed) < 8) {
         util::log(util::stderr_sink, util::LogLevel::Info,
-                  "mpp: initialize profile={} stable_export={} av1_p010={} output_format={} width={} height={}",
+                  "mpp: initialize profile={} stable_export={} output_format={} width={} height={}",
                   static_cast<int>(profile_),
                   stable_export_enabled_ ? 1 : 0,
-                  av1ExportAs10BitEnabled() ? 1 : 0,
                   static_cast<int>(output_format),
                   width,
                   height);
     }
     api->control(ctx, MPP_DEC_SET_OUTPUT_FORMAT, &output_format);
 
+    uint32_t split_parse = mppSplitParseEnabled() ? 1u : 0u;
     MppDecCfg raw_cfg = nullptr;
     if (mpp_dec_cfg_init(&raw_cfg) == MPP_OK && raw_cfg) {
         MppDecCfgHandle cfg{raw_cfg};
-        mpp_dec_cfg_set_u32(cfg.get(), "base:split_parse", 1);
+        mpp_dec_cfg_set_u32(cfg.get(), "base:split_parse", split_parse);
         api->control(ctx, MPP_DEC_SET_CFG, cfg.get());
     }
 
-    uint32_t split_parse = 1;
     api->control(ctx, MPP_DEC_SET_PARSER_SPLIT_MODE, &split_parse);
 
-    if (profile_ == CodecProfile::H264 && h264ImmediateOutEnabled()) {
+    if (h264ImmediateOutEnabled()) {
         RK_U32 immediate_out = 1;
         api->control(ctx, MPP_DEC_SET_IMMEDIATE_OUT, &immediate_out);
     }
@@ -644,6 +654,38 @@ bool MppDecoder::abandonTailPendingSurface(VASurfaceID focus_surface, uint32_t m
 
 bool MppDecoder::enqueueJob(DecodeJob job) {
     if (!session_) return false;
+
+    // FFmpeg's VA-API flush does not tear down the VA context. After a seek it
+    // submits an IDR while the pre-seek frame is still pending in MPP, which
+    // then waits forever for its old DPB. Detect that stale-pending IDR and
+    // reset the MPP stream before submitting it.
+    if (profile_ == CodecProfile::H264 && job.idr &&
+        next_job_id_.load(std::memory_order_relaxed) > 0) {
+        const uint64_t now_us = steadyMicrosNow();
+        bool stale_pending = false;
+        bool same_surface_pending = false;
+        {
+            std::lock_guard<std::mutex> pending_lock(pending_mutex_);
+            for (const auto& pending : pending_surfaces_) {
+                if (pending.second == job.target_surface) {
+                    same_surface_pending = true;
+                }
+                std::lock_guard<std::mutex> surface_lock(surface_mutex_);
+                auto surface_it = surfaces_.find(pending.second);
+                if (surface_it == surfaces_.end()) continue;
+                const uint64_t submit_us = surface_it->second.last_submit_us.load(std::memory_order_acquire);
+                if (submit_us != 0 && now_us - submit_us > 30000) {
+                    stale_pending = true;
+                }
+            }
+        }
+        if (!running_.load() || stale_pending || same_surface_pending) {
+            util::log(util::stderr_sink, util::LogLevel::Info,
+                      "mpp: H264 IDR after seek-like discontinuity running={} stale={} same_surface={}",
+                      running_.load() ? 1 : 0, stale_pending ? 1 : 0, same_surface_pending ? 1 : 0);
+            flushStream();
+        }
+    }
 
     job.job_id = next_job_id_.fetch_add(1, std::memory_order_relaxed);
 
@@ -973,7 +1015,10 @@ void MppDecoder::resetSurface(VASurfaceID surface) {
     const bool had_output_refs = static_cast<bool>(it->second.buffer) || static_cast<bool>(it->second.frame) || it->second.surface.dmabuf_fd >= 0;
     it->second.frame.reset();
     it->second.buffer.reset();
-    if (!stable_export_enabled_) {
+    // A 10-bit frame uses the stable-export buffer even when the global
+    // ROCKCHIP_VAAPI_STABLE_EXPORT switch is off. Keep that DMA-BUF alive
+    // across surface reuse, otherwise the next vaSyncSurface publishes -1.
+    if (!stable_export_enabled_ && !it->second.export_map) {
         it->second.dmabuf.reset();
     }
     it->second.surface.dmabuf_fd = it->second.dmabuf.get();
@@ -1032,6 +1077,109 @@ void MppDecoder::destroySurface(VASurfaceID surface) {
                                  DiscardOutputReason::SurfaceDestroy,
                                  surface);
     }
+}
+
+void MppDecoder::flushStream() {
+    std::scoped_lock lock(init_mutex_);
+    if (!session_ || !session_initialized_) {
+        return;
+    }
+
+    MppCtx ctx = session_->ctx();
+    MppApi* api = session_->api();
+
+    running_ = false;
+    tail_drain_eos_requested_.store(false, std::memory_order_relaxed);
+    if (!eos_sent_.exchange(true, std::memory_order_relaxed)) {
+        DecodeJob eos;
+        eos.target_surface = VA_INVALID_ID;
+        eos.eos = true;
+        input_queue_.push(eos);
+    }
+
+    if (input_thread_.joinable()) {
+        input_thread_.request_stop();
+        input_thread_.join();
+    }
+
+    // MPP may be blocked waiting for a reference that will never arrive after
+    // the seek. Do not wait for EOS output; stop the output thread directly.
+    eos_seen_.store(true, std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> pending_lock(pending_mutex_);
+        pending_cv_.notify_all();
+    }
+    if (output_thread_.joinable()) {
+        output_thread_.request_stop();
+        output_thread_.join();
+    }
+
+    if (api && ctx) {
+        api->reset(ctx);
+    }
+    session_.reset();
+    session_initialized_ = false;
+
+    input_queue_.reset();
+
+    {
+        std::lock_guard<std::mutex> pending_lock(pending_mutex_);
+        pending_surfaces_.clear();
+        pending_surface_pts_.clear();
+        pending_payloads_.clear();
+        pending_count_ = 0;
+        pending_cv_.notify_all();
+    }
+
+    {
+        std::lock_guard<std::mutex> surface_lock(surface_mutex_);
+        for (auto& kv : surfaces_) {
+            kv.second.buffer.reset();
+            kv.second.frame.reset();
+            kv.second.in_flight.store(false);
+            kv.second.ready.store(false);
+            kv.second.failed.store(false);
+        }
+    }
+
+    session_ = MppSession::create();
+    if (!session_) {
+        return;
+    }
+
+    ctx = session_->ctx();
+    api = session_->api();
+    if (mpp_init(ctx, MPP_CTX_DEC, codecProfileToMpp(profile_)) != MPP_OK) {
+        session_.reset();
+        return;
+    }
+
+    MppFrameFormat output_format = (profile_ == CodecProfile::AV1 && av1ExportAs10BitEnabled())
+                                       ? MPP_FMT_YUV420SP_10BIT
+                                       : MPP_FMT_YUV420SP;
+    api->control(ctx, MPP_DEC_SET_OUTPUT_FORMAT, &output_format);
+
+    uint32_t split_parse = mppSplitParseEnabled() ? 1u : 0u;
+    MppDecCfg raw_cfg = nullptr;
+    if (mpp_dec_cfg_init(&raw_cfg) == MPP_OK && raw_cfg) {
+        MppDecCfgHandle cfg{raw_cfg};
+        mpp_dec_cfg_set_u32(cfg.get(), "base:split_parse", split_parse);
+        api->control(ctx, MPP_DEC_SET_CFG, cfg.get());
+    }
+    api->control(ctx, MPP_DEC_SET_PARSER_SPLIT_MODE, &split_parse);
+
+    if (h264ImmediateOutEnabled()) {
+        RK_U32 immediate_out = 1;
+        api->control(ctx, MPP_DEC_SET_IMMEDIATE_OUT, &immediate_out);
+    }
+    MppPollType nonblock = MPP_POLL_NON_BLOCK;
+    api->control(ctx, MPP_SET_OUTPUT_TIMEOUT, &nonblock);
+    session_initialized_ = true;
+    running_ = false;
+    eos_sent_ = false;
+    eos_seen_ = false;
+    util::log(util::stderr_sink, util::LogLevel::Info,
+              "mpp: flushStream reset after seek/profile switch");
 }
 
 void MppDecoder::shutdown() {
@@ -1149,7 +1297,6 @@ void MppDecoder::inputThreadMain(std::stop_token st) {
         } else if (job_id > 0) {
             mpp_packet_set_pts(packet.get(), static_cast<RK_S64>(job_id));
             mpp_packet_set_dts(packet.get(), static_cast<RK_S64>(job_id));
-            mpp_packet_set_flag(packet.get(), mpp_packet_get_flag(packet.get()) | MPP_PACKET_FLAG_EOI);
         }
 
         while (running_) {
@@ -1354,6 +1501,13 @@ void MppDecoder::outputThreadMain(std::stop_token st) {
             continue;
         }
 
+        // AV1 (and some HEVC streams) emit a 1x1 metadata-only frame before
+        // the first real picture. Exporting it as a VA surface makes Firefox
+        // import an invalid 1x1 NV12 image and disables hardware decoding.
+        if (mpp_frame_get_width(frame) <= 1 || mpp_frame_get_height(frame) <= 1) {
+            continue;
+        }
+
         bool is_error = mpp_frame_get_errinfo(frame) || mpp_frame_get_discard(frame);
         bool is_eos_frame = mpp_frame_get_eos(frame);
 
@@ -1480,7 +1634,10 @@ void MppDecoder::outputThreadMain(std::stop_token st) {
                 uint32_t published_stride = zero_copy_stride;
                 bool export_ok = false;
 
-                if (stable_export_enabled_ && mpp_buf && output_width > 0 && output_height > 0 && !is_error) {
+                const bool use_stable_export = (stable_export_enabled_ ||
+                                                MPP_FRAME_FMT_IS_YUV_10BIT(frame_fmt) != 0) &&
+                                               mpp_buf && output_width > 0 && output_height > 0 && !is_error;
+                if (use_stable_export) {
                     if (!it->second.export_map) {
                         if (!export_drm_fd_) {
                             auto export_fd = openStableExportDrmFd();
