@@ -596,6 +596,11 @@ struct DriverState {
     std::string drm_device_path;
     std::string drm_driver_name;
 
+    // Set when the client created at least one 10-bit VA surface.  Firefox
+    // creates surfaces before vaCreateContext and may leave render_targets
+    // empty, so this is needed to select MPP's 10-bit output for AV1/HEVC 10-bit.
+    bool surface_10bit_requested = false;
+
     // Current expected decoding resolution (from vaCreateContext or MPP feedback).
     uint32_t picture_width = 0;
     uint32_t picture_height = 0;
@@ -1129,6 +1134,18 @@ static bool tryAdoptStartupPrimeSurface(DriverState& driver,
         }
     }
 
+    // A startup-prime surface is only a substitute for the first pictures.
+    // Once the target has a real job submitted, returning an older prime
+    // frame makes the client reuse the target while MPP is still decoding
+    // that job.  That replacement drops a DPB reference and produces the
+    // "missing ref poc" failure seen with HEVC web streams.
+    SurfaceSyncSnapshot target_snapshot;
+    if (!captureSurfaceSyncSnapshot(driver, target_surface, target_snapshot, true)) {
+        return false;
+    }
+    const uint64_t target_job_id = std::max(target_published_job_id,
+                                            target_snapshot.last_submitted_job_id);
+
     bool found_candidate = false;
     SurfaceSyncSnapshot best_candidate;
     VASurfaceID best_prime_surface = VA_INVALID_ID;
@@ -1144,7 +1161,7 @@ static bool tryAdoptStartupPrimeSurface(DriverState& driver,
         if (candidate.failed || candidate.pending || candidate.dmabuf_fd < 0) {
             continue;
         }
-        if (candidate.last_completed_job_id <= target_published_job_id) {
+        if (candidate.last_completed_job_id <= target_job_id) {
             continue;
         }
 
@@ -1363,6 +1380,9 @@ static VAStatus vaCreateSurfaces1(VADriverContextP ctx,
     }
 
     const bool wants_10bit = (static_cast<uint32_t>(format) & VA_RT_FORMAT_YUV420_10BPP) != 0;
+    if (wants_10bit) {
+        d->surface_10bit_requested = true;
+    }
     const uint32_t expected_fourcc = wants_10bit ? VA_FOURCC_P010 : VA_FOURCC_NV12;
 
     for (int i = 0; i < num_attribs; i++) {
@@ -1857,11 +1877,14 @@ static VAStatus vaCreateContext(VADriverContextP ctx,
         return VA_STATUS_ERROR_INVALID_PARAMETER;
     }
 
+    bool render_targets_10bit = false;
     for (int i = 0; i < num_render_targets; i++) {
-        if (d->surfaces.find(render_targets[i]) == d->surfaces.end()) {
+        auto surface_it = d->surfaces.find(render_targets[i]);
+        if (surface_it == d->surfaces.end()) {
             util::log(util::stderr_sink, util::LogLevel::Warn, "vaCreateContext: target surface {} not found", render_targets[i]);
             return VA_STATUS_ERROR_INVALID_SURFACE;
         }
+        render_targets_10bit = render_targets_10bit || surface_it->second->surface.is_10bit;
     }
 
     if (!isSupportedProfile(config.profile)) {
@@ -1878,15 +1901,20 @@ static VAStatus vaCreateContext(VADriverContextP ctx,
 
     d->profile = config.profile;
 
-    // Initialize decoder with the requested size; it may adjust later.
+    const bool wants_10bit_surfaces = rtFormatRequires10BitSurface(config.rt_format) ||
+                                      render_targets_10bit || d->surface_10bit_requested;
+    // Initialize decoder with the requested size; it may adjust later.  The
+    // bit depth must be known before MPP starts: AV1 Profile0 is used for both
+    // 8-bit and 10-bit, and forcing 10-bit output on an 8-bit stream stalls
+    // (observed with the Bilibili AV1 player).
     if (!d->decoder || (!d->decoder->isInitialized() &&
-                        !d->decoder->initialize(vaProfileToCodec(config.profile), picture_width, picture_height, d->drm_fd))) {
+                        !d->decoder->initialize(vaProfileToCodec(config.profile), picture_width, picture_height,
+                                                d->drm_fd, wants_10bit_surfaces))) {
         return VA_STATUS_ERROR_ALLOCATION_FAILED;
     }
 
     std::vector<VASurfaceID> prime_surfaces;
     const unsigned int prime_surface_count = CodecSessionState::startupPrimeSurfaceCountForProfile(config.profile);
-    const bool wants_10bit_surfaces = rtFormatRequires10BitSurface(config.rt_format);
     for (unsigned int index = 0; index < prime_surface_count; ++index) {
         MppDecoder::DecodedSurface scratch_surface;
         scratch_surface.is_10bit = wants_10bit_surfaces;
@@ -2194,6 +2222,7 @@ static VAStatus vaEndPicture(VADriverContextP ctx,
     if (picture.frame_buffer.empty()) return VA_STATUS_ERROR_INVALID_BUFFER;
 
     picture.frame_extra_data.clear();
+    bool av1_hidden_frame = false;
     H264PictureTraits h264_traits;
     bool h264_references_reused_external_surface = false;
     if (picture.decode_state.picture_param_buffer_id) {
@@ -2301,6 +2330,7 @@ static VAStatus vaEndPicture(VADriverContextP ctx,
                     break;
                 case VAProfileAV1Profile0: {
                     const auto& av1_pic = *reinterpret_cast<const VADecPictureParameterBufferAV1*>(picture_param_buffer.data.data());
+                    av1_hidden_frame = av1_pic.pic_info_fields.bits.show_frame == 0;
                     if (session.pending_av1_frame.valid) {
                         std::array<VASurfaceID, 8> pending_ref_frame_map{};
                         std::copy(std::begin(session.pending_av1_frame.pic.ref_frame_map),
@@ -2470,6 +2500,7 @@ static VAStatus vaEndPicture(VADriverContextP ctx,
     const bool h264_idr = isH264Profile(d->profile) && h264AccessUnitStartsWithIdr(picture.frame_buffer);
     job.target_surface = picture.current_surface;
     job.idr = h264_idr;
+    job.hidden = av1_hidden_frame;
     job.bitstream = std::move(picture.frame_buffer);
     job.extra_data = std::move(picture.frame_extra_data);
     // AV1 sequence-header OBUs must travel with the frame OBU in a single

@@ -54,13 +54,18 @@ class MppDecoder {
         bool eos = false;
         bool idr = false;
         bool discard_output = false;
+        // AV1 show_frame=0 frames are decoded references but produce no
+        // displayable output.  Waiting for a MPP output frame for them deadlocks
+        // the player after the first hidden frame.
+        bool hidden = false;
         uint64_t job_id = 0;
     };
 
     MppDecoder();
     ~MppDecoder();
 
-    bool initialize(CodecProfile profile, int width, int height, int drm_fd);
+    bool initialize(CodecProfile profile, int width, int height, int drm_fd,
+                    bool ten_bit_output = false);
     bool isInitialized() const;
     bool enqueueJob(DecodeJob job);
 
@@ -130,6 +135,7 @@ class MppDecoder {
     VASurfaceID dropOldestPendingSurfaceLocked();
 
     CodecProfile profile_{CodecProfile::Unknown};
+    bool ten_bit_output_ = false;
     std::shared_ptr<MppSession> session_;
     bool session_initialized_ = false;
     MppBufferGroup group_ = nullptr;

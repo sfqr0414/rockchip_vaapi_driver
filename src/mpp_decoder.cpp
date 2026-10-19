@@ -495,9 +495,11 @@ void MppDecoder::destroyExternalP010Buffers() {
     external_p010_buffers_.clear();
 }
 
-bool MppDecoder::initialize(CodecProfile profile, int width, int height, int drm_fd) {
+bool MppDecoder::initialize(CodecProfile profile, int width, int height, int drm_fd,
+                            bool ten_bit_output) {
     std::scoped_lock lock(init_mutex_);
     profile_ = profile;
+    ten_bit_output_ = ten_bit_output;
     if (session_initialized_) return true;
     // shutdown() leaves the queue latched closed. A seek may destroy and
     // recreate the VA context, so re-arm it before decoding can resume.
@@ -526,9 +528,16 @@ bool MppDecoder::initialize(CodecProfile profile, int width, int height, int drm
         return false;
     }
 
-    MppFrameFormat output_format = (profile_ == CodecProfile::AV1 && av1ExportAs10BitEnabled())
-                                       ? MPP_FMT_YUV420SP_10BIT
-                                       : MPP_FMT_YUV420SP;
+    // The decoder follows the VA surface format.  AV1 Profile0 covers both
+    // 8-bit and 10-bit streams, so forcing 10-bit output here made an 8-bit
+    // web stream (Bilibili AV1) wait forever for a frame MPP never produced.
+    // HEVC Main10 also needs the 10-bit output format; the driver passes the
+    // surface bit depth explicitly.
+    ten_bit_output_ = ten_bit_output_ &&
+                      (profile_ == CodecProfile::AV1 || profile_ == CodecProfile::HEVC) &&
+                      !envDisabled("ROCKCHIP_VAAPI_AV1_EXPORT_P010");
+    MppFrameFormat output_format = ten_bit_output_ ? MPP_FMT_YUV420SP_10BIT
+                                                   : MPP_FMT_YUV420SP;
     static std::atomic<int> init_log_count{0};
     if (init_log_count.fetch_add(1, std::memory_order_relaxed) < 8) {
         util::log(util::stderr_sink, util::LogLevel::Info,
@@ -562,7 +571,9 @@ bool MppDecoder::initialize(CodecProfile profile, int width, int height, int drm
     // Keep the decoder's 10-bit output in P010-sized imported DMA-BUFs.  This
     // is opt-in until the external-group path has been validated against every
     // AV1 seek/flush sequence.
-    setupExternalP010Buffers(drm_fd, static_cast<uint32_t>(width), static_cast<uint32_t>(height));
+    if (ten_bit_output_) {
+        setupExternalP010Buffers(drm_fd, static_cast<uint32_t>(width), static_cast<uint32_t>(height));
+    }
 
     session_initialized_ = true;
     return true;
@@ -926,41 +937,73 @@ bool MppDecoder::enqueueJob(DecodeJob job) {
             }
         }
 
-        size_t surface_count = 0;
-        {
-            std::lock_guard<std::mutex> lock(surface_mutex_);
-            surface_count = surfaces_.size();
-        }
-
-        std::unique_lock<std::mutex> lock(pending_mutex_);
-        const size_t target_in_flight = (surface_count == 0) ? kMaxInFlightJobs : std::min<size_t>(surface_count * 4, kMaxInFlightJobs);
-        const size_t max_in_flight = std::max<size_t>(1, target_in_flight);
-        static std::atomic<int> enqueue_wait_log_count{0};
-        while (pending_count_ >= max_in_flight && running_.load()) {
-            if (enqueue_wait_log_count.fetch_add(1, std::memory_order_relaxed) < 5) {
-                util::log(util::stderr_sink, util::LogLevel::Info,
-                          "mpp: enqueueJob waiting surface={} pending={} max_in_flight={}",
-                          job.target_surface, pending_count_, max_in_flight);
+        if (job.hidden) {
+            // MPP consumes the hidden reference frame internally and does not
+            // return a displayable frame for it.  VA-API still calls
+            // vaSyncSurface/vaExportSurfaceHandle for the surface, so give it a
+            // valid (black) export buffer and complete the sync.  The hidden
+            // pixels are never displayed; MPP keeps the real reference frame.
+            {
+                std::lock_guard<std::mutex> surface_lock(surface_mutex_);
+                auto surface_it = surfaces_.find(job.target_surface);
+                if (surface_it != surfaces_.end()) {
+                    if (!surface_it->second.export_map) {
+                        if (!export_drm_fd_) {
+                            auto export_fd = openStableExportDrmFd();
+                            if (export_fd) export_drm_fd_ = std::move(*export_fd);
+                        }
+                        createStableExportBuffer(surface_it->second,
+                                                 export_drm_fd_.get(),
+                                                 surface_it->second.surface.width,
+                                                 surface_it->second.surface.height,
+                                                 surface_it->second.surface.is_10bit);
+                    }
+                    if (surface_it->second.export_map) {
+                        std::memset(surface_it->second.export_map, 0, surface_it->second.export_size);
+                        surface_it->second.surface.dmabuf_fd = surface_it->second.dmabuf.get();
+                    }
+                    surface_it->second.last_completed_job_id.store(job.job_id, std::memory_order_release);
+                    surface_it->second.last_complete_us.store(steadyMicrosNow(), std::memory_order_release);
+                }
             }
-            lock.unlock();
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            lock.lock();
+            setSurfaceState(job.target_surface, true, false);
+        } else {
+            size_t surface_count = 0;
+            {
+                std::lock_guard<std::mutex> lock(surface_mutex_);
+                surface_count = surfaces_.size();
+            }
+
+            std::unique_lock<std::mutex> lock(pending_mutex_);
+            const size_t target_in_flight = (surface_count == 0) ? kMaxInFlightJobs : std::min<size_t>(surface_count * 4, kMaxInFlightJobs);
+            const size_t max_in_flight = std::max<size_t>(1, target_in_flight);
+            static std::atomic<int> enqueue_wait_log_count{0};
+            while (pending_count_ >= max_in_flight && running_.load()) {
+                if (enqueue_wait_log_count.fetch_add(1, std::memory_order_relaxed) < 5) {
+                    util::log(util::stderr_sink, util::LogLevel::Info,
+                              "mpp: enqueueJob waiting surface={} pending={} max_in_flight={}",
+                              job.target_surface, pending_count_, max_in_flight);
+                }
+                lock.unlock();
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                lock.lock();
+            }
+            static std::atomic<int> dedupe_log_count{0};
+            if (dropPendingSurfaceLocked(job.target_surface,
+                                         DiscardOutputReason::ReplacedPendingSurface,
+                                         job.target_surface,
+                                         job.job_id) &&
+                dedupe_log_count.fetch_add(1, std::memory_order_relaxed) < 8) {
+                util::log(util::stderr_sink, util::LogLevel::Info,
+                          "mpp: enqueueJob replaced older pending work for surface={} with job_id={}",
+                          job.target_surface,
+                          static_cast<unsigned long long>(job.job_id));
+            }
+            pending_surfaces_.emplace_back(job.job_id, job.target_surface);
+            pending_surface_pts_[job.job_id] = job.target_surface;
+            ++pending_count_;
+            pending_cv_.notify_all();
         }
-        static std::atomic<int> dedupe_log_count{0};
-        if (dropPendingSurfaceLocked(job.target_surface,
-                                     DiscardOutputReason::ReplacedPendingSurface,
-                                     job.target_surface,
-                                     job.job_id) &&
-            dedupe_log_count.fetch_add(1, std::memory_order_relaxed) < 8) {
-            util::log(util::stderr_sink, util::LogLevel::Info,
-                      "mpp: enqueueJob replaced older pending work for surface={} with job_id={}",
-                      job.target_surface,
-                      static_cast<unsigned long long>(job.job_id));
-        }
-        pending_surfaces_.emplace_back(job.job_id, job.target_surface);
-        pending_surface_pts_[job.job_id] = job.target_surface;
-        ++pending_count_;
-        pending_cv_.notify_all();
     } else if (job.discard_output) {
         std::lock_guard<std::mutex> lock(pending_mutex_);
         markDiscardOutputJobLocked(job.job_id,
@@ -1371,9 +1414,16 @@ void MppDecoder::flushStream() {
         return;
     }
 
-    MppFrameFormat output_format = (profile_ == CodecProfile::AV1 && av1ExportAs10BitEnabled())
-                                       ? MPP_FMT_YUV420SP_10BIT
-                                       : MPP_FMT_YUV420SP;
+    // The decoder follows the VA surface format.  AV1 Profile0 covers both
+    // 8-bit and 10-bit streams, so forcing 10-bit output here made an 8-bit
+    // web stream (Bilibili AV1) wait forever for a frame MPP never produced.
+    // HEVC Main10 also needs the 10-bit output format; the driver passes the
+    // surface bit depth explicitly.
+    ten_bit_output_ = ten_bit_output_ &&
+                      (profile_ == CodecProfile::AV1 || profile_ == CodecProfile::HEVC) &&
+                      !envDisabled("ROCKCHIP_VAAPI_AV1_EXPORT_P010");
+    MppFrameFormat output_format = ten_bit_output_ ? MPP_FMT_YUV420SP_10BIT
+                                                   : MPP_FMT_YUV420SP;
     api->control(ctx, MPP_DEC_SET_OUTPUT_FORMAT, &output_format);
 
     uint32_t split_parse = mppSplitParseEnabled() ? 1u : 0u;
