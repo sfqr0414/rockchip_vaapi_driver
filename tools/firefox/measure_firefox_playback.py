@@ -320,11 +320,23 @@ def main() -> int:
         preexec_fn=os.setsid,
     )
 
+    # The test page intentionally waits for Firefox to publish gfxVars before
+    # assigning video.src.  Waiting for the first decoded frame here makes
+    # --duration mean "seconds of playback", not "seconds including startup".
+    startup_start = time.monotonic()
+    samples = []
+    while time.monotonic() - startup_start < 15.0:
+        samples = read_status_lines(STATUS_FILE)
+        if any((sample.get("currentTime") or 0) > 0
+               or int(sample.get("readyState") or 0) >= 2 for sample in samples):
+            break
+        time.sleep(0.2)
+    startup_seconds = round(time.monotonic() - startup_start, 2)
+
     start = time.monotonic()
     deadline = start + max(args.duration, 1.0)
 
     try:
-        samples = []
         while time.monotonic() < deadline:
             samples = read_status_lines(STATUS_FILE)
             time.sleep(0.2)
@@ -341,6 +353,7 @@ def main() -> int:
                 "seek_at": args.seek_at,
                 "seek_to": args.seek_to,
                 "duration_seconds": args.duration,
+                "startup_seconds": startup_seconds,
                 "interrupt_pattern": interrupt_info.get("pattern"),
                 "interrupt_active": bool(interrupt_info.get("active")),
                 "interrupt_delta": int(interrupt_info.get("interrupt_delta") or 0),
