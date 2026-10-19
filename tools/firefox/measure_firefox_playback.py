@@ -151,6 +151,36 @@ def read_status_lines(status_file: Path):
     return lines
 
 
+def display_snapshot():
+    """Record the compositor output so dropped-frame reports can be attributed."""
+    snapshot = {
+        "session_type": os.environ.get("XDG_SESSION_TYPE"),
+        "wayland_display": os.environ.get("WAYLAND_DISPLAY"),
+        "displays": [],
+    }
+    for status_path in sorted(Path("/sys/class/drm").glob("card*-*/status")):
+        output = status_path.parent.name
+        entry = {"output": output, "status": status_path.read_text(errors="ignore").strip()}
+        for attribute in ("dpms", "enabled"):
+            path = status_path.parent / attribute
+            if path.exists():
+                entry[attribute] = path.read_text(errors="ignore").strip()
+        snapshot["displays"].append(entry)
+    try:
+        result = subprocess.run(
+            ["gdbus", "call", "--session", "--dest", "org.gnome.Mutter.DisplayConfig",
+             "--object-path", "/org/gnome/Mutter/DisplayConfig",
+             "--method", "org.gnome.Mutter.DisplayConfig.GetCurrentState"],
+            capture_output=True, text=True, timeout=2, check=False)
+        if result.returncode == 0:
+            # Keep the monitor names and modes but avoid bloating the summary.
+            snapshot["mutter_monitors"] = re.findall(r"'([^']*Virtual[^']*)'", result.stdout)
+            snapshot["mutter_modes"] = re.findall(r"'([0-9]+x[0-9]+@[0-9.]+)'", result.stdout)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return snapshot
+
+
 def compute_summary(samples):
     if not samples:
         return {"error": "no telemetry samples"}
@@ -192,6 +222,9 @@ def compute_summary(samples):
         "seek_completed": any(bool(sample.get("seekCompleted")) for sample in samples),
         "seek_target": next((sample.get("seekTarget") for sample in reversed(samples) if sample.get("seekTarget") is not None), None),
         "hardware_decode_reported": any(bool(sample.get("hardwareDecodeActive")) for sample in samples),
+        "playback_started": any(
+            bool(sample.get("currentTime")) or int(sample.get("readyState") or 0) >= 2
+            for sample in samples),
         "interrupt_delta_max": max((int(sample.get("interruptDelta") or 0) for sample in samples), default=0),
         "interrupt_sources": next((sample.get("interruptSources") for sample in reversed(samples) if sample.get("interruptSources")), []),
     }
@@ -207,6 +240,12 @@ def compute_summary(samples):
     if first.get("corruptedVideoFrames") is not None and last.get("corruptedVideoFrames") is not None:
         result["corrupted_delta"] = last["corruptedVideoFrames"] - first["corruptedVideoFrames"]
 
+    if result["currentTime_delta"] and result["currentTime_delta"] > 0:
+        if result["presented_delta"] is not None:
+            result["presented_fps"] = round(result["presented_delta"] / result["currentTime_delta"], 2)
+        if result["decoded_delta"]:
+            result["dropped_ratio"] = round(
+                (result["dropped_delta"] or 0) / result["decoded_delta"], 3)
     return result
 
 
@@ -282,6 +321,7 @@ def main() -> int:
             time.sleep(0.2)
 
         summary = compute_summary(samples)
+        summary["display"] = display_snapshot()
         interrupt_info = interrupt_sampler.stop()
         summary.update(
             {
@@ -303,7 +343,13 @@ def main() -> int:
         # A transient vaInitialize/RDD startup failure can silently select the
         # software decoder.  Retry the whole browser once before reporting a
         # software fallback; this is a harness retry, not a decoder setting.
-        if (args.mode == "hw" and not summary["hardware_decode_reported"]
+        # The page deliberately waits for Firefox to publish gfxVars before it
+        # assigns video.src.  Do not kill that startup window just because no
+        # decoder exists yet: retry only after playback really started.
+        if not summary["playback_started"]:
+            print("playback did not start during the measurement window; not retrying", file=sys.stderr)
+        if (args.mode == "hw" and summary["playback_started"]
+                and not summary["hardware_decode_reported"]
                 and os.environ.get("ROCKCHIP_MEASURE_RETRY") != "1"):
             print("hardware decode not observed; retrying Firefox once", file=sys.stderr)
             clear_harness_processes()
