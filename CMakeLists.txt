@@ -22,6 +22,7 @@ add_executable(test_mpp_decode tools/test_mpp_decode.cpp)
 add_executable(vaapi_decode_test tools/vaapi_decode_test.cpp)
 add_executable(gecko_vaapi_probe tools/gecko_vaapi_probe.cpp)
 add_executable(panthor_egl_import_test tools/panthor_egl_import_test.cpp)
+add_executable(test_slice_framing tools/test_slice_framing.cpp)
 
 target_link_libraries(test_mpp_decode PRIVATE
     dl
@@ -72,6 +73,11 @@ target_include_directories(panthor_egl_import_test PRIVATE
     src
 )
 
+target_include_directories(test_slice_framing PRIVATE
+    ${LIBVA_INCLUDE_DIRS}
+    src
+)
+
 # The VA-API driver naming convention expects <driver>_drv_video.so (no lib prefix).
 set_target_properties(rockchip_drv_video PROPERTIES
     PREFIX ""
@@ -80,33 +86,27 @@ set_target_properties(rockchip_drv_video PROPERTIES
 
 target_compile_definitions(rockchip_drv_video PRIVATE "_GNU_SOURCE")
 
-# Link against Rockchip MPP and system libraries
-find_package(PkgConfig REQUIRED)
+# The driver is a VA-API -> MPP bridge.  It may only use the installed MPP
+# public headers and shared library (the MPI ABI), never MPP source-tree
+# internals.  Keep the search paths explicit so a MPP checkout can never leak
+# into the build through an accidental -I.
+find_library(ROCKCHIP_MPP_LIB NAMES rockchip_mpp PATHS /usr/lib /usr/local/lib
+             PATH_SUFFIXES aarch64-linux-gnu NO_DEFAULT_PATH)
+find_path(ROCKCHIP_MPP_INCLUDE NAMES rk_mpi.h PATHS /usr/include /usr/local/include
+          PATH_SUFFIXES rockchip NO_DEFAULT_PATH)
 
-pkg_check_modules(LIBVA REQUIRED libva)
-pkg_check_modules(LIBVA_DRM REQUIRED libva-drm)
-pkg_check_modules(LIBDRM REQUIRED libdrm)
-
-# Prefer installed rockchip-mpp (RK3588) if available.
-find_library(ROCKCHIP_MPP_LIB NAMES rockchip_mpp)
-find_path(ROCKCHIP_MPP_INCLUDE NAMES rk_mpi.h PATH_SUFFIXES rockchip)
-
-if (ROCKCHIP_MPP_LIB AND ROCKCHIP_MPP_INCLUDE)
-    message(STATUS "Using system rockchip-mpp: ${ROCKCHIP_MPP_LIB}")
-    set(MPP_INCLUDE_DIR ${ROCKCHIP_MPP_INCLUDE})
-    set(MPP_LIB ${ROCKCHIP_MPP_LIB})
-    set(MPP_FOUND TRUE)
-else()
-    message(STATUS "rockchip-mpp not found; falling back to local stub implementation")
-    set(MPP_FOUND FALSE)
-    set(MPP_INCLUDE_DIR "${CMAKE_SOURCE_DIR}")
+if (NOT ROCKCHIP_MPP_LIB OR NOT ROCKCHIP_MPP_INCLUDE)
+    message(FATAL_ERROR "rockchip-mpp public headers/library not found; install librockchip-mpp")
 endif()
+message(STATUS "Using installed rockchip-mpp: ${ROCKCHIP_MPP_LIB} (${ROCKCHIP_MPP_INCLUDE})")
+set(MPP_INCLUDE_DIR ${ROCKCHIP_MPP_INCLUDE})
+set(MPP_LIB ${ROCKCHIP_MPP_LIB})
 
 target_include_directories(rockchip_drv_video PRIVATE
+    ${MPP_INCLUDE_DIR}/..
     ${MPP_INCLUDE_DIR}
     ${LIBVA_INCLUDE_DIRS}
     ${LIBDRM_INCLUDE_DIRS}
-    ${CMAKE_SOURCE_DIR}
     src
 )
 
@@ -117,12 +117,15 @@ target_link_libraries(rockchip_drv_video PRIVATE
     pthread
 )
 
-if (MPP_FOUND)
-    target_link_libraries(rockchip_drv_video PRIVATE ${MPP_LIB})
-    target_link_libraries(test_mpp_decode PRIVATE ${MPP_LIB})
-else()
-    message(FATAL_ERROR "rockchip-mpp not found; please install librockchip-mpp or set MPP_INCLUDE_DIR and MPP_LIB")
-endif()
+target_link_libraries(rockchip_drv_video PRIVATE ${MPP_LIB})
+target_link_libraries(test_mpp_decode PRIVATE ${MPP_LIB})
+
+# Fail the build if anything in the bridge starts depending on MPP internals.
+add_custom_target(check-mpp-boundary
+    COMMAND bash ${CMAKE_SOURCE_DIR}/tools/check_mpp_boundary.sh ${CMAKE_SOURCE_DIR}
+    COMMENT "Checking MPP public-ABI boundary"
+    VERBATIM)
+add_dependencies(rockchip_drv_video check-mpp-boundary)
 
 # Installation
 install(TARGETS rockchip_drv_video

@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 
 
-REPO_DIR = Path(__file__).resolve().parent.parent
+REPO_DIR = Path(__file__).resolve().parents[2]
 STATUS_FILE = Path("/tmp/rockchip-firefox-http-server/playback-status.jsonl")
 TELEMETRY_FILE = Path("/tmp/rockchip-firefox-http-server/decode-telemetry.json")
 INTERRUPT_PATTERN = re.compile(r"rkvdec|av1d", re.IGNORECASE)
@@ -113,8 +113,19 @@ class InterruptSampler:
 
 
 def clear_harness_processes() -> None:
+    # Kill the previous probe's whole process group first.  A surviving RDD
+    # child keeps the VA-API/DRM device busy; the next Firefox then silently
+    # falls back to software for AV1 even though vaInitialize succeeded.
+    pid_file = Path("/tmp/rockchip-firefox-http-server/probe.pid")
+    if pid_file.exists():
+        try:
+            pid = int(pid_file.read_text(encoding="utf-8").strip())
+            subprocess.run(["kill", "-TERM", f"-{pid}"], check=False,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except (OSError, ValueError):
+            pass
     subprocess.run(
-        ["bash", "-lc", "pkill -f '/tmp/rockchip-firefox-profile\\.' || true; pkill -f 'bash ./tools/run_firefox_vaapi_probe.sh' || true"],
+        ["bash", "-lc", "pkill -f '/tmp/rockchip-firefox-profile\\.' || true; pkill -f 'bash ./tools/firefox/run_firefox_vaapi_probe.sh' || true"],
         cwd=REPO_DIR,
         check=False,
         stdout=subprocess.DEVNULL,
@@ -122,7 +133,7 @@ def clear_harness_processes() -> None:
     )
     # Give the previous Firefox/RDD/GPU process group time to release the
     # DRM device and Wayland surfaces before the next decoder starts.
-    time.sleep(2.0)
+    time.sleep(5.0)
 
 
 def read_status_lines(status_file: Path):
@@ -158,9 +169,18 @@ def compute_summary(samples):
         "first_decoded": first.get("decodedVideoFrames"),
         "last_decoded": last.get("decodedVideoFrames"),
         "decoded_delta": None,
+        "first_presented": first.get("presentedVideoFrames"),
+        "last_presented": last.get("presentedVideoFrames"),
+        "presented_delta": None,
         "first_dropped": first.get("droppedVideoFrames"),
         "last_dropped": last.get("droppedVideoFrames"),
         "dropped_delta": None,
+        "first_corrupted": first.get("corruptedVideoFrames"),
+        "last_corrupted": last.get("corruptedVideoFrames"),
+        "corrupted_delta": None,
+        "last_pictureMeanRGB": [last.get("pictureMeanRed"), last.get("pictureMeanGreen"), last.get("pictureMeanBlue")],
+        "last_pictureNonBlackRatio": last.get("pictureNonBlackRatio"),
+        "last_pictureSharpness": last.get("pictureSharpness"),
         "last_readyState": last.get("readyState"),
         "last_paused": last.get("paused"),
         "last_ended": last.get("ended"),
@@ -180,8 +200,12 @@ def compute_summary(samples):
         result["currentTime_delta"] = round(last["currentTime"] - first["currentTime"], 3)
     if first.get("decodedVideoFrames") is not None and last.get("decodedVideoFrames") is not None:
         result["decoded_delta"] = last["decodedVideoFrames"] - first["decodedVideoFrames"]
+    if first.get("presentedVideoFrames") is not None and last.get("presentedVideoFrames") is not None:
+        result["presented_delta"] = last["presentedVideoFrames"] - first["presentedVideoFrames"]
     if first.get("droppedVideoFrames") is not None and last.get("droppedVideoFrames") is not None:
         result["dropped_delta"] = last["droppedVideoFrames"] - first["droppedVideoFrames"]
+    if first.get("corruptedVideoFrames") is not None and last.get("corruptedVideoFrames") is not None:
+        result["corrupted_delta"] = last["corruptedVideoFrames"] - first["corruptedVideoFrames"]
 
     return result
 
@@ -240,7 +264,7 @@ def main() -> int:
         stdout_handle = stdout_path.open("w", encoding="utf-8")
 
     process = subprocess.Popen(
-        ["bash", "./tools/run_firefox_vaapi_probe.sh"],
+        ["bash", "./tools/firefox/run_firefox_vaapi_probe.sh"],
         cwd=REPO_DIR,
         env=env,
         stdout=stdout_handle if stdout_handle else subprocess.DEVNULL,
@@ -276,6 +300,21 @@ def main() -> int:
             }
         )
         summary["hardware_decode_reported"] = bool(summary.get("hardware_decode_reported")) or bool(summary["hardware_decode_interrupt_seen"])
+        # A transient vaInitialize/RDD startup failure can silently select the
+        # software decoder.  Retry the whole browser once before reporting a
+        # software fallback; this is a harness retry, not a decoder setting.
+        if (args.mode == "hw" and not summary["hardware_decode_reported"]
+                and os.environ.get("ROCKCHIP_MEASURE_RETRY") != "1"):
+            print("hardware decode not observed; retrying Firefox once", file=sys.stderr)
+            clear_harness_processes()
+            retry_env = os.environ.copy()
+            retry_env["ROCKCHIP_MEASURE_RETRY"] = "1"
+            try:
+                os.execve(sys.executable,
+                          [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]],
+                          retry_env)
+            except OSError as error:
+                print(f"retry exec failed: {error}", file=sys.stderr)
         if args.summary_file:
             summary_path = Path(args.summary_file)
             summary_path.parent.mkdir(parents=True, exist_ok=True)

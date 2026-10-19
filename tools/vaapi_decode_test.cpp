@@ -155,12 +155,18 @@ int main(int argc, char** argv) {
     int height = 0;
     int kMaxDecodedFrames = 0; // 0 means no limit (decode full stream)
     bool save_images = true;
+    bool export_only = false;
     std::optional<std::string> framemd5_out;
 
     for (int argi = 2; argi < argc; ++argi) {
         std::string_view arg = argv[argi];
         if (arg == "--no-images") {
             save_images = false;
+            continue;
+        }
+        if (arg == "--export-only") {
+            save_images = false;
+            export_only = true;
             continue;
         }
         if (arg == "--framemd5-out") {
@@ -395,6 +401,23 @@ int main(int argc, char** argv) {
                                                       decoded_frames + 1,
                                                       output_dir,
                                                       &exported_stride);
+                }
+                if (wrote_frame && export_only) {
+                    VADRMPRIMESurfaceDescriptor desc = {};
+                    VAStatus export_status = vaExportSurfaceHandle(
+                        display, surfaces[surface_idx % 2],
+                        VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
+                        VA_EXPORT_SURFACE_READ_ONLY | VA_EXPORT_SURFACE_SEPARATE_LAYERS,
+                        &desc);
+                    if (export_status == VA_STATUS_SUCCESS) {
+                        exported_stride = desc.layers[0].pitch[0];
+                        for (uint32_t object = 0; object < desc.num_objects; ++object) {
+                            if (desc.objects[object].fd >= 0) close(desc.objects[object].fd);
+                        }
+                    } else {
+                        wrote_frame = false;
+                        util::console(std::cerr, "vaExportSurfaceHandle failed: {}\n", export_status);
+                    }
                 }
                 if (wrote_frame && framemd5_sink) {
                     wrote_frame = write_surface_visible_bytes(display,

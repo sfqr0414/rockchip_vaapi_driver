@@ -130,6 +130,9 @@ public:
         if (count <= 0) {
             return;
         }
+        if (count > 64) {
+            count = 64;
+        }
 
         const std::uint64_t mask = (count >= 64) ? std::numeric_limits<std::uint64_t>::max()
                                                  : ((std::uint64_t{1} << count) - 1u);
@@ -1091,12 +1094,211 @@ inline bool has_start_code(const std::uint8_t* data, size_t size) {
     return false;
 }
 
+inline size_t start_code_length(const std::uint8_t* data, size_t size) {
+    if (size >= 4 && data[0] == 0x00 && data[1] == 0x00 && data[2] == 0x00 && data[3] == 0x01) {
+        return 4;
+    }
+    if (size >= 3 && data[0] == 0x00 && data[1] == 0x00 && data[2] == 0x01) {
+        return 3;
+    }
+    return 0;
+}
+
 inline void append_start_code(std::vector<std::uint8_t>& out) {
     out.insert(out.end(), {0x00, 0x00, 0x00, 0x01});
 }
 
 inline void append_start_code_3(std::vector<std::uint8_t>& out) {
     out.insert(out.end(), {0x00, 0x00, 0x01});
+}
+
+/*
+ * VA-API slice offsets point at the NAL header.  Depending on the client the
+ * buffer either contains an Annex-B start code or an AVCC/HVCC length prefix.
+ * MPP wants Annex-B, so normalize both forms and reject anything that cannot
+ * be framed safely.  This is the part where a parser bug silently feeds a
+ * truncated or length-prefixed NAL to the VPU and produces corrupt frames.
+ */
+struct SliceRange {
+    std::size_t offset = 0;
+    std::size_t size = 0;
+};
+
+inline bool valid_slice_range(std::size_t offset, std::size_t size, std::size_t data_size) {
+    return size != 0 && offset <= data_size && size <= data_size - offset;
+}
+
+template <typename Slice>
+inline bool collect_slice_ranges(const Slice* slices,
+                                 std::uint32_t count,
+                                 std::size_t data_size,
+                                 std::vector<SliceRange>& ranges,
+                                 bool require_all_flag = false) {
+    ranges.clear();
+    if (!slices || count == 0 || data_size == 0 || count > (1u << 16)) {
+        return false;
+    }
+    ranges.reserve(count);
+    for (std::uint32_t index = 0; index < count; ++index) {
+        const auto& slice = slices[index];
+        if (require_all_flag && slice.slice_data_flag != VA_SLICE_DATA_FLAG_ALL) {
+            return false;
+        }
+        if (slice.slice_data_flag != VA_SLICE_DATA_FLAG_ALL &&
+            slice.slice_data_flag != VA_SLICE_DATA_FLAG_BEGIN &&
+            slice.slice_data_flag != VA_SLICE_DATA_FLAG_MIDDLE &&
+            slice.slice_data_flag != VA_SLICE_DATA_FLAG_END) {
+            return false;
+        }
+        if (!valid_slice_range(slice.slice_data_offset, slice.slice_data_size, data_size)) {
+            return false;
+        }
+        ranges.push_back({slice.slice_data_offset, slice.slice_data_size});
+    }
+
+    auto sorted = ranges;
+    std::ranges::sort(sorted, [](const SliceRange& lhs, const SliceRange& rhs) {
+        return std::tie(lhs.offset, lhs.size) < std::tie(rhs.offset, rhs.size);
+    });
+    for (std::size_t index = 1; index < sorted.size(); ++index) {
+        const auto& previous = sorted[index - 1];
+        const auto& current = sorted[index];
+        if (current.offset < previous.offset + previous.size) {
+            return false;
+        }
+    }
+    return true;
+}
+
+inline bool h264_nal_header_valid(const std::uint8_t* data, std::size_t size) {
+    if (!data || size < 1 || (data[0] & 0x80u) != 0) {
+        return false;
+    }
+    const std::uint8_t nal_type = data[0] & 0x1fu;
+    return nal_type >= 1 && nal_type <= 23;
+}
+
+inline bool hevc_nal_header_valid(const std::uint8_t* data, std::size_t size) {
+    if (!data || size < 2 || (data[0] & 0x80u) != 0) {
+        return false;
+    }
+    const std::uint8_t nal_type = (data[0] >> 1) & 0x3fu;
+    const std::uint8_t layer_id = static_cast<std::uint8_t>(((data[0] & 0x01u) << 5) | (data[1] >> 3));
+    const std::uint8_t temporal_id_plus1 = data[1] & 0x07u;
+    return nal_type <= 63 && layer_id <= 63 && temporal_id_plus1 != 0;
+}
+
+inline std::uint32_t read_be32(const std::uint8_t* data) {
+    return (static_cast<std::uint32_t>(data[0]) << 24) |
+           (static_cast<std::uint32_t>(data[1]) << 16) |
+           (static_cast<std::uint32_t>(data[2]) << 8) |
+           static_cast<std::uint32_t>(data[3]);
+}
+
+template <typename Validator>
+inline bool append_annexb_nal(std::vector<std::uint8_t>& out,
+                              const std::uint8_t* data,
+                              std::size_t size,
+                              bool four_byte_start_code,
+                              Validator&& valid_nal_header) {
+    if (!data || size == 0) {
+        return false;
+    }
+    if (has_start_code(data, size)) {
+        out.insert(out.end(), data, data + size);
+        return true;
+    }
+
+    // AVCC/HVCC: 4-byte big-endian length followed by the NAL header.
+    if (size >= 5) {
+        const std::uint32_t declared = read_be32(data);
+        const std::size_t payload_size = size - 4;
+        if (declared == payload_size && valid_nal_header(data + 4, payload_size)) {
+            if (four_byte_start_code) {
+                append_start_code(out);
+            } else {
+                append_start_code_3(out);
+            }
+            out.insert(out.end(), data + 4, data + size);
+            return true;
+        }
+    }
+
+    if (!valid_nal_header(data, size)) {
+        return false;
+    }
+    if (four_byte_start_code) {
+        append_start_code(out);
+    } else {
+        append_start_code_3(out);
+    }
+    out.insert(out.end(), data, data + size);
+    return true;
+}
+
+enum class SlicePlacement {
+    Whole,
+    Begin,
+    Middle,
+    End,
+};
+
+inline bool append_slice_fragment(std::vector<std::uint8_t>& out,
+                                  const std::uint8_t* data,
+                                  std::size_t size,
+                                  SlicePlacement placement,
+                                  bool& at_slice_boundary,
+                                  bool four_byte_start_code,
+                                  bool (*valid_nal_header)(const std::uint8_t*, std::size_t)) {
+    if (placement == SlicePlacement::Whole || placement == SlicePlacement::Begin) {
+        if (!at_slice_boundary) {
+            return false;
+        }
+        if (!append_annexb_nal(out, data, size, four_byte_start_code, valid_nal_header)) {
+            return false;
+        }
+        at_slice_boundary = placement == SlicePlacement::Whole;
+        return true;
+    }
+
+    // MIDDLE/END continue a slice whose BEGIN fragment supplied the NAL
+    // header/start code.  Appending another start code here would corrupt the
+    // RBSP exactly like Mesa's PIPE_SLICE_BUFFER_PLACEMENT_TYPE handling warns.
+    if (at_slice_boundary) {
+        return false;
+    }
+    out.insert(out.end(), data, data + size);
+    at_slice_boundary = placement == SlicePlacement::End;
+    return true;
+}
+
+inline bool h264_access_unit_has_idr(std::span<const std::uint8_t> bytes) {
+    std::size_t cursor = 0;
+    while (cursor + 3 <= bytes.size()) {
+        std::size_t sc = 0;
+        while (cursor + sc + 3 <= bytes.size()) {
+            const std::size_t len = start_code_length(bytes.data() + cursor + sc, bytes.size() - cursor - sc);
+            if (len != 0) {
+                sc += len;
+                break;
+            }
+            ++sc;
+        }
+        if (cursor + sc >= bytes.size()) {
+            return false;
+        }
+        const std::size_t header = cursor + sc;
+        if (!h264_nal_header_valid(bytes.data() + header, bytes.size() - header)) {
+            cursor = header + 1;
+            continue;
+        }
+        const std::uint8_t nal_type = bytes[header] & 0x1fu;
+        if (nal_type >= 1 && nal_type <= 5) {
+            return nal_type == 5;
+        }
+        cursor = header + 1;
+    }
+    return false;
 }
 
 inline void append_emulation_prevention_bytes(std::vector<std::uint8_t>& out,
@@ -1234,52 +1436,100 @@ inline std::vector<std::uint8_t> build_h264_headers(const VAPictureParameterBuff
 inline std::vector<std::uint8_t> build_h264_annexb_slices(const VASliceParameterBufferH264* slices,
                                                           std::uint32_t num_slices,
                                                           const std::uint8_t* data,
-                                                          size_t data_size) {
+                                                          size_t data_size,
+                                                          bool* valid = nullptr) {
     std::vector<std::uint8_t> out;
-    if (!slices || !data || data_size == 0 || num_slices == 0) {
+    if (valid) *valid = false;
+    std::vector<SliceRange> ranges;
+    if (!collect_slice_ranges(slices, num_slices, data_size, ranges, false)) {
         return out;
     }
 
     out.reserve(data_size + static_cast<size_t>(num_slices) * 4);
+    bool at_slice_boundary = true;
     for (std::uint32_t index = 0; index < num_slices; ++index) {
-        const auto& slice = slices[index];
-        if (slice.slice_data_offset > data_size || slice.slice_data_size > data_size - slice.slice_data_offset) {
+        const auto& range = ranges[index];
+        SlicePlacement placement = SlicePlacement::Whole;
+        switch (slices[index].slice_data_flag) {
+            case VA_SLICE_DATA_FLAG_ALL: placement = SlicePlacement::Whole; break;
+            case VA_SLICE_DATA_FLAG_BEGIN: placement = SlicePlacement::Begin; break;
+            case VA_SLICE_DATA_FLAG_MIDDLE: placement = SlicePlacement::Middle; break;
+            case VA_SLICE_DATA_FLAG_END: placement = SlicePlacement::End; break;
+            default: out.clear(); return out;
+        }
+        if (!append_slice_fragment(out, data + range.offset, range.size, placement,
+                                   at_slice_boundary, false, h264_nal_header_valid)) {
             out.clear();
             return out;
         }
-        const auto* slice_ptr = data + slice.slice_data_offset;
-        const size_t slice_len = slice.slice_data_size;
-        if (!has_start_code(slice_ptr, slice_len)) {
-            append_start_code_3(out);
-        }
-        out.insert(out.end(), slice_ptr, slice_ptr + slice_len);
     }
+    if (!at_slice_boundary) {
+        out.clear();
+        return out;
+    }
+    if (valid) *valid = true;
     return out;
 }
 
 inline std::vector<std::uint8_t> build_hevc_annexb_slices(const VASliceParameterBufferHEVC* slices,
                                                           std::uint32_t num_slices,
                                                           const std::uint8_t* data,
-                                                          size_t data_size) {
+                                                          size_t data_size,
+                                                          bool* valid = nullptr) {
     std::vector<std::uint8_t> out;
-    if (!slices || !data || data_size == 0 || num_slices == 0) {
+    if (valid) *valid = false;
+    std::vector<SliceRange> ranges;
+    if (!collect_slice_ranges(slices, num_slices, data_size, ranges, false)) {
         return out;
     }
 
     out.reserve(data_size + static_cast<size_t>(num_slices) * 4);
+    bool at_slice_boundary = true;
     for (std::uint32_t index = 0; index < num_slices; ++index) {
-        const auto& slice = slices[index];
-        if (slice.slice_data_offset > data_size || slice.slice_data_size > data_size - slice.slice_data_offset) {
+        const auto& range = ranges[index];
+        SlicePlacement placement = SlicePlacement::Whole;
+        switch (slices[index].slice_data_flag) {
+            case VA_SLICE_DATA_FLAG_ALL: placement = SlicePlacement::Whole; break;
+            case VA_SLICE_DATA_FLAG_BEGIN: placement = SlicePlacement::Begin; break;
+            case VA_SLICE_DATA_FLAG_MIDDLE: placement = SlicePlacement::Middle; break;
+            case VA_SLICE_DATA_FLAG_END: placement = SlicePlacement::End; break;
+            default: out.clear(); return out;
+        }
+        if (!append_slice_fragment(out, data + range.offset, range.size, placement,
+                                   at_slice_boundary, true, hevc_nal_header_valid)) {
             out.clear();
             return out;
         }
-        const auto* slice_ptr = data + slice.slice_data_offset;
-        const size_t slice_len = slice.slice_data_size;
-        if (!has_start_code(slice_ptr, slice_len)) {
-            append_start_code(out);
-        }
-        out.insert(out.end(), slice_ptr, slice_ptr + slice_len);
     }
+    if (!at_slice_boundary) {
+        out.clear();
+        return out;
+    }
+    if (valid) *valid = true;
+    return out;
+}
+
+inline std::vector<std::uint8_t> build_av1_tile_slices(const VASliceParameterBufferAV1* slices,
+                                                       std::uint32_t num_slices,
+                                                       const std::uint8_t* data,
+                                                       size_t data_size,
+                                                       bool* valid = nullptr) {
+    std::vector<std::uint8_t> out;
+    if (valid) *valid = false;
+    std::vector<SliceRange> ranges;
+    if (!collect_slice_ranges(slices, num_slices, data_size, ranges, true)) {
+        return out;
+    }
+
+    size_t total = 0;
+    for (const auto& range : ranges) {
+        total += range.size;
+    }
+    out.reserve(total);
+    for (const auto& range : ranges) {
+        out.insert(out.end(), data + range.offset, data + range.offset + range.size);
+    }
+    if (valid) *valid = true;
     return out;
 }
 

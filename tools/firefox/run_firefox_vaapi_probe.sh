@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 build_dir=${ROCKCHIP_VAAPI_BUILD_DIR:-$repo_dir/build}
 profile_dir=$(mktemp -d /tmp/rockchip-firefox-profile.XXXXXX)
 server_state_dir=/tmp/rockchip-firefox-http-server
@@ -55,7 +55,7 @@ start_http_server() {
 	local server_log="$server_state_dir/server.log"
 	: >"$status_file"
 	rm -f "$telemetry_file"
-	nohup python3 "$repo_dir/tools/firefox_playback_server.py" \
+	nohup python3 "$repo_dir/tools/firefox/firefox_playback_server.py" \
 		--bind 127.0.0.1 \
 		--port "$port" \
 		--directory "$repo_dir" \
@@ -161,7 +161,7 @@ export MOZ_WEBRENDER=${MOZ_WEBRENDER:-1}
 export MOZ_LOG=${MOZ_LOG:-PlatformDecoderModule:5,FFmpegVideo:5,Dmabuf:5,VAAPI:5}
 
 firefox_bin=${FIREFOX_BIN:-firefox}
-target_url=${1:-"http://127.0.0.1:$server_port/tools/firefox_headless_video_test.html?$query_string"}
+target_url=${1:-"http://127.0.0.1:$server_port/tools/firefox/firefox_headless_video_test.html?$query_string"}
 
 printf 'PROFILE=%s\n' "$profile_dir"
 printf 'URL=%s\n' "$target_url"
@@ -169,4 +169,7 @@ printf 'HTTP_SERVER=%s\n' "http://127.0.0.1:$server_port/"
 printf 'STATUS_FILE=%s\n' "$status_file"
 printf 'TELEMETRY_FILE=%s\n' "$telemetry_file"
 
-"$firefox_bin" --new-instance --no-remote -profile "$profile_dir" "$target_url"
+echo $$ >"$server_state_dir/probe.pid"
+# exec keeps the probe pid, process group and Firefox lifetime identical, so
+# the measurement harness can reap the whole RDD/GPU/Firefox tree reliably.
+exec "$firefox_bin" --new-instance --no-remote -profile "$profile_dir" "$target_url"

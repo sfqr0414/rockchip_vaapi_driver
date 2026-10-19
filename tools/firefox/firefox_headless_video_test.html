@@ -94,7 +94,7 @@
     const params = new URLSearchParams(window.location.search);
     const requestedVideo = params.get('video');
     const videoPath = requestedVideo || 'videos/Test Jellyfin 1080p AVC 20M.mp4';
-    // The test page is served from /tools/, while --video paths are relative
+    // The test page is served from /tools/firefox/, while --video paths are relative
     // to the HTTP server root (the repository directory).
     const sourceUrl = new URL(videoPath.replace(/^\/+/, ''), window.location.origin + '/').href;
     const seekAtParam = params.get('seekAt');
@@ -282,6 +282,9 @@
           pictureSharpness: pictureSample.sharpness,
           pictureHash: pictureSample.hash,
           droppedVideoFrames: quality ? quality.droppedVideoFrames : null,
+          corruptedVideoFrames: quality && typeof quality.corruptedVideoFrames === 'number'
+            ? quality.corruptedVideoFrames
+            : null,
           totalFrameDelay: quality && typeof quality.totalFrameDelay === 'number'
             ? Number(quality.totalFrameDelay.toFixed(3))
             : null,
@@ -354,7 +357,7 @@
     setTimeout(() => {
       video.src = sourceUrl;
       ensurePlayback();
-    }, 5000);
+    }, 7000);
 
     [
       'loadstart',

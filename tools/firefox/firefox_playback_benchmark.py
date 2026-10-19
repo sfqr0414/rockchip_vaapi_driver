@@ -130,7 +130,7 @@ def main():
     parser.add_argument("--video", default="videos/Test Jellyfin 1080p AVC 20M.mp4")
     args = parser.parse_args()
 
-    repo_dir = Path(__file__).resolve().parents[1]
+    repo_dir = Path(__file__).resolve().parents[2]
     if webdriver is None:
         # Selenium is not installed on this image; fall back to the shared
         # Firefox harness, which drives the same test page and reports the same
@@ -141,7 +141,7 @@ def main():
         try:
             cmd = [
                 sys.executable,
-                str(repo_dir / "tools" / "measure_firefox_playback.py"),
+                str(repo_dir / "tools" / "firefox" / "measure_firefox_playback.py"),
                 "--video", args.video,
                 "--mode", "hw" if args.hwdecode else "sw",
                 "--duration", str(args.duration),
@@ -167,7 +167,7 @@ def main():
     env.setdefault("LIBVA_DRM_DEVICE", env["MOZ_DRM_DEVICE"])
 
     server, _ = start_http_server(repo_dir)
-    url = f"http://127.0.0.1:{server.server_address[1]}/tools/firefox_headless_video_test.html"
+    url = f"http://127.0.0.1:{server.server_address[1]}/tools/firefox/firefox_headless_video_test.html"
 
     service = Service(executable_path=geckodriver_path, log_output=subprocess.DEVNULL, env=env)
     options = build_options(args, profile_dir)

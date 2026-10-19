@@ -111,15 +111,9 @@ bool isInternalSurfaceId(VASurfaceID surface_id) {
 }
 
 bool h264AccessUnitStartsWithIdr(std::span<const uint8_t> bytes) {
-    if (bytes.size() >= 5 && bytes[0] == 0x00 && bytes[1] == 0x00) {
-        if (bytes[2] == 0x01) {
-            return (bytes[3] & 0x1fu) == 5;
-        }
-        if (bytes.size() >= 5 && bytes[2] == 0x00 && bytes[3] == 0x01) {
-            return (bytes[4] & 0x1fu) == 5;
-        }
-    }
-    return false;
+    // An access unit may prefix the IDR with SPS/PPS/AUD NAL units.  Walk to
+    // the first VCL NAL instead of only inspecting the first NAL header.
+    return bitstream::h264_access_unit_has_idr(bytes);
 }
 
 std::string formatBytePrefix(std::span<const uint8_t> bytes, size_t limit = 16) {
@@ -2146,46 +2140,45 @@ static VAStatus vaEndPicture(VADriverContextP ctx,
             }
 
             std::vector<uint8_t> framed;
+            bool framed_valid = true;
             if (slice_param_buffer && slice_param_buffer->num_elements > 0) {
+                bool parsed = false;
                 if (isH264Profile(d->profile) &&
                     slice_param_buffer->size_bytes() >= slice_param_buffer->num_elements * sizeof(VASliceParameterBufferH264)) {
                     framed = bitstream::build_h264_annexb_slices(
                         reinterpret_cast<const VASliceParameterBufferH264*>(slice_param_buffer->data.data()),
                         slice_param_buffer->num_elements,
                         slice_data.data(),
-                        slice_data.size());
+                        slice_data.size(),
+                        &parsed);
                 } else if ((d->profile == VAProfileHEVCMain || d->profile == VAProfileHEVCMain10) &&
                            slice_param_buffer->size_bytes() >= slice_param_buffer->num_elements * sizeof(VASliceParameterBufferHEVC)) {
                     framed = bitstream::build_hevc_annexb_slices(
                         reinterpret_cast<const VASliceParameterBufferHEVC*>(slice_param_buffer->data.data()),
                         slice_param_buffer->num_elements,
                         slice_data.data(),
-                        slice_data.size());
+                        slice_data.size(),
+                        &parsed);
                 } else if (d->profile == VAProfileAV1Profile0 &&
                            slice_param_buffer->size_bytes() >= slice_param_buffer->num_elements * sizeof(VASliceParameterBufferAV1)) {
-                    const auto* av1_slices = reinterpret_cast<const VASliceParameterBufferAV1*>(slice_param_buffer->data.data());
-                    size_t total_size = 0;
-                    bool valid = true;
-                    for (uint32_t slice_index = 0; slice_index < slice_param_buffer->num_elements; ++slice_index) {
-                        const auto offset = static_cast<size_t>(av1_slices[slice_index].slice_data_offset);
-                        const auto size = static_cast<size_t>(av1_slices[slice_index].slice_data_size);
-                        if (offset > slice_data.size() || size > slice_data.size() - offset) {
-                            valid = false;
-                            break;
-                        }
-                        total_size += size;
-                    }
-                    if (valid) {
-                        framed.reserve(total_size);
-                        for (uint32_t slice_index = 0; slice_index < slice_param_buffer->num_elements; ++slice_index) {
-                            const auto offset = static_cast<size_t>(av1_slices[slice_index].slice_data_offset);
-                            const auto size = static_cast<size_t>(av1_slices[slice_index].slice_data_size);
-                            framed.insert(framed.end(), slice_data.begin() + offset, slice_data.begin() + offset + size);
-                        }
-                    }
+                    framed = bitstream::build_av1_tile_slices(
+                        reinterpret_cast<const VASliceParameterBufferAV1*>(slice_param_buffer->data.data()),
+                        slice_param_buffer->num_elements,
+                        slice_data.data(),
+                        slice_data.size(),
+                        &parsed);
                 }
+                framed_valid = parsed;
             }
 
+            if (!framed_valid) {
+                util::log(util::stderr_sink, util::LogLevel::Warn,
+                          "vaEndPicture: rejecting malformed slice framing profile=0x{:x} slices={} data={}",
+                          static_cast<unsigned>(d->profile),
+                          slice_param_buffer ? slice_param_buffer->num_elements : 0,
+                          slice_data.size());
+                return VA_STATUS_ERROR_INVALID_PARAMETER;
+            }
             if (!framed.empty()) {
                 rebuilt_frame_buffer.insert(rebuilt_frame_buffer.end(), framed.begin(), framed.end());
             } else {
@@ -3544,46 +3537,44 @@ static VAStatus vaRenderPicture(VADriverContextP ctx,
     if (slice_data_buffer) {
         const auto slice_data = slice_data_buffer->map();
         std::vector<uint8_t> framed;
+        bool framed_valid = true;
         if (slice_param_buffer && slice_param_buffer->num_elements > 0) {
+            bool parsed = false;
             if (isH264Profile(d->profile) &&
                 slice_param_buffer->size_bytes() >= slice_param_buffer->num_elements * sizeof(VASliceParameterBufferH264)) {
                 framed = bitstream::build_h264_annexb_slices(
                     reinterpret_cast<const VASliceParameterBufferH264*>(slice_param_buffer->data.data()),
                     slice_param_buffer->num_elements,
                     slice_data.data(),
-                    slice_data.size());
+                    slice_data.size(),
+                    &parsed);
             } else if ((d->profile == VAProfileHEVCMain || d->profile == VAProfileHEVCMain10) &&
                        slice_param_buffer->size_bytes() >= slice_param_buffer->num_elements * sizeof(VASliceParameterBufferHEVC)) {
                 framed = bitstream::build_hevc_annexb_slices(
                     reinterpret_cast<const VASliceParameterBufferHEVC*>(slice_param_buffer->data.data()),
                     slice_param_buffer->num_elements,
                     slice_data.data(),
-                    slice_data.size());
+                    slice_data.size(),
+                    &parsed);
             } else if (d->profile == VAProfileAV1Profile0 &&
                        slice_param_buffer->size_bytes() >= slice_param_buffer->num_elements * sizeof(VASliceParameterBufferAV1)) {
-                const auto* av1_slices = reinterpret_cast<const VASliceParameterBufferAV1*>(slice_param_buffer->data.data());
-                size_t total_size = 0;
-                bool valid = true;
-                for (uint32_t index = 0; index < slice_param_buffer->num_elements; ++index) {
-                    const auto offset = static_cast<size_t>(av1_slices[index].slice_data_offset);
-                    const auto size = static_cast<size_t>(av1_slices[index].slice_data_size);
-                    if (offset > slice_data.size() || size > slice_data.size() - offset) {
-                        valid = false;
-                        break;
-                    }
-                    total_size += size;
-                }
-                if (valid) {
-                    framed.reserve(total_size);
-                    for (uint32_t index = 0; index < slice_param_buffer->num_elements; ++index) {
-                        const auto offset = static_cast<size_t>(av1_slices[index].slice_data_offset);
-                        const auto size = static_cast<size_t>(av1_slices[index].slice_data_size);
-                        framed.insert(framed.end(), slice_data.begin() + offset, slice_data.begin() + offset + size);
-                    }
-                } else {
-                    framed.clear();
-                }
+                framed = bitstream::build_av1_tile_slices(
+                    reinterpret_cast<const VASliceParameterBufferAV1*>(slice_param_buffer->data.data()),
+                    slice_param_buffer->num_elements,
+                    slice_data.data(),
+                    slice_data.size(),
+                    &parsed);
             }
+            framed_valid = parsed;
+        }
+
+        if (!framed_valid) {
+            util::log(util::stderr_sink, util::LogLevel::Warn,
+                      "vaRenderPicture: rejecting malformed slice framing profile=0x{:x} slices={} data={}",
+                      static_cast<unsigned>(d->profile),
+                      slice_param_buffer ? slice_param_buffer->num_elements : 0,
+                      slice_data.size());
+            return VA_STATUS_ERROR_INVALID_PARAMETER;
         }
 
         if (!framed.empty()) {

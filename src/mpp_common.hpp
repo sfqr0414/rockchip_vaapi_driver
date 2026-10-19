@@ -390,10 +390,23 @@ inline constexpr size_t kMaxInFlightJobs = 64;
 inline void unpackPacked10RowLE(std::span<const uint8_t> src,
                                 uint16_t* dst,
                                 size_t sample_count) {
-    // Rockchip NV12_10BIT packs four 10-bit samples into five bytes. Decode
-    // four samples at a time; the scalar path handles the row remainder.
+    // Rockchip NV12_10BIT packs four 10-bit samples into five bytes (a
+    // little-endian 40-bit word).  Extract four fields from one 64-bit load;
+    // this keeps the per-frame P010 expansion off the byte-by-byte path that
+    // dominated AV1 10-bit playback.
     size_t sample = 0;
     size_t src_index = 0;
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    for (; sample + 3 < sample_count && src_index + 5 <= src.size();
+         sample += 4, src_index += 5) {
+        std::uint64_t packed = 0;
+        std::memcpy(&packed, src.data() + src_index, 5);
+        dst[sample] = static_cast<std::uint16_t>((packed & 0x3FFu) << 6);
+        dst[sample + 1] = static_cast<std::uint16_t>(((packed >> 10) & 0x3FFu) << 6);
+        dst[sample + 2] = static_cast<std::uint16_t>(((packed >> 20) & 0x3FFu) << 6);
+        dst[sample + 3] = static_cast<std::uint16_t>(((packed >> 30) & 0x3FFu) << 6);
+    }
+#else
     for (; sample + 3 < sample_count && src_index + 5 <= src.size();
          sample += 4, src_index += 5) {
         const uint32_t b0 = src[src_index];
@@ -406,6 +419,7 @@ inline void unpackPacked10RowLE(std::span<const uint8_t> src,
         dst[sample + 2] = static_cast<uint16_t>(((b2 >> 4) | ((b3 & 0x3Fu) << 4)) << 6);
         dst[sample + 3] = static_cast<uint16_t>(((b3 >> 6) | (b4 << 2)) << 6);
     }
+#endif
     for (; sample < sample_count; ++sample) {
         const size_t index = (sample * 10) / 8;
         const uint8_t bit_offset = static_cast<uint8_t>((sample * 2) & 7u);

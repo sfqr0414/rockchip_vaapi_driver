@@ -224,39 +224,47 @@ bool copyFrameToStableExport(void* dst_map,
     const uint8_t* src_uv = src_base + static_cast<size_t>(src_stride_bytes) * src_ver_stride;
 
     if (is_10bit) {
-        if (src_is_10bit) {
-            // MPP_FMT_YUV420SP_10BIT is Rockchip's packed 10-bit layout (no gap),
-            // while VA exposes P010. Expand each row before publishing the surface.
-            const size_t packed_row_bytes = ((static_cast<size_t>(width) + 3) / 4) * 5;
-            for (uint32_t row = 0; row < height; ++row) {
-                auto* dst_row = reinterpret_cast<uint16_t*>(dst_y + static_cast<size_t>(row) * dst_pitch);
-                const auto src_row = std::span<const uint8_t>(src_y + static_cast<size_t>(row) * src_stride_bytes,
-                                                              std::min(packed_row_bytes, static_cast<size_t>(src_stride_bytes)));
-                unpackPacked10RowLE(src_row, dst_row, width);
-            }
-            for (uint32_t row = 0; row < height / 2; ++row) {
-                auto* dst_row = reinterpret_cast<uint16_t*>(dst_uv + static_cast<size_t>(row) * dst_pitch);
-                const auto src_row = std::span<const uint8_t>(src_uv + static_cast<size_t>(row) * src_stride_bytes,
-                                                              std::min(packed_row_bytes, static_cast<size_t>(src_stride_bytes)));
-                unpackPacked10RowLE(src_row, dst_row, width);
-            }
-            return true;
-        }
+        // P010 expansion is the only CPU-heavy step for AV1 10-bit.  Split the
+        // independent row ranges over up to four cores instead of stretching the
+        // MPP output thread; this keeps 1080p60 real-time with headroom.
+        const uint32_t total_rows = height + height / 2;
+        const unsigned hw_threads = std::thread::hardware_concurrency();
+        const unsigned workers = std::clamp(hw_threads / 2u, 2u, 4u);
+        const size_t packed_row_bytes = ((static_cast<size_t>(width) + 3) / 4) * 5;
 
-        // 8-bit MPP output published on a 10-bit VA surface: widen to P010.
-        for (uint32_t row = 0; row < height; ++row) {
-            auto* dst_row = reinterpret_cast<uint16_t*>(dst_y + static_cast<size_t>(row) * dst_pitch);
-            const uint8_t* src_row = src_y + static_cast<size_t>(row) * src_stride_bytes;
-            for (uint32_t col = 0; col < width; ++col) {
-                dst_row[col] = static_cast<uint16_t>(src_row[col]) << 8;
+        auto convert_range = [&](uint32_t begin, uint32_t end, bool packed) {
+            for (uint32_t row = begin; row < end; ++row) {
+                const bool luma = row < height;
+                const uint32_t plane_row = luma ? row : (row - height);
+                auto* dst_row = reinterpret_cast<uint16_t*>(
+                    (luma ? dst_y : dst_uv) + static_cast<size_t>(plane_row) * dst_pitch);
+                const uint8_t* src_row = (luma ? src_y : src_uv) +
+                                         static_cast<size_t>(plane_row) * src_stride_bytes;
+                if (packed) {
+                    const auto src_span = std::span<const uint8_t>(
+                        src_row, std::min(packed_row_bytes, static_cast<size_t>(src_stride_bytes)));
+                    unpackPacked10RowLE(src_span, dst_row, width);
+                } else {
+                    for (uint32_t col = 0; col < width; ++col) {
+                        dst_row[col] = static_cast<uint16_t>(src_row[col]) << 8;
+                    }
+                }
+            }
+        };
+
+        const uint32_t chunk = (total_rows + workers - 1) / workers;
+        std::vector<std::thread> helpers;
+        helpers.reserve(workers - 1);
+        for (unsigned worker = 1; worker < workers; ++worker) {
+            const uint32_t begin = std::min(total_rows, worker * chunk);
+            const uint32_t end = std::min(total_rows, begin + chunk);
+            if (begin < end) {
+                helpers.emplace_back(convert_range, begin, end, src_is_10bit);
             }
         }
-        for (uint32_t row = 0; row < height / 2; ++row) {
-            auto* dst_row = reinterpret_cast<uint16_t*>(dst_uv + static_cast<size_t>(row) * dst_pitch);
-            const uint8_t* src_row = src_uv + static_cast<size_t>(row) * src_stride_bytes;
-            for (uint32_t col = 0; col < width; ++col) {
-                dst_row[col] = static_cast<uint16_t>(src_row[col]) << 8;
-            }
+        convert_range(0, std::min(total_rows, chunk), src_is_10bit);
+        for (auto& helper : helpers) {
+            helper.join();
         }
         return true;
     }
