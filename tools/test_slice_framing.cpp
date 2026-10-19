@@ -1,7 +1,9 @@
 #include <cstdint>
+#include <cstring>
 #include <cstdio>
 #include <vector>
 
+#include "mpp_common.hpp"
 #include "util/bitstream.hpp"
 
 namespace {
@@ -69,6 +71,26 @@ int main() {
     VASliceParameterBufferAV1 av1[2] = {av1_slice(3, 2), av1_slice(0, 2)};
     auto av1_framed = rockchip::bitstream::build_av1_tile_slices(av1, 2, tiles.data(), tiles.size(), &valid);
     expect(valid && av1_framed == std::vector<std::uint8_t>({0x44, 0x55, 0x11, 0x22}), "AV1 tile order");
+
+    // Rockchip packed 10-bit uses four samples per five bytes; the P010 export
+    // path must place each 10-bit value in bits 15:6 without dropping LSBs.
+    std::vector<std::uint8_t> packed10(10);
+    const std::uint32_t samples[8] = {0, 1, 0x155, 0x2aa, 0x3ff, 0x200, 0x0ff, 0x300};
+    for (std::size_t group = 0; group < 2; ++group) {
+        std::uint64_t word = 0;
+        for (std::size_t i = 0; i < 4; ++i) {
+            word |= static_cast<std::uint64_t>(samples[group * 4 + i]) << (10 * i);
+        }
+        std::memcpy(packed10.data() + group * 5, &word, 5);
+    }
+    std::vector<std::uint16_t> unpacked(8);
+    rockchip::unpackPacked10RowLE(
+        std::span<const std::uint8_t>(packed10.data(), packed10.size()), unpacked.data(), 8);
+    bool packed_ok = true;
+    for (std::size_t i = 0; i < 8; ++i) {
+        packed_ok &= unpacked[i] == static_cast<std::uint16_t>(samples[i] << 6);
+    }
+    expect(packed_ok, "packed 10-bit P010 expansion");
 
     // IDR detection ignores leading AUD/SPS and finds the first VCL NAL.
     const std::vector<std::uint8_t> aud_sps_idr{
