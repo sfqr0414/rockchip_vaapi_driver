@@ -231,11 +231,12 @@ bool copyFrameToStableExport(void* dst_map,
 
     if (is_10bit) {
         // P010 expansion is the only CPU-heavy step for AV1 10-bit.  Split the
-        // independent row ranges over up to four cores instead of stretching the
-        // MPP output thread; this keeps 1080p60 real-time with headroom.
+        // independent row ranges over the available cores (capped at eight)
+        // instead of stretching the MPP output thread; this keeps 1080p60
+        // real-time with headroom.
         const uint32_t total_rows = height + height / 2;
         const unsigned hw_threads = std::thread::hardware_concurrency();
-        const unsigned workers = std::clamp(hw_threads / 2u, 2u, 4u);
+        const unsigned workers = std::clamp(hw_threads, 4u, 8u);
         const size_t packed_row_bytes = ((static_cast<size_t>(width) + 3) / 4) * 5;
 
         auto convert_range = [&](uint32_t begin, uint32_t end, bool packed) {
@@ -1973,6 +1974,7 @@ void MppDecoder::outputThreadMain(std::stop_token st) {
                                                                       export_drm_fd_.get(),
                                                                       output_width,
                                                                       output_height,
+                                                                      it->second.surface.is_10bit,
                                                                       it->second.surface.is_10bit);
                         static std::atomic<int> stable_alloc_log_count{0};
                         if (stable_alloc_log_count.fetch_add(1, std::memory_order_relaxed) < 4) {
@@ -1985,6 +1987,11 @@ void MppDecoder::outputThreadMain(std::stop_token st) {
 
                     if (it->second.export_map) {
                         const uint8_t* frame_ptr = static_cast<const uint8_t*>(mpp_buffer_get_ptr(mpp_buf));
+                        // Cacheable 10-bit export: CPU writes must be bracketed so
+                        // the importing GPU sees the converted P010 bytes.
+                        const bool cache_synced = it->second.surface.is_10bit &&
+                            syncDmaBuf(it->second.dmabuf.get(),
+                                       DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE);
                         export_ok = copyFrameToStableExport(it->second.export_map,
                                                             it->second.export_pitch,
                                                             output_width,
@@ -1994,6 +2001,10 @@ void MppDecoder::outputThreadMain(std::stop_token st) {
                                                             frame_ptr,
                                                             it->second.surface.is_10bit,
                                                             MPP_FRAME_FMT_IS_YUV_10BIT(frame_fmt) != 0);
+                        if (cache_synced) {
+                            syncDmaBuf(it->second.dmabuf.get(),
+                                       DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ | DMA_BUF_SYNC_WRITE);
+                        }
                         if (export_ok) {
                             it->second.surface.dmabuf_fd = it->second.dmabuf.get();
                             published_stride = it->second.export_pitch /
