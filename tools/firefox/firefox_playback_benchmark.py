@@ -148,7 +148,10 @@ def main():
                 "--duration", str(args.duration),
                 "--summary-file", summary.name,
             ]
-            result = subprocess.run(cmd, cwd=repo_dir, check=False)
+            # measure_firefox_playback.py also prints its summary; keep stdout
+            # valid JSON by letting the file be the single source of truth.
+            result = subprocess.run(cmd, cwd=repo_dir, check=False,
+                                    stdout=subprocess.DEVNULL)
             if result.returncode == 0:
                 print(Path(summary.name).read_text(encoding="utf-8"))
             else:
