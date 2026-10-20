@@ -289,6 +289,8 @@ def main() -> int:
     parser.add_argument("--zero-copy", choices=["auto", "on", "off"], default="auto")
     parser.add_argument("--seek-at", type=float)
     parser.add_argument("--seek-to", type=float)
+    parser.add_argument("--switch-to", help="Play this video after --switch-after seconds")
+    parser.add_argument("--switch-after", type=float, default=5.0)
     parser.add_argument("--stdout-file")
     parser.add_argument("--summary-file")
     parser.add_argument("--last-sample-file")
@@ -314,6 +316,12 @@ def main() -> int:
         env["FIREFOX_TEST_SEEK_TO"] = str(args.seek_to)
     else:
         env.pop("FIREFOX_TEST_SEEK_TO", None)
+    if args.switch_to is not None:
+        env["FIREFOX_TEST_SWITCH_TO"] = args.switch_to
+        env["FIREFOX_TEST_SWITCH_AFTER"] = str(args.switch_after)
+    else:
+        env.pop("FIREFOX_TEST_SWITCH_TO", None)
+        env.pop("FIREFOX_TEST_SWITCH_AFTER", None)
     if args.stable_export:
         env["ROCKCHIP_VAAPI_STABLE_EXPORT"] = "1"
     else:
@@ -375,6 +383,8 @@ def main() -> int:
                 "zero_copy": args.zero_copy,
                 "seek_at": args.seek_at,
                 "seek_to": args.seek_to,
+                "switch_to": args.switch_to,
+                "switch_after": args.switch_after if args.switch_to else None,
                 "duration_seconds": args.duration,
                 "startup_seconds": startup_seconds,
                 "interrupt_pattern": interrupt_info.get("pattern"),

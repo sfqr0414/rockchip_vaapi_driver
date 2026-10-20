@@ -47,6 +47,8 @@ hwdecode_enabled=${FIREFOX_HWDECODE_ENABLED:-true}
 test_video=${FIREFOX_TEST_VIDEO:-videos/Test Jellyfin 1080p AVC 20M.mp4}
 seek_at=${FIREFOX_TEST_SEEK_AT:-}
 seek_to=${FIREFOX_TEST_SEEK_TO:-}
+switch_to=${FIREFOX_TEST_SWITCH_TO:-}
+switch_after=${FIREFOX_TEST_SWITCH_AFTER:-}
 
 pick_http_port() {
 	python3 - <<'PY'
@@ -134,6 +136,12 @@ if [[ -n "$seek_at" ]]; then
 fi
 if [[ -n "$seek_to" ]]; then
 	query_string+="&seekTo=$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1]))' "$seek_to")"
+fi
+if [[ -n "$switch_to" ]]; then
+	query_string+="&switchTo=$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1]))' "$switch_to")"
+fi
+if [[ -n "$switch_after" ]]; then
+	query_string+="&switchAfter=$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1]))' "$switch_after")"
 fi
 
 cat >"$profile_dir/user.js" <<'EOF'

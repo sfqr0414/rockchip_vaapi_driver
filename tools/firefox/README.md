@@ -23,6 +23,21 @@ python3 tools/firefox/measure_firefox_playback.py \
   --video "videos/Test Jellyfin 1080p AVC 20M.mp4" --mode hw --duration 45
 ```
 
+Switch to a second video in the same browser session (the regression that used
+to leave the second video stuck after the first one ended):
+
+```bash
+python3 tools/firefox/measure_firefox_playback.py \
+  --video "videos/Test Jellyfin 1080p HEVC 8bit 20M.mp4" --mode hw --duration 20 \
+  --switch-to "videos/Test Jellyfin 1080p AVC 20M.mp4" --switch-after 4
+```
+
+The bridge treats a new VA context created while an older context is still
+alive as a decoder switch.  It tears down the old single-codec MPP session,
+re-registers the existing VA surfaces, and initializes MPP for the new
+profile, resolution, and bit depth.  The old MPP session cannot be reused:
+Firefox keeps both VA contexts alive briefly and reuses the same VA display.
+
 The server still serves the repository root because the HTML addresses the
 videos as `videos/<name>.mp4`; only the test page itself moved under
 `tools/firefox/`.

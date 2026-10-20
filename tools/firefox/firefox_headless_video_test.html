@@ -100,6 +100,13 @@
     const seekAtParam = params.get('seekAt');
     const seekToParam = params.get('seekTo');
     const restartOnEndedParam = params.get('restartOnEnded');
+    const switchToParam = params.get('switchTo');
+    const switchAfterParam = params.get('switchAfter');
+    const switchToPath = switchToParam || null;
+    const switchAfter = switchAfterParam === null ? 5 : Number(switchAfterParam);
+    const switchUrl = switchToPath
+      ? new URL(switchToPath.replace(/^\/+/, ''), window.location.origin + '/').href
+      : null;
     const seekAt = seekAtParam === null ? Number.NaN : Number(seekAtParam);
     const seekTo = seekToParam === null ? Number.NaN : Number(seekToParam);
     const restartOnEnded = restartOnEndedParam === '1' || restartOnEndedParam === 'true';
@@ -357,6 +364,14 @@
     setTimeout(() => {
       video.src = sourceUrl;
       ensurePlayback();
+      if (switchUrl && Number.isFinite(switchAfter) && switchAfter >= 0) {
+        setTimeout(() => {
+          note('switch-request:' + switchUrl);
+          video.src = switchUrl;
+          video.load();
+          ensurePlayback();
+        }, switchAfter * 1000);
+      }
     }, 7000);
 
     [

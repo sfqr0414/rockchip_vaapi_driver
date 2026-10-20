@@ -574,6 +574,15 @@ struct DriverState {
     };
 
     std::unique_ptr<MppDecoder> decoder;
+    // MPP decoder instances are single-codec/single-resolution.  Firefox keeps
+    // the previous VA context alive while creating the next decoder when the
+    // user switches videos, so the bridge has to rebuild this session instead
+    // of reusing a decoder initialized for the old profile.
+    bool decoder_initialized = false;
+    VAProfile decoder_profile = VAProfileNone;
+    uint32_t decoder_width = 0;
+    uint32_t decoder_height = 0;
+    bool decoder_10bit = false;
     std::mutex resource_mutex;
     std::unordered_map<VASurfaceID, std::unique_ptr<SurfaceState>> surfaces;
     std::unordered_map<VABufferID, std::unique_ptr<VABuffer>> buffers;
@@ -1841,6 +1850,39 @@ static VAStatus vaCreateSurfaces2(VADriverContextP ctx,
                              static_cast<int>(num_attribs));
 }
 
+static bool rebuildDecoderForContext(DriverState& d,
+                                       CodecProfile codec,
+                                       int width,
+                                       int height,
+                                       bool ten_bit) {
+    // Drop the old MPP session first, but keep DriverState.surfaces: Firefox
+    // creates the new context's surfaces before calling vaCreateContext.
+    std::unique_ptr<MppDecoder> old = std::move(d.decoder);
+    if (old) {
+        old->shutdown();
+    }
+    d.decoder = std::make_unique<MppDecoder>();
+    for (auto& [id, state] : d.surfaces) {
+        MppDecoder::DecodedSurface descriptor = state->surface;
+        if (!d.decoder->allocateSurface(id, descriptor,
+                                        static_cast<int>(descriptor.width),
+                                        static_cast<int>(descriptor.height))) {
+            d.decoder_initialized = false;
+            return false;
+        }
+    }
+    if (!d.decoder->initialize(codec, width, height, d.drm_fd, ten_bit)) {
+        d.decoder_initialized = false;
+        return false;
+    }
+    d.decoder_initialized = true;
+    d.decoder_profile = d.profile;
+    d.decoder_width = static_cast<uint32_t>(width);
+    d.decoder_height = static_cast<uint32_t>(height);
+    d.decoder_10bit = ten_bit;
+    return true;
+}
+
 static VAStatus vaCreateContext(VADriverContextP ctx,
                                 VAConfigID config_id,
                                 int picture_width,
@@ -1865,7 +1907,13 @@ static VAStatus vaCreateContext(VADriverContextP ctx,
         util::log(util::stderr_sink, util::LogLevel::Warn, "vaCreateContext: missing config_id={}", config_id);
         return VA_STATUS_ERROR_INVALID_CONFIG;
     }
-    const auto& config = config_it->second;
+    // Copy the configuration instead of holding a reference into the
+    // unordered_map across decoder teardown and context creation.  Firefox
+    // creates the next decoder while the previous context is still alive;
+    // keeping the reference here made the profile used for context dispatch
+    // disagree with the profile passed to MPP.
+    const VAProfile requested_profile = config_it->second.profile;
+    const uint32_t requested_rt_format = config_it->second.rt_format;
     if (num_render_targets < 0 || (num_render_targets > 0 && !render_targets)) {
         util::log(util::stderr_sink, util::LogLevel::Warn, "vaCreateContext: invalid render targets count={} ptr={}",
               num_render_targets, static_cast<const void*>(render_targets));
@@ -1887,34 +1935,51 @@ static VAStatus vaCreateContext(VADriverContextP ctx,
         render_targets_10bit = render_targets_10bit || surface_it->second->surface.is_10bit;
     }
 
-    if (!isSupportedProfile(config.profile)) {
-        util::log(util::stderr_sink, util::LogLevel::Warn, "vaCreateContext: unsupported profile={}", config.profile);
+    if (!isSupportedProfile(requested_profile)) {
+        util::log(util::stderr_sink, util::LogLevel::Warn, "vaCreateContext: unsupported profile={}", static_cast<int>(requested_profile));
         return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;
     }
 
-    if (d->active_contexts.empty()) {
+    d->profile = requested_profile;
+
+    // Surfaces created since the last context are the best evidence of the
+    // requested bit depth.  Clear the marker so a later 8-bit video cannot
+    // inherit the previous 10-bit video's MPP output format.
+    const bool pending_surface_10bit = d->surface_10bit_requested;
+    d->surface_10bit_requested = false;
+    const bool wants_10bit_surfaces = rtFormatRequires10BitSurface(requested_rt_format) ||
+                                      render_targets_10bit || pending_surface_10bit;
+
+    const bool decoder_stopped = !d->decoder || !d->decoder->isInitialized();
+    const bool decoder_mismatch = d->decoder_initialized &&
+        (d->decoder_profile != requested_profile ||
+         d->decoder_width != static_cast<uint32_t>(picture_width) ||
+         d->decoder_height != static_cast<uint32_t>(picture_height) ||
+         d->decoder_10bit != wants_10bit_surfaces);
+    // A second context while one is still active means Firefox is switching
+    // videos/decoders.  There is only one MPP session, so rebuild it for the
+    // new context instead of feeding the new codec into the old session.
+    const bool switching_active_context = !d->active_contexts.empty();
+    const bool rebuild_decoder = decoder_stopped || decoder_mismatch || switching_active_context;
+
+    if (rebuild_decoder) {
+        if (!rebuildDecoderForContext(*d, vaProfileToCodec(requested_profile),
+                                      picture_width, picture_height,
+                                      wants_10bit_surfaces)) {
+            util::log(util::stderr_sink, util::LogLevel::Warn,
+                      "vaCreateContext: failed to rebuild decoder for profile={} {}x{} 10bit={}",
+                      static_cast<int>(requested_profile), picture_width, picture_height,
+                      wants_10bit_surfaces ? 1 : 0);
+            return VA_STATUS_ERROR_ALLOCATION_FAILED;
+        }
         d->picture_width = static_cast<uint32_t>(picture_width);
         d->picture_height = static_cast<uint32_t>(picture_height);
-        d->session.beginContext(config.profile);
+        d->session.beginContext(requested_profile);
         resetPictureState(d);
     }
 
-    d->profile = config.profile;
-
-    const bool wants_10bit_surfaces = rtFormatRequires10BitSurface(config.rt_format) ||
-                                      render_targets_10bit || d->surface_10bit_requested;
-    // Initialize decoder with the requested size; it may adjust later.  The
-    // bit depth must be known before MPP starts: AV1 Profile0 is used for both
-    // 8-bit and 10-bit, and forcing 10-bit output on an 8-bit stream stalls
-    // (observed with the Bilibili AV1 player).
-    if (!d->decoder || (!d->decoder->isInitialized() &&
-                        !d->decoder->initialize(vaProfileToCodec(config.profile), picture_width, picture_height,
-                                                d->drm_fd, wants_10bit_surfaces))) {
-        return VA_STATUS_ERROR_ALLOCATION_FAILED;
-    }
-
     std::vector<VASurfaceID> prime_surfaces;
-    const unsigned int prime_surface_count = CodecSessionState::startupPrimeSurfaceCountForProfile(config.profile);
+    const unsigned int prime_surface_count = CodecSessionState::startupPrimeSurfaceCountForProfile(requested_profile);
     for (unsigned int index = 0; index < prime_surface_count; ++index) {
         MppDecoder::DecodedSurface scratch_surface;
         scratch_surface.is_10bit = wants_10bit_surfaces;
@@ -1925,21 +1990,21 @@ static VAStatus vaCreateContext(VADriverContextP ctx,
             }
             util::log(util::stderr_sink, util::LogLevel::Warn,
                       "vaCreateContext: failed to allocate startup-prime surface profile={} index={}",
-                      config.profile,
+                      static_cast<int>(requested_profile),
                       index);
             return VA_STATUS_ERROR_ALLOCATION_FAILED;
         }
         prime_surfaces.push_back(internal_surface_id);
     }
-    if (d->active_contexts.empty()) {
+    if (d->active_contexts.empty() || rebuild_decoder) {
         d->session.setStartupPrimeSurfaces(prime_surfaces);
     }
 
     const VAContextID new_context = d->next_context_id++;
     d->active_contexts.emplace(new_context, DriverState::ContextState{
         .config_id = config_id,
-        .profile = config.profile,
-        .rt_format = config.rt_format,
+        .profile = requested_profile,
+        .rt_format = requested_rt_format,
         .prime_surfaces = std::move(prime_surfaces),
     });
     static std::atomic<int> context_prime_log_count{0};
@@ -1948,8 +2013,8 @@ static VAStatus vaCreateContext(VADriverContextP ctx,
         util::log(util::stderr_sink, util::LogLevel::Info,
                   "vaCreateContext: context={} profile={} rt_format=0x{:x} render_targets={} prime_surfaces={} first_prime_surface={}",
                   new_context,
-                  config.profile,
-                  config.rt_format,
+                  static_cast<int>(requested_profile),
+                  requested_rt_format,
                   num_render_targets,
                   context_state.prime_surfaces.size(),
                   context_state.prime_surfaces.empty() ? VA_INVALID_ID : context_state.prime_surfaces.front());
@@ -1975,12 +2040,12 @@ static VAStatus vaDestroyContext(VADriverContextP ctx, VAContextID context) {
     // Stop any decoding activity.
     d->decoder->shutdown();
 
-    // Release driver-owned surface handles after MPP has fully stopped.
-    for (auto& kv : d->surfaces) {
-        kv.second->set_dmabuf({});
-    }
-
-    d->surfaces.clear();
+    // Do not clear the application-owned VA surfaces here.  Firefox creates
+    // the next video's surfaces before destroying the previous context; the
+    // old code dropped those fresh surfaces and the following vaCreateContext
+    // failed with "target surface not found", leaving the second video stuck.
+    // Surfaces are released by vaDestroySurfaces, and a subsequent context
+    // rebuild re-registers whatever surfaces are still alive.
     d->ready_flags.clear();
     d->session.endContext();
     d->picture.reset();
